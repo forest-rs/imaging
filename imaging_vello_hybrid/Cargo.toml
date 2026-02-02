@@ -1,0 +1,25 @@
+[package]
+name = "imaging_vello_hybrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vello hybrid (CPU/GPU via wgpu) backend for the imaging command stream."
+readme = "README.md"
+publish = false
+
+[dependencies]
+imaging = { path = "../imaging", features = ["std"] }
+kurbo = { workspace = true, default-features = true }
+peniko = { workspace = true, default-features = true }
+pollster = "0.4.0"
+wgpu = { version = "27.0.1", default-features = false, features = [
+  "std",
+  "wgsl",
+] }
+vello_hybrid = { version = "0.0.6", default-features = true }
+vello_common = { version = "0.0.6", default-features = true }
+
+[lints]
+workspace = true

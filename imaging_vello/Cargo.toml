@@ -1,0 +1,20 @@
+[package]
+name = "imaging_vello"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vello (GPU) backend for the imaging command stream."
+readme = "README.md"
+publish = false
+
+[dependencies]
+imaging = { path = "../imaging", features = ["std"] }
+kurbo = { workspace = true, default-features = true }
+peniko = { workspace = true, default-features = true }
+pollster = "0.4.0"
+vello = { version = "0.7.0", default-features = true }
+
+[lints]
+workspace = true

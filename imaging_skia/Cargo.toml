@@ -1,0 +1,19 @@
+[package]
+name = "imaging_skia"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Skia backend for the imaging command stream."
+readme = "README.md"
+publish = false
+
+[dependencies]
+imaging = { path = "../imaging", features = ["std"] }
+kurbo = { workspace = true, default-features = true }
+peniko = { workspace = true, default-features = true }
+skia-safe = { version = "0.90.0" }
+
+[lints]
+workspace = true
