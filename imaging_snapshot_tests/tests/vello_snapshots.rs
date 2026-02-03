@@ -6,7 +6,7 @@
 #![cfg(feature = "vello")]
 
 use imaging_snapshot_tests::cases::{DEFAULT_HEIGHT, DEFAULT_WIDTH, build_scene};
-use imaging_vello::VelloRenderer;
+use imaging_vello::VelloRecorder;
 
 mod common;
 
@@ -19,9 +19,7 @@ fn snapshots() {
 
     // In some sandboxed/headless environments, `wgpu` can't create a usable device.
     // Treat that as a skip rather than a snapshot failure.
-    let Some(mut renderer) =
-        common::try_init_or_skip("vello", || VelloRenderer::try_new(width, height))
-    else {
+    let Some(wgpu) = common::try_init_or_skip("vello", common::vello_wgpu::Context::try_new) else {
         return;
     };
 
@@ -30,9 +28,12 @@ fn snapshots() {
         "vello",
         |case| {
             let scene = build_scene(case, w, h);
-            let bytes = renderer
-                .render_scene_rgba8(&scene)
-                .expect("render vello scene");
+            let vello_scene = VelloRecorder::new(width, height)
+                .record(&scene)
+                .expect("record vello scene");
+            let bytes = wgpu
+                .render_rgba8(&vello_scene, width, height)
+                .expect("render vello scene via wgpu");
 
             kompari::image::ImageBuffer::from_raw(u32::from(width), u32::from(height), bytes)
                 .expect("RGBA buffer size should match image dimensions")

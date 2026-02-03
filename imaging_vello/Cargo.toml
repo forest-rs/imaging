@@ -13,7 +13,6 @@ publish = false
 imaging = { path = "../imaging", features = ["std"] }
 kurbo = { workspace = true, default-features = true }
 peniko = { workspace = true, default-features = true }
-pollster = "0.4.0"
 vello = { version = "0.7.0", default-features = true }
 
 [lints]

@@ -996,6 +996,8 @@ dependencies = [
  "kompari",
  "kurbo",
  "peniko",
+ "pollster",
+ "vello",
 ]
 
 [[package]]
@@ -1005,7 +1007,6 @@ dependencies = [
  "imaging",
  "kurbo",
  "peniko",
- "pollster",
  "vello",
 ]
 

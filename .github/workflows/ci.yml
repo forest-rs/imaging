@@ -228,7 +228,9 @@ jobs:
 
       - name: cargo test imaging_snapshot_tests (Windows, serial)
         if: runner.os == 'Windows'
-        run: cargo test -p imaging_snapshot_tests --locked --all-features --no-fail-fast -- --test-threads=1
+        env:
+          IMAGING_SNAPSHOT_PROGRESS: "1"
+        run: cargo test -p imaging_snapshot_tests --locked --all-features --no-fail-fast -- --test-threads=1 --nocapture
 
       - name: kompari report (on failure)
         if: failure() && runner.os == 'Linux'

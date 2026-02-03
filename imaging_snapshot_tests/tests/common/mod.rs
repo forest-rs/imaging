@@ -21,6 +21,9 @@ use kompari::{
 
 use imaging_snapshot_tests::cases::{SnapshotCase, selected_cases_for_backend};
 
+#[cfg(feature = "vello")]
+pub(crate) mod vello_wgpu;
+
 pub(crate) fn run_cases(
     backend: &str,
     render: impl FnMut(&dyn SnapshotCase) -> Image,
@@ -52,7 +55,9 @@ pub(crate) fn run_cases_with(
     errors: &mut Vec<String>,
 ) {
     for case in selected_cases_for_backend(backend) {
-        if std::env::var("IMAGING_TEST_VERBOSE").is_ok() {
+        if std::env::var("IMAGING_TEST_VERBOSE").is_ok()
+            || std::env::var_os("IMAGING_SNAPSHOT_PROGRESS").is_some()
+        {
             eprintln!("[{backend}] running case `{}`", case.name());
         }
         let image = render(case);

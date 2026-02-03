@@ -3,9 +3,11 @@
 
 //! Vello backend for `imaging`.
 //!
-//! This crate provides a headless CPU/GPU renderer that consumes `imaging::Scene` (or accepts
-//! commands directly via `imaging::Sink`) and produces an RGBA8 image buffer using
-//! `vello` + `wgpu`.
+//! This crate translates the `imaging` command stream into a `vello::Scene`.
+//!
+//! Rendering a `vello::Scene` to pixels requires `wgpu` device/queue setup; for CI snapshot
+//! testing we keep that logic in `imaging_snapshot_tests` to better control lifetimes and reduce
+//! platform-specific flakiness.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
@@ -13,11 +15,8 @@
 use imaging::{Clip, Composite, Draw, Geometry, Group, Scene, Sink, replay};
 use kurbo::{Affine, Rect};
 use peniko::{Brush, Fill};
-use std::sync::mpsc;
-use vello::wgpu;
-use vello::{AaConfig, RenderParams};
 
-/// Errors that can occur when rendering via Vello.
+/// Errors that can occur when recording into a `vello::Scene`.
 #[derive(Debug)]
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
@@ -32,12 +31,6 @@ pub enum Error {
     /// separate stacks, so scenes that interleave them (e.g. `push_clip`, `push_group`, `pop_clip`)
     /// cannot be represented directly.
     UnbalancedLayerStack,
-    /// No suitable GPU adapter was found.
-    NoAdapter,
-    /// A GPU device could not be created.
-    RequestDevice,
-    /// Vello returned a render error.
-    Render(vello::Error),
     /// An internal invariant was violated.
     Internal(&'static str),
 }
@@ -48,19 +41,9 @@ enum LayerKind {
     Group,
 }
 
-/// Renderer that executes `imaging` commands using `vello` + `wgpu`.
-pub struct VelloRenderer {
+/// Recorder that translates `imaging` commands into a `vello::Scene`.
+pub struct VelloRecorder {
     scene: vello::Scene,
-    renderer: vello::Renderer,
-
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-
-    texture: wgpu::Texture,
-    texture_view: wgpu::TextureView,
-    readback: wgpu::Buffer,
-    bytes_per_row: u32,
-
     width: u16,
     height: u16,
     tolerance: f64,
@@ -68,9 +51,9 @@ pub struct VelloRenderer {
     layer_stack: Vec<LayerKind>,
 }
 
-impl core::fmt::Debug for VelloRenderer {
+impl core::fmt::Debug for VelloRecorder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VelloRenderer")
+        f.debug_struct("VelloRecorder")
             .field("width", &self.width)
             .field("height", &self.height)
             .field("tolerance", &self.tolerance)
@@ -80,39 +63,17 @@ impl core::fmt::Debug for VelloRenderer {
     }
 }
 
-impl VelloRenderer {
-    /// Create a renderer for a fixed-size target.
+impl VelloRecorder {
+    /// Create a recorder for a fixed-size target.
     pub fn new(width: u16, height: u16) -> Self {
-        Self::try_new(width, height).expect("create imaging_vello renderer")
-    }
-
-    /// Create a renderer for a fixed-size target.
-    ///
-    /// This is fallible because `wgpu` may not be able to find a compatible adapter/device
-    /// in some sandboxed or headless environments.
-    pub fn try_new(width: u16, height: u16) -> Result<Self, Error> {
-        let (device, queue) = pollster::block_on(init_device_and_queue())?;
-        let (texture, texture_view, readback, bytes_per_row) =
-            create_targets(&device, width, height);
-
-        let renderer = vello::Renderer::new(&device, vello::RendererOptions::default())
-            .map_err(Error::Render)?;
-
-        Ok(Self {
+        Self {
             scene: vello::Scene::new(),
-            renderer,
-            device,
-            queue,
-            texture,
-            texture_view,
-            readback,
-            bytes_per_row,
             width,
             height,
             tolerance: 0.1,
             error: None,
             layer_stack: Vec::new(),
-        })
+        }
     }
 
     /// Set the curve flattening tolerance used when converting rounded rects to paths.
@@ -127,49 +88,23 @@ impl VelloRenderer {
         self.layer_stack.clear();
     }
 
-    /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
+    /// Record an `imaging::Scene` into a `vello::Scene`.
+    pub fn record(mut self, scene: &Scene) -> Result<vello::Scene, Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         self.reset();
-        replay(scene, self);
-        self.finish_rgba8()
+        replay(scene, &mut self);
+        self.finish()
     }
 
-    /// Finish rendering the current command stream and return an RGBA8 buffer (unpremultiplied).
-    pub fn finish_rgba8(&mut self) -> Result<Vec<u8>, Error> {
+    /// Finish recording and return the produced `vello::Scene`.
+    pub fn finish(mut self) -> Result<vello::Scene, Error> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
         if !self.layer_stack.is_empty() {
             return Err(Error::Internal("unbalanced layer stack"));
         }
-
-        let params = RenderParams {
-            base_color: peniko::Color::from_rgba8(0, 0, 0, 0),
-            width: u32::from(self.width),
-            height: u32::from(self.height),
-            antialiasing_method: AaConfig::Area,
-        };
-
-        self.renderer
-            .render_to_texture(
-                &self.device,
-                &self.queue,
-                &self.scene,
-                &self.texture_view,
-                &params,
-            )
-            .map_err(Error::Render)?;
-
-        readback_rgba8(
-            &self.device,
-            &self.queue,
-            &self.texture,
-            &self.readback,
-            self.bytes_per_row,
-            self.width,
-            self.height,
-        )
+        Ok(self.scene)
     }
 
     fn set_error_once(&mut self, err: Error) {
@@ -208,7 +143,7 @@ impl VelloRenderer {
     }
 }
 
-impl Sink for VelloRenderer {
+impl Sink for VelloRecorder {
     fn push_clip(&mut self, clip: Clip) {
         if self.error.is_some() {
             return;
@@ -468,118 +403,4 @@ impl Sink for VelloRenderer {
             }
         }
     }
-}
-
-async fn init_device_and_queue() -> Result<(wgpu::Device, wgpu::Queue), Error> {
-    let instance = wgpu::Instance::default();
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })
-        .await
-        .map_err(|_| Error::NoAdapter)?;
-
-    adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("imaging_vello device"),
-            required_features: wgpu::Features::empty(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| Error::RequestDevice)
-}
-
-fn create_targets(
-    device: &wgpu::Device,
-    width: u16,
-    height: u16,
-) -> (wgpu::Texture, wgpu::TextureView, wgpu::Buffer, u32) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("imaging_vello render target"),
-        size: wgpu::Extent3d {
-            width: u32::from(width),
-            height: u32::from(height),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let bytes_per_row = u32::from(width) * 4;
-    let padded_bytes_per_row = bytes_per_row.div_ceil(256) * 256;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("imaging_vello readback"),
-        size: u64::from(padded_bytes_per_row) * u64::from(height),
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    (texture, texture_view, readback, padded_bytes_per_row)
-}
-
-fn readback_rgba8(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    readback: &wgpu::Buffer,
-    bytes_per_row: u32,
-    width: u16,
-    height: u16,
-) -> Result<Vec<u8>, Error> {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("imaging_vello readback"),
-    });
-
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: None,
-            },
-        },
-        wgpu::Extent3d {
-            width: u32::from(width),
-            height: u32::from(height),
-            depth_or_array_layers: 1,
-        },
-    );
-
-    queue.submit([encoder.finish()]);
-
-    let slice = readback.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|_| Error::Internal("device poll failed"))?;
-    rx.recv()
-        .map_err(|_| Error::Internal("map_async callback dropped"))?
-        .map_err(|_| Error::Internal("buffer map failed"))?;
-
-    let mapped = slice.get_mapped_range();
-    let width_bytes = usize::from(width) * 4;
-
-    let mut out = Vec::with_capacity(usize::from(width) * usize::from(height) * 4);
-    for row in mapped.chunks_exact(bytes_per_row as usize) {
-        out.extend_from_slice(&row[..width_bytes]);
-    }
-    drop(mapped);
-    readback.unmap();
-    Ok(out)
 }
