@@ -219,7 +219,16 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo nextest
+        if: runner.os != 'Windows'
         run: cargo nextest run --workspace --locked --all-features --no-fail-fast
+
+      - name: cargo nextest (exclude imaging_snapshot_tests on Windows)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --workspace --locked --all-features --no-fail-fast --exclude imaging_snapshot_tests
+
+      - name: cargo test imaging_snapshot_tests (Windows, serial)
+        if: runner.os == 'Windows'
+        run: cargo test -p imaging_snapshot_tests --locked --all-features --no-fail-fast -- --test-threads=1
 
       - name: kompari report (on failure)
         if: failure() && runner.os == 'Linux'
