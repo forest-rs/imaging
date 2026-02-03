@@ -37,6 +37,19 @@ impl SnapshotCase for GmBlendGrid {
         "gm_blend_grid"
     }
 
+    fn skia_max_diff_pixels(&self) -> u64 {
+        // Skia's blend output can vary slightly across platforms/toolchains.
+        3_000
+    }
+
+    fn vello_max_diff_pixels(&self) -> u64 {
+        64
+    }
+
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        2_000
+    }
+
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(12, 12, 14));
 

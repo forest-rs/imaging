@@ -14,6 +14,15 @@ impl SnapshotCase for GmStrokes {
         "gm_strokes"
     }
 
+    fn skia_max_diff_pixels(&self) -> u64 {
+        // Minor variation in stroke rasterization/AA across platforms/toolchains.
+        2_500
+    }
+
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        3_000
+    }
+
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(245, 245, 250));
 

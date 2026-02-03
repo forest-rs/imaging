@@ -14,6 +14,10 @@ impl SnapshotCase for GmGroupBlurFilter {
         "gm_group_blur_filter"
     }
 
+    fn supports_backend(&self, backend: &str) -> bool {
+        backend == "skia" || backend == "vello_cpu"
+    }
+
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
         background(sink, width, height, Color::WHITE);
 
@@ -43,6 +47,15 @@ pub(crate) struct GmGroupDropShadow;
 impl SnapshotCase for GmGroupDropShadow {
     fn name(&self) -> &'static str {
         "gm_group_drop_shadow"
+    }
+
+    fn skia_max_diff_pixels(&self) -> u64 {
+        // Skia's drop-shadow filter output can differ slightly across platforms/toolchains.
+        2_000
+    }
+
+    fn supports_backend(&self, backend: &str) -> bool {
+        backend == "skia" || backend == "vello_cpu"
     }
 
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {

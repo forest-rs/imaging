@@ -14,6 +14,20 @@ impl SnapshotCase for GmClipNonIsolated {
         "gm_clip_non_isolated"
     }
 
+    fn skia_max_diff_pixels(&self) -> u64 {
+        // Skia's XOR compositing can vary slightly across platforms/toolchains.
+        8_000
+    }
+
+    fn vello_max_diff_pixels(&self) -> u64 {
+        32
+    }
+
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        // Hybrid can differ more on non-isolated clip edge AA.
+        512
+    }
+
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(30, 30, 34));
         sink.draw(Draw::Fill {

@@ -9,6 +9,7 @@ members = [
   "imaging_vello_cpu",
   "imaging_vello_hybrid",
   "imaging_wind_tunnel",
+  "xtask",
 ]
 
 [workspace.package]

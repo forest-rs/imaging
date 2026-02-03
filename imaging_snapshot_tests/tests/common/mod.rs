@@ -7,6 +7,10 @@
     missing_docs,
     reason = "Integration-test helper module; not part of the public API."
 )]
+#![allow(
+    dead_code,
+    reason = "Not all snapshot backends use the shared runner/check logic (e.g. Vello GPU device detection)."
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,15 +23,46 @@ use imaging_snapshot_tests::cases::{SnapshotCase, selected_cases_for_backend};
 
 pub(crate) fn run_cases(
     backend: &str,
+    render: impl FnMut(&dyn SnapshotCase) -> Image,
+    errors: &mut Vec<String>,
+) {
+    run_cases_with(backend, render, |_case| 0, errors);
+}
+
+pub(crate) fn try_init_or_skip<T, E>(
+    backend: &str,
+    try_init: impl FnOnce() -> Result<T, E>,
+) -> Option<T>
+where
+    E: core::fmt::Debug,
+{
+    match try_init() {
+        Ok(v) => Some(v),
+        Err(err) => {
+            eprintln!("[{backend}] skipping snapshots: {err:?}");
+            None
+        }
+    }
+}
+
+pub(crate) fn run_cases_with(
+    backend: &str,
     mut render: impl FnMut(&dyn SnapshotCase) -> Image,
+    mut max_allowed_different_pixels: impl FnMut(&dyn SnapshotCase) -> u64,
     errors: &mut Vec<String>,
 ) {
     for case in selected_cases_for_backend(backend) {
         if std::env::var("IMAGING_TEST_VERBOSE").is_ok() {
             eprintln!("[{backend}] running case `{}`", case.name());
         }
-        let image = render(*case);
-        check_snapshot(backend, case.name(), &image, errors);
+        let image = render(case);
+        check_snapshot_with_tolerance(
+            backend,
+            case.name(),
+            &image,
+            max_allowed_different_pixels(case),
+            errors,
+        );
     }
 }
 
@@ -49,12 +84,20 @@ pub(crate) fn accept_enabled() -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("accept"))
 }
 
+pub(crate) fn generate_all_enabled() -> bool {
+    std::env::var("IMAGING_TEST")
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("generate-all"))
+}
+
 pub(crate) fn assert_no_snapshot_errors(errors: Vec<String>) {
     if errors.is_empty() {
         return;
     }
 
-    eprintln!("Snapshot failures (use `IMAGING_TEST=accept` to bless):");
+    eprintln!(
+        "Snapshot failures (use `IMAGING_TEST=accept` to bless; `cargo xtask report` to view diffs):"
+    );
     for error in &errors {
         eprintln!("  - {error}");
     }
@@ -62,6 +105,16 @@ pub(crate) fn assert_no_snapshot_errors(errors: Vec<String>) {
 }
 
 pub(crate) fn check_snapshot(backend: &str, name: &str, image: &Image, errors: &mut Vec<String>) {
+    check_snapshot_with_tolerance(backend, name, image, 0, errors);
+}
+
+pub(crate) fn check_snapshot_with_tolerance(
+    backend: &str,
+    name: &str,
+    image: &Image,
+    max_allowed_different_pixels: u64,
+    errors: &mut Vec<String>,
+) {
     let expected_dir = snapshots_dir(backend);
     let expected_path = expected_dir.join(format!("{name}.png"));
     let current_dir = current_dir(backend);
@@ -71,6 +124,7 @@ pub(crate) fn check_snapshot(backend: &str, name: &str, image: &Image, errors: &
     fs::create_dir_all(&current_dir).expect("create current dir");
 
     let accept = accept_enabled();
+    let generate_all = generate_all_enabled();
 
     if !expected_path.exists() {
         if accept {
@@ -96,7 +150,28 @@ pub(crate) fn check_snapshot(backend: &str, name: &str, image: &Image, errors: &
 
     let expected = load_image(&expected_path).expect("load expected snapshot png");
     match compare_images(&expected, image) {
-        ImageDifference::None => {}
+        ImageDifference::None => {
+            if generate_all {
+                fs::write(
+                    &current_path,
+                    image_to_png(image, SizeOptimizationLevel::Fast),
+                )
+                .expect("write current image");
+            }
+        }
+        ImageDifference::Content {
+            n_different_pixels, ..
+        } if max_allowed_different_pixels > 0
+            && n_different_pixels <= max_allowed_different_pixels =>
+        {
+            if generate_all {
+                fs::write(
+                    &current_path,
+                    image_to_png(image, SizeOptimizationLevel::Fast),
+                )
+                .expect("write current image");
+            }
+        }
         diff => {
             if accept {
                 fs::write(

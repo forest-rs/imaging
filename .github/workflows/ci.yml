@@ -22,6 +22,7 @@ env:
     --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
+    --exclude xtask
   # List of packages that don't support wasip1
   RUST_NO_WASIP1_PKGS: >-
     --exclude imaging_conformance
@@ -31,6 +32,7 @@ env:
     --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
+    --exclude xtask
   # List of packages that don't support wasm32
   RUST_NO_WASM_PKGS: >-
     --exclude imaging_conformance
@@ -40,6 +42,7 @@ env:
     --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
+    --exclude xtask
   # List of features that depend on the standard library and will be excluded from no_std checks.
   FEATURES_DEPENDING_ON_STD: "std,default"
 
@@ -217,6 +220,26 @@ jobs:
 
       - name: cargo nextest
         run: cargo nextest run --workspace --locked --all-features --no-fail-fast
+
+      - name: kompari report (on failure)
+        if: failure() && runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          cargo xtask report --backend vello_cpu
+          cargo xtask report --backend skia
+          cargo xtask report --backend vello_hybrid
+          cargo xtask report --backend vello
+
+      - name: upload kompari report artifact (on failure)
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kompari-report-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            imaging_snapshot_tests/tests/report-*.html
+            imaging_snapshot_tests/tests/current
+            imaging_snapshot_tests/tests/snapshots
 
       - name: cargo test --doc
         run: cargo test --doc --workspace --locked --all-features --no-fail-fast

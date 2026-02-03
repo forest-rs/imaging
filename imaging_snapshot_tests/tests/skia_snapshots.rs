@@ -31,6 +31,11 @@ fn render_case(case: &dyn imaging_snapshot_tests::cases::SnapshotCase) -> Image 
 #[test]
 fn snapshots() {
     let mut errors = Vec::new();
-    common::run_cases("skia", render_case, &mut errors);
+    common::run_cases_with(
+        "skia",
+        render_case,
+        |case| case.skia_max_diff_pixels(),
+        &mut errors,
+    );
     common::assert_no_snapshot_errors(errors);
 }

@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Snapshot test infrastructure for `imaging` backends.
-//!
-//! This crate will host Kompari-driven image snapshot tests (borrowed from Understory's
-//! `understory_imaging_snapshot_tests`) while keeping the `imaging` core crate dependency-free.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 

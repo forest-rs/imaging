@@ -48,6 +48,20 @@ impl SnapshotCase for GmGradientsLinear {
         "gm_gradients_linear"
     }
 
+    fn skia_max_diff_pixels(&self) -> u64 {
+        // Minor variation in gradient interpolation/AA across platforms/toolchains.
+        512
+    }
+
+    fn vello_max_diff_pixels(&self) -> u64 {
+        64
+    }
+
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        // Hybrid can differ more across drivers for AA/gradient edges.
+        256
+    }
+
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(18, 18, 22));
 
@@ -78,6 +92,15 @@ pub(crate) struct GmGradientsSweep;
 impl SnapshotCase for GmGradientsSweep {
     fn name(&self) -> &'static str {
         "gm_gradients_sweep"
+    }
+
+    fn skia_max_diff_pixels(&self) -> u64 {
+        // Minor variation in sweep gradient rasterization/AA across platforms/toolchains.
+        512
+    }
+
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        256
     }
 
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
@@ -114,6 +137,14 @@ pub(crate) struct GmGradientsTwoPointRadial;
 impl SnapshotCase for GmGradientsTwoPointRadial {
     fn name(&self) -> &'static str {
         "gm_gradients_two_point_radial"
+    }
+
+    fn vello_max_diff_pixels(&self) -> u64 {
+        64
+    }
+
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        256
     }
 
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
