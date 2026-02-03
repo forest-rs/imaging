@@ -20,6 +20,8 @@ use alloc::vec::Vec;
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
 use peniko::{BlendMode, Brush, Fill};
 
+pub mod validation;
+
 /// Fill rule used by fills and fill-style clips.
 pub type FillRule = Fill;
 
