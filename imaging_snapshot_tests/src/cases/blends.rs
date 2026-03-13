@@ -44,8 +44,8 @@ impl SnapshotCase for GmBlendGrid {
     fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(12, 12, 14));
 
-        let cols = 4.0;
-        let cell_w = width / cols;
+        let cols = 4_usize;
+        let cell_w = width / cols as f64;
         let cell_h = height / 3.0;
         let pad = 6.0;
         let tol = 0.1;
@@ -66,8 +66,8 @@ impl SnapshotCase for GmBlendGrid {
         ];
 
         for (i, (mode, alpha)) in modes.iter().enumerate() {
-            let col = (i as f64) % cols;
-            let row = ((i as f64) / cols).floor();
+            let col = (i % cols) as f64;
+            let row = (i / cols) as f64;
             let x0 = col * cell_w;
             let y0 = row * cell_h;
             let x1 = x0 + cell_w;
