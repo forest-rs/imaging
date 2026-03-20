@@ -39,9 +39,9 @@
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef, StrokeStyle, record::Geometry,
+    StrokeRef, record::Geometry,
 };
-use kurbo::{Affine, BezPath, Rect, RoundedRect};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
 use peniko::Brush;
 
 /// Decision returned by a [`ValidatingSink`] violation hook.
@@ -266,7 +266,7 @@ where
         }
     }
 
-    fn validate_stroke(&mut self, stroke: &StrokeStyle) -> bool {
+    fn validate_stroke(&mut self, stroke: &Stroke) -> bool {
         let ok = stroke.width.is_finite()
             && stroke.width >= 0.0
             && stroke.miter_limit.is_finite()
@@ -627,14 +627,15 @@ where
 mod tests {
     use super::*;
     use crate::{
-        ClipRef, Composite, FillRef, FillRule, GlyphRunRef,
+        ClipRef, Composite, FillRef, GlyphRunRef,
         record::{Geometry, Glyph, Scene},
     };
     use alloc::sync::Arc;
     use alloc::vec;
     use kurbo::Rect;
     use peniko::{
-        Blob, Brush, Color, FontData, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
+        Blob, Brush, Color, Fill, FontData, Gradient, ImageAlphaType, ImageBrush, ImageData,
+        ImageFormat,
     };
 
     #[test]
@@ -686,7 +687,7 @@ mod tests {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
         let font = FontData::new(Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
-        let style = peniko::Style::Fill(FillRule::NonZero);
+        let style = peniko::Style::Fill(Fill::NonZero);
         let glyphs = vec![Glyph {
             id: 1,
             x: 0.0,

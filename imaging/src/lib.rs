@@ -102,8 +102,8 @@
 
 extern crate alloc;
 
-use kurbo::{Affine, Rect, Stroke};
-use peniko::{BlendMode, Fill, Style};
+use kurbo::{Affine, Rect};
+use peniko::BlendMode;
 
 mod paint;
 mod painter;
@@ -114,15 +114,6 @@ pub use paint::{
     ClipRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, Painter, StrokeBuilder};
-
-/// Fill rule used by fills and fill-style clips.
-pub type FillRule = Fill;
-
-/// Stroke style used by strokes and stroke-style clips.
-pub type StrokeStyle = Stroke;
-
-/// Glyph drawing style used by [`record::GlyphRun`].
-pub type GlyphStyle = Style;
 
 /// Normalized variable-font coordinate value.
 pub type NormalizedCoord = i16;

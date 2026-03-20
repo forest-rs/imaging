@@ -8,12 +8,12 @@
 
 use alloc::vec::Vec;
 
-use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _};
-use peniko::{Brush, FontData};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
+use peniko::{Brush, Fill, FontData, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, FillRule, GlyphRunRef, GlyphStyle, GroupRef,
-    NormalizedCoord, PaintSink, StrokeRef, StrokeStyle,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GlyphRunRef, GroupRef, NormalizedCoord,
+    PaintSink, StrokeRef,
 };
 
 /// A geometry payload stored in a recording.
@@ -55,7 +55,7 @@ pub enum Clip {
         /// Shape used to define the clip region.
         shape: Geometry,
         /// Fill rule used to determine the interior for path clips.
-        fill_rule: FillRule,
+        fill_rule: Fill,
     },
     /// Clip to the filled outline of a stroked shape.
     Stroke {
@@ -66,7 +66,7 @@ pub enum Clip {
         /// Shape whose stroked outline defines the clip region.
         shape: Geometry,
         /// Stroke style used to compute the outline (including dashes).
-        stroke: StrokeStyle,
+        stroke: Stroke,
     },
 }
 
@@ -143,7 +143,7 @@ pub struct GlyphRun {
     /// Normalized variation coordinates for variable fonts.
     pub normalized_coords: Vec<NormalizedCoord>,
     /// Fill or stroke style for the glyphs.
-    pub style: GlyphStyle,
+    pub style: Style,
     /// Positioned glyphs in the run.
     pub glyphs: Vec<Glyph>,
     /// Brush used for the run.
@@ -163,7 +163,7 @@ impl GlyphRun {
             font_size: 16.0,
             hint: false,
             normalized_coords: Vec::new(),
-            style: GlyphStyle::Fill(FillRule::NonZero),
+            style: Style::Fill(Fill::NonZero),
             glyphs: Vec::new(),
             brush: Brush::Solid(peniko::Color::BLACK),
             composite: Composite::default(),
@@ -182,7 +182,7 @@ pub enum Draw {
         /// Geometry transform.
         transform: Affine,
         /// Fill rule used to determine inside/outside for paths.
-        fill_rule: FillRule,
+        fill_rule: Fill,
         /// Brush used by this draw.
         brush: Brush,
         /// Optional brush-space transform (for gradients/images).
@@ -197,7 +197,7 @@ pub enum Draw {
         /// Geometry transform.
         transform: Affine,
         /// Stroke style.
-        stroke: StrokeStyle,
+        stroke: Stroke,
         /// Brush used by this draw.
         brush: Brush,
         /// Optional brush-space transform (for gradients/images).
@@ -428,7 +428,7 @@ mod tests {
         let _clip = s.push_clip(Clip::Fill {
             transform: Affine::IDENTITY,
             shape: Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
-            fill_rule: FillRule::NonZero,
+            fill_rule: Fill::NonZero,
         });
         let _group = s.push_group(Group::default());
         s.pop_group();
@@ -449,12 +449,12 @@ mod tests {
         let _ = a.push_clip(Clip::Fill {
             transform: Affine::IDENTITY,
             shape: Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
-            fill_rule: FillRule::NonZero,
+            fill_rule: Fill::NonZero,
         });
         let _ = a.push_group(Group::default());
         a.draw(Draw::Fill {
             transform: Affine::IDENTITY,
-            fill_rule: FillRule::NonZero,
+            fill_rule: Fill::NonZero,
             brush: Brush::Solid(peniko::Color::WHITE),
             brush_transform: None,
             shape: Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
@@ -468,7 +468,7 @@ mod tests {
             font_size: 12.0,
             hint: false,
             normalized_coords: Vec::new(),
-            style: GlyphStyle::Fill(FillRule::NonZero),
+            style: Style::Fill(Fill::NonZero),
             glyphs: vec![Glyph {
                 id: 7,
                 x: 0.0,

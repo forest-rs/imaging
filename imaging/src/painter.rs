@@ -3,12 +3,12 @@
 
 //! Painter-style authoring helpers built on top of [`PaintSink`].
 
-use kurbo::{Affine, Rect};
-use peniko::Brush;
+use kurbo::{Affine, Rect, Stroke};
+use peniko::{Brush, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GlyphStyle,
-    GroupRef, NormalizedCoord, PaintSink, StrokeRef, StrokeStyle, record::Glyph,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef,
+    NormalizedCoord, PaintSink, StrokeRef, record::Glyph,
 };
 
 /// Painter-style authoring wrapper over a [`PaintSink`].
@@ -48,7 +48,7 @@ where
     pub fn stroke<'b>(
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
-        stroke: &'b StrokeStyle,
+        stroke: &'b Stroke,
         brush: &'b Brush,
     ) -> StrokeBuilder<'b, S> {
         StrokeBuilder {
@@ -104,7 +104,7 @@ where
     pub fn with_stroke_clip<'b>(
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
-        stroke: &'b StrokeStyle,
+        stroke: &'b Stroke,
         f: impl FnOnce(&mut Painter<'_, S>),
     ) {
         self.with_clip(ClipRef::stroke(shape, stroke), f);
@@ -265,7 +265,7 @@ where
     }
 
     /// Emit the glyph run to the wrapped sink.
-    pub fn draw(self, style: &'a GlyphStyle, glyphs: &'a [Glyph]) {
+    pub fn draw(self, style: &'a Style, glyphs: &'a [Glyph]) {
         self.sink.glyph_run(GlyphRunRef {
             font: self.font,
             transform: self.transform,

@@ -7,11 +7,11 @@
 //! first constructing owned recording payloads. [`crate::record::Scene`] remains the owned
 //! semantic recording format.
 
-use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _};
-use peniko::Brush;
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
+use peniko::{Brush, Fill, Style};
 
 use crate::{
-    BlurredRoundedRect, Composite, FillRule, Filter, GlyphStyle, NormalizedCoord, StrokeStyle,
+    BlurredRoundedRect, Composite, Filter, NormalizedCoord,
     record::{
         Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group, GroupId, Scene,
     },
@@ -104,7 +104,7 @@ pub enum ClipRef<'a> {
         /// Shape used to define the clip region.
         shape: GeometryRef<'a>,
         /// Fill rule used to determine the interior for path clips.
-        fill_rule: FillRule,
+        fill_rule: Fill,
     },
     /// Clip to the filled outline of a stroked shape.
     Stroke {
@@ -113,7 +113,7 @@ pub enum ClipRef<'a> {
         /// Shape whose stroked outline defines the clip region.
         shape: GeometryRef<'a>,
         /// Stroke style used to compute the outline.
-        stroke: &'a StrokeStyle,
+        stroke: &'a Stroke,
     },
 }
 
@@ -124,13 +124,13 @@ impl<'a> ClipRef<'a> {
         Self::Fill {
             transform: Affine::IDENTITY,
             shape: shape.into(),
-            fill_rule: FillRule::NonZero,
+            fill_rule: Fill::NonZero,
         }
     }
 
     /// Create a fill-style clip with an explicit fill rule.
     #[must_use]
-    pub fn fill_with_rule(shape: impl Into<GeometryRef<'a>>, fill_rule: FillRule) -> Self {
+    pub fn fill_with_rule(shape: impl Into<GeometryRef<'a>>, fill_rule: Fill) -> Self {
         Self::Fill {
             transform: Affine::IDENTITY,
             shape: shape.into(),
@@ -140,7 +140,7 @@ impl<'a> ClipRef<'a> {
 
     /// Create a stroke-style clip.
     #[must_use]
-    pub fn stroke(shape: impl Into<GeometryRef<'a>>, stroke: &'a StrokeStyle) -> Self {
+    pub fn stroke(shape: impl Into<GeometryRef<'a>>, stroke: &'a Stroke) -> Self {
         Self::Stroke {
             transform: Affine::IDENTITY,
             shape: shape.into(),
@@ -240,7 +240,7 @@ pub struct FillRef<'a> {
     /// Geometry transform.
     pub transform: Affine,
     /// Fill rule used to determine inside/outside for paths.
-    pub fill_rule: FillRule,
+    pub fill_rule: Fill,
     /// Brush used by this draw.
     pub brush: &'a Brush,
     /// Optional brush-space transform (for gradients/images).
@@ -257,7 +257,7 @@ impl<'a> FillRef<'a> {
     pub fn new(shape: impl Into<GeometryRef<'a>>, brush: &'a Brush) -> Self {
         Self {
             transform: Affine::IDENTITY,
-            fill_rule: FillRule::NonZero,
+            fill_rule: Fill::NonZero,
             brush,
             brush_transform: None,
             shape: shape.into(),
@@ -274,7 +274,7 @@ impl<'a> FillRef<'a> {
 
     /// Set the fill rule.
     #[must_use]
-    pub fn fill_rule(mut self, fill_rule: FillRule) -> Self {
+    pub fn fill_rule(mut self, fill_rule: Fill) -> Self {
         self.fill_rule = fill_rule;
         self
     }
@@ -313,7 +313,7 @@ pub struct StrokeRef<'a> {
     /// Geometry transform.
     pub transform: Affine,
     /// Stroke style.
-    pub stroke: &'a StrokeStyle,
+    pub stroke: &'a Stroke,
     /// Brush used by this draw.
     pub brush: &'a Brush,
     /// Optional brush-space transform (for gradients/images).
@@ -327,11 +327,7 @@ pub struct StrokeRef<'a> {
 impl<'a> StrokeRef<'a> {
     /// Create a stroke draw with default transform, brush transform, and composite state.
     #[must_use]
-    pub fn new(
-        shape: impl Into<GeometryRef<'a>>,
-        stroke: &'a StrokeStyle,
-        brush: &'a Brush,
-    ) -> Self {
+    pub fn new(shape: impl Into<GeometryRef<'a>>, stroke: &'a Stroke, brush: &'a Brush) -> Self {
         Self {
             transform: Affine::IDENTITY,
             stroke,
@@ -393,7 +389,7 @@ pub struct GlyphRunRef<'a> {
     /// Normalized variation coordinates for a variable font instance.
     pub normalized_coords: &'a [NormalizedCoord],
     /// Fill or stroke style for the glyphs.
-    pub style: &'a GlyphStyle,
+    pub style: &'a Style,
     /// Positioned glyphs in the run.
     pub glyphs: &'a [Glyph],
     /// Brush used for the run.
@@ -407,7 +403,7 @@ impl<'a> GlyphRunRef<'a> {
     #[must_use]
     pub fn new(
         font: &'a peniko::FontData,
-        style: &'a GlyphStyle,
+        style: &'a Style,
         glyphs: &'a [Glyph],
         brush: &'a Brush,
     ) -> Self {

@@ -1,8 +1,8 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{PaintSink, Painter, StrokeStyle, record::Geometry};
-use kurbo::{Affine, BezPath, Cap, Join, Point};
+use imaging::{PaintSink, Painter, record::Geometry};
+use kurbo::{Affine, BezPath, Cap, Join, Point, Stroke};
 use peniko::{Brush, Color};
 
 use super::SnapshotCase;
@@ -34,7 +34,7 @@ impl SnapshotCase for GmStrokes {
         for (i, (join, start_cap, end_cap, dash)) in styles.iter().enumerate() {
             let y = (i as f64) * (height * 0.18);
             let transform = Affine::translate((0.0, y));
-            let mut stroke = StrokeStyle::new(14.0)
+            let mut stroke = Stroke::new(14.0)
                 .with_join(*join)
                 .with_start_cap(*start_cap)
                 .with_end_cap(*end_cap);

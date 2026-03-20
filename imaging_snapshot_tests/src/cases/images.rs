@@ -1,8 +1,8 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, PaintSink, Painter, StrokeStyle, record::Geometry};
-use kurbo::{Affine, BezPath, Point, Rect, RoundedRect};
+use imaging::{Composite, PaintSink, Painter, record::Geometry};
+use kurbo::{Affine, BezPath, Point, Rect, RoundedRect, Stroke};
 use peniko::{BlendMode, Brush, Color, Extend, ImageBrush, ImageQuality, Mix};
 
 use super::SnapshotCase;
@@ -61,7 +61,7 @@ impl SnapshotCase for GmImageBrushes {
             .composite(Composite::new(BlendMode::from(Mix::Multiply), 1.0))
             .draw();
 
-        let frame_stroke = StrokeStyle::new(20.0);
+        let frame_stroke = Stroke::new(20.0);
         let frame_brush = Brush::Image(
             ImageBrush::new(test_image())
                 .with_extend(Extend::Reflect)

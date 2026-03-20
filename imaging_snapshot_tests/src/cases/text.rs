@@ -1,8 +1,8 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{PaintSink, Painter, StrokeStyle, record::Glyph};
-use kurbo::Affine;
+use imaging::{PaintSink, Painter, record::Glyph};
+use kurbo::{Affine, Stroke};
 use peniko::{Brush, Color, Fill, Style};
 use skrifa::{FontRef, MetadataProvider};
 
@@ -38,7 +38,7 @@ impl SnapshotCase for GmGlyphRuns {
 
         let stroke_glyphs = glyphs_for_text(&font, 34.0, "glyph run");
         let stroke_paint = Brush::Solid(Color::from_rgba8(178, 74, 30, 255));
-        let stroke_style = Style::Stroke(StrokeStyle::new(1.5));
+        let stroke_style = Style::Stroke(Stroke::new(1.5));
         painter
             .glyphs(&font, &stroke_paint)
             .transform(Affine::translate((22.0, 172.0)))

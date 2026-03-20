@@ -9,19 +9,15 @@
 #[cfg(test)]
 mod tests {
     use imaging::{
-        FillRule,
-        record::{Clip, Geometry, Group, Scene, ValidateError},
+        ClipRef,
+        record::{Geometry, Group, Scene, ValidateError},
     };
     use kurbo::Rect;
 
     #[test]
     fn smoke() {
         let mut s = Scene::new();
-        s.push_clip(Clip::Fill {
-            transform: kurbo::Affine::IDENTITY,
-            shape: Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
-            fill_rule: FillRule::NonZero,
-        });
+        s.push_clip(ClipRef::fill(Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0))).to_owned());
         s.push_group(Group::default());
         s.pop_group();
         s.pop_clip();
