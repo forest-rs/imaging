@@ -321,84 +321,6 @@ impl GlyphRun {
     }
 }
 
-/// Builder for recording a glyph run into a [`Scene`].
-#[must_use = "Methods on the builder don't do anything until `draw` is called."]
-#[derive(Debug)]
-pub struct DrawGlyphs<'a> {
-    scene: &'a mut Scene,
-    glyph_run: GlyphRun,
-}
-
-impl<'a> DrawGlyphs<'a> {
-    fn new(scene: &'a mut Scene, font: &FontData) -> Self {
-        Self {
-            scene,
-            glyph_run: GlyphRun::new(font.clone()),
-        }
-    }
-
-    /// Set the global transform applied to the run.
-    pub fn transform(mut self, transform: Affine) -> Self {
-        self.glyph_run.transform = transform;
-        self
-    }
-
-    /// Set the per-glyph transform applied before the glyph offset translation.
-    pub fn glyph_transform(mut self, transform: Option<Affine>) -> Self {
-        self.glyph_run.glyph_transform = transform;
-        self
-    }
-
-    /// Set the font size in pixels per em.
-    pub fn font_size(mut self, size: f32) -> Self {
-        self.glyph_run.font_size = size;
-        self
-    }
-
-    /// Set whether hinting is enabled.
-    pub fn hint(mut self, hint: bool) -> Self {
-        self.glyph_run.hint = hint;
-        self
-    }
-
-    /// Set normalized variation coordinates for a variable font instance.
-    pub fn normalized_coords(mut self, coords: &[NormalizedCoord]) -> Self {
-        self.glyph_run.normalized_coords.clear();
-        self.glyph_run.normalized_coords.extend_from_slice(coords);
-        self
-    }
-
-    /// Set the brush used for the run.
-    pub fn brush(mut self, brush: impl Into<Paint>) -> Self {
-        self.glyph_run.paint = brush.into();
-        self
-    }
-
-    /// Set an extra alpha multiplier for the run's brush.
-    pub fn brush_alpha(mut self, alpha: f32) -> Self {
-        self.glyph_run.composite.alpha = alpha.clamp(0.0, 1.0);
-        self
-    }
-
-    /// Set the full compositing state for the run.
-    pub fn composite(mut self, composite: Composite) -> Self {
-        self.glyph_run.composite = composite;
-        self
-    }
-
-    /// Record the glyph run into the scene.
-    pub fn draw(
-        mut self,
-        style: impl Into<GlyphStyle>,
-        glyphs: impl IntoIterator<Item = Glyph>,
-    ) -> DrawId {
-        self.glyph_run.style = style.into();
-        self.glyph_run.glyphs.clear();
-        self.glyph_run.glyphs.extend(glyphs);
-        self.scene.draw(Draw::GlyphRun(self.glyph_run))
-    }
-}
-
 /// A drawing command that produces pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Draw {
@@ -544,12 +466,6 @@ impl Scene {
         id
     }
 
-    /// Returns a builder for recording a glyph run.
-    #[inline]
-    pub fn draw_glyphs(&mut self, font: &FontData) -> DrawGlyphs<'_> {
-        DrawGlyphs::new(self, font)
-    }
-
     /// Validate well-nested stacks.
     pub fn validate(&self) -> Result<(), ValidateError> {
         let mut clip_depth = 0_u32;
@@ -642,6 +558,7 @@ pub enum ValidateError {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
+    use alloc::vec;
 
     #[test]
     fn validate_balanced() {
@@ -682,14 +599,22 @@ mod tests {
             composite: Composite::default(),
         });
         let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
-        let _ = a.draw_glyphs(&font).font_size(12.0).draw(
-            GlyphStyle::Fill(FillRule::NonZero),
-            [Glyph {
+        a.draw(Draw::GlyphRun(GlyphRun {
+            font,
+            transform: Affine::IDENTITY,
+            glyph_transform: None,
+            font_size: 12.0,
+            hint: false,
+            normalized_coords: Vec::new(),
+            style: GlyphStyle::Fill(FillRule::NonZero),
+            glyphs: vec![Glyph {
                 id: 7,
                 x: 0.0,
                 y: 0.0,
             }],
-        );
+            paint: Paint::Solid(peniko::Color::BLACK),
+            composite: Composite::default(),
+        }));
         a.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {
             transform: Affine::IDENTITY,
             rect: Rect::new(0.0, 0.0, 4.0, 3.0),
