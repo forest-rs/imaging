@@ -3,18 +3,98 @@
 
 //! `imaging`: backend-agnostic 2D imaging recording + streaming API.
 //!
-//! This crate has two primary public layers:
-//! - [`PaintSink`] and [`Painter`] for borrowed command authoring and streaming.
-//! - [`record`] for owned semantic recordings you can retain, validate, and replay.
+//! `imaging` has two primary workflows:
+//! - Painting: stream borrowed commands into any [`PaintSink`] with [`Painter`].
+//! - Recording: retain an owned command stream in [`record::Scene`] for validation and replay.
 //!
 //! The root of the crate is intentionally focused on the streaming surface and the shared drawing
 //! vocabulary. Retained scene data and low-level recording payloads live under [`record`].
 //!
-//! Use [`Painter`] with any [`PaintSink`] when authoring commands. Record into
-//! [`record::Scene`] when you need backend-independent retention, validation, testing, or replay.
+//! # Painting
 //!
-//! Migration note: retained types that previously lived at the crate root now live under
-//! [`record`], for example [`record::Scene`] and [`record::Draw`].
+//! Use [`Painter`] when you want to stream commands directly into a renderer, backend-native
+//! recorder, validator, or any other [`PaintSink`] implementation without first constructing owned
+//! retained payloads.
+//!
+//! ```rust
+//! use imaging::{
+//!     BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, StrokeRef,
+//! };
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! #[derive(Default)]
+//! struct CountingSink {
+//!     fills: usize,
+//!     clips: usize,
+//! }
+//!
+//! impl PaintSink for CountingSink {
+//!     fn push_clip(&mut self, _clip: ClipRef<'_>) {
+//!         self.clips += 1;
+//!     }
+//!
+//!     fn pop_clip(&mut self) {}
+//!
+//!     fn push_group(&mut self, _group: GroupRef<'_>) {}
+//!
+//!     fn pop_group(&mut self) {}
+//!
+//!     fn fill(&mut self, _draw: FillRef<'_>) {
+//!         self.fills += 1;
+//!     }
+//!
+//!     fn stroke(&mut self, _draw: StrokeRef<'_>) {}
+//!
+//!     fn glyph_run(&mut self, _draw: GlyphRunRef<'_>) {}
+//!
+//!     fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
+//! }
+//!
+//! let paint = Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb));
+//! let mut sink = CountingSink::default();
+//!
+//! {
+//!     let mut painter = Painter::new(&mut sink);
+//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), &paint);
+//!     painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |p| {
+//!         p.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), &paint);
+//!     });
+//! }
+//!
+//! assert_eq!(sink.fills, 2);
+//! assert_eq!(sink.clips, 1);
+//! ```
+//!
+//! # Recording
+//!
+//! Use [`record::Scene`] when you want an owned, backend-agnostic recording you can retain,
+//! validate, compare in tests, and replay into another sink later.
+//!
+//! ```rust
+//! use imaging::{record, Painter};
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! let paint = Brush::Solid(Color::from_rgb8(0x12, 0x34, 0x56));
+//! let mut scene = record::Scene::new();
+//!
+//! {
+//!     let mut painter = Painter::new(&mut scene);
+//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), &paint);
+//! }
+//!
+//! scene.validate()?;
+//! assert_eq!(scene.commands().len(), 1);
+//!
+//! let mut replayed = record::Scene::new();
+//! record::replay(&scene, &mut replayed);
+//! assert_eq!(scene, replayed);
+//! # Ok::<(), record::ValidateError>(())
+//! ```
+//!
+//! Low-level retained payloads like [`record::Draw`], [`record::Clip`], and [`record::Group`] are
+//! also public under [`record`] when you need exact control over the recorded representation.
 //!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 

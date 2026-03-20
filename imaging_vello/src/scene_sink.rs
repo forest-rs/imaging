@@ -1,269 +1,60 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Vello backend for `imaging`.
-//!
-//! This crate provides a headless CPU/GPU renderer that consumes `imaging::record::Scene` (or
-//! accepts commands directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using
-//! `vello` + `wgpu`.
-//!
-//! # Render A Recorded Scene
-//!
-//! Record commands into [`imaging::record::Scene`], then render them with [`VelloRenderer`].
-//!
-//! ```no_run
-//! use imaging::{Painter, record};
-//! use imaging_vello::VelloRenderer;
-//! use kurbo::Rect;
-//! use peniko::{Brush, Color};
-//!
-//! fn main() -> Result<(), imaging_vello::Error> {
-//!     let paint = Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb));
-//!     let mut scene = record::Scene::new();
-//!
-//!     {
-//!         let mut painter = Painter::new(&mut scene);
-//!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
-//!     }
-//!
-//!     let mut renderer = VelloRenderer::try_new(128, 128)?;
-//!     let rgba = renderer.render_scene_rgba8(&scene)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
-//!     Ok(())
-//! }
-//! ```
-//!
-//! # Stream Commands Directly
-//!
-//! [`VelloRenderer`] also implements [`imaging::PaintSink`], so you can stream commands directly
-//! and then call [`VelloRenderer::finish_rgba8`].
-//!
-//! ```no_run
-//! use imaging::Painter;
-//! use imaging_vello::VelloRenderer;
-//! use kurbo::Rect;
-//! use peniko::{Brush, Color};
-//!
-//! fn main() -> Result<(), imaging_vello::Error> {
-//!     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
-//!     let mut renderer = VelloRenderer::try_new(128, 128)?;
-//!
-//!     {
-//!         let mut painter = Painter::new(&mut renderer);
-//!         painter.fill_rect(Rect::new(16.0, 16.0, 112.0, 112.0), &paint);
-//!     }
-//!
-//!     let rgba = renderer.finish_rgba8()?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
-//!     Ok(())
-//! }
-//! ```
-//!
-//! # Record Into `vello::Scene`
-//!
-//! If you want a backend-native retained scene without going through [`VelloRenderer`], wrap a
-//! mutable [`vello::Scene`] with [`VelloSceneSink`].
-//!
-//! ```no_run
-//! use imaging::Painter;
-//! use imaging_vello::VelloSceneSink;
-//! use kurbo::Rect;
-//! use peniko::{Brush, Color};
-//!
-//! fn main() -> Result<(), imaging_vello::Error> {
-//!     let paint = Brush::Solid(Color::from_rgb8(0x1d, 0x4e, 0x89));
-//!     let mut scene = vello::Scene::new();
-//!
-//!     {
-//!         let bounds = Rect::new(0.0, 0.0, 128.0, 128.0);
-//!         let mut sink = VelloSceneSink::new(&mut scene, bounds);
-//!         let mut painter = Painter::new(&mut sink);
-//!         painter.fill_rect(bounds, &paint);
-//!         sink.finish()?;
-//!     }
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! Note: Vello uses a single layer stack for clipping and blending. Scenes that interleave clips
-//! and groups in ways Vello cannot represent may return [`Error::UnbalancedLayerStack`].
-
-#![deny(unsafe_code)]
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
-
-mod scene_sink;
-
+use super::{Error, LayerKind};
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
     StrokeRef,
-    record::{Scene, ValidateError, replay},
 };
 use kurbo::{Affine, Rect};
 use peniko::{Brush, Fill};
-use std::sync::mpsc;
-use vello::wgpu;
-use vello::{AaConfig, Glyph as VelloGlyph, RenderParams};
+use vello::Glyph as VelloGlyph;
 
-pub use scene_sink::VelloSceneSink;
-
-/// Errors that can occur when rendering via Vello.
-#[derive(Debug)]
-pub enum Error {
-    /// The scene is invalid (unbalanced stacks).
-    InvalidScene(ValidateError),
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
-    /// A filter configuration could not be translated.
-    UnsupportedFilter,
-    /// Glyph draws with non-default blend modes are not supported by this backend yet.
-    UnsupportedGlyphBlend,
-    /// Blurred rounded rect draws with non-default blend modes are not supported by this backend yet.
-    UnsupportedBlurredRoundedRectBlend,
-    /// The clip/group stack was not well-nested for this backend.
-    ///
-    /// Vello uses a single layer stack for both clipping and blending; `imaging` tracks these as
-    /// separate stacks, so scenes that interleave them (e.g. `push_clip`, `push_group`, `pop_clip`)
-    /// cannot be represented directly.
-    UnbalancedLayerStack,
-    /// No suitable GPU adapter was found.
-    NoAdapter,
-    /// A GPU device could not be created.
-    RequestDevice,
-    /// Vello returned a render error.
-    Render(vello::Error),
-    /// An internal invariant was violated.
-    Internal(&'static str),
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LayerKind {
-    Clip,
-    Group,
-}
-
-/// Renderer that executes `imaging` commands using `vello` + `wgpu`.
-pub struct VelloRenderer {
-    scene: vello::Scene,
-    renderer: vello::Renderer,
-
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-
-    texture: wgpu::Texture,
-    texture_view: wgpu::TextureView,
-    readback: wgpu::Buffer,
-    bytes_per_row: u32,
-
-    width: u16,
-    height: u16,
-    tolerance: f64,
+/// Borrowed adapter that streams `imaging` commands into an existing [`vello::Scene`].
+///
+/// Use this when you want a backend-native retained scene without owning a full
+/// [`crate::VelloRenderer`]. Call [`VelloSceneSink::finish`] after streaming to surface any
+/// deferred translation errors and to confirm the Vello layer stack is balanced.
+pub struct VelloSceneSink<'a> {
+    scene: &'a mut vello::Scene,
+    surface_clip: Rect,
     error: Option<Error>,
     layer_stack: Vec<LayerKind>,
 }
 
-impl core::fmt::Debug for VelloRenderer {
+impl core::fmt::Debug for VelloSceneSink<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VelloRenderer")
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("tolerance", &self.tolerance)
+        f.debug_struct("VelloSceneSink")
+            .field("surface_clip", &self.surface_clip)
             .field("error", &self.error)
             .field("layer_stack_depth", &self.layer_stack.len())
             .finish_non_exhaustive()
     }
 }
 
-impl VelloRenderer {
-    /// Create a renderer for a fixed-size target.
-    pub fn new(width: u16, height: u16) -> Self {
-        Self::try_new(width, height).expect("create imaging_vello renderer")
-    }
-
-    /// Create a renderer for a fixed-size target.
+impl<'a> VelloSceneSink<'a> {
+    /// Wrap an existing [`vello::Scene`].
     ///
-    /// This is fallible because `wgpu` may not be able to find a compatible adapter/device
-    /// in some sandboxed or headless environments.
-    pub fn try_new(width: u16, height: u16) -> Result<Self, Error> {
-        let (device, queue) = pollster::block_on(init_device_and_queue())?;
-        let (texture, texture_view, readback, bytes_per_row) =
-            create_targets(&device, width, height);
-
-        let renderer = vello::Renderer::new(&device, vello::RendererOptions::default())
-            .map_err(Error::Render)?;
-
-        Ok(Self {
-            scene: vello::Scene::new(),
-            renderer,
-            device,
-            queue,
-            texture,
-            texture_view,
-            readback,
-            bytes_per_row,
-            width,
-            height,
-            tolerance: 0.1,
+    /// `surface_clip` is used as the fallback layer bounds for isolated groups that do not
+    /// provide an explicit clip.
+    pub fn new(scene: &'a mut vello::Scene, surface_clip: Rect) -> Self {
+        Self {
+            scene,
+            surface_clip,
             error: None,
             layer_stack: Vec::new(),
-        })
+        }
     }
 
-    /// Set the curve flattening tolerance used when converting rounded rects to paths.
-    pub fn set_tolerance(&mut self, tolerance: f64) {
-        self.tolerance = tolerance;
-    }
-
-    /// Reset the internal Vello scene and state.
-    pub fn reset(&mut self) {
-        self.scene.reset();
-        self.error = None;
-        self.layer_stack.clear();
-    }
-
-    /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
-        scene.validate().map_err(Error::InvalidScene)?;
-        self.reset();
-        replay(scene, self);
-        self.finish_rgba8()
-    }
-
-    /// Finish rendering the current command stream and return an RGBA8 buffer (unpremultiplied).
-    pub fn finish_rgba8(&mut self) -> Result<Vec<u8>, Error> {
+    /// Return the first deferred translation error, if any, and ensure the layer stack is balanced.
+    pub fn finish(&mut self) -> Result<(), Error> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
         if !self.layer_stack.is_empty() {
             return Err(Error::Internal("unbalanced layer stack"));
         }
-
-        let params = RenderParams {
-            base_color: peniko::Color::from_rgba8(0, 0, 0, 0),
-            width: u32::from(self.width),
-            height: u32::from(self.height),
-            antialiasing_method: AaConfig::Area,
-        };
-
-        self.renderer
-            .render_to_texture(
-                &self.device,
-                &self.queue,
-                &self.scene,
-                &self.texture_view,
-                &params,
-            )
-            .map_err(Error::Render)?;
-
-        readback_rgba8(
-            &self.device,
-            &self.queue,
-            &self.texture,
-            &self.readback,
-            self.bytes_per_row,
-            self.width,
-            self.height,
-        )
+        Ok(())
     }
 
     fn set_error_once(&mut self, err: Error) {
@@ -277,10 +68,6 @@ impl VelloRenderer {
         match brush {
             Brush::Solid(_) | Brush::Gradient(_) | Brush::Image(_) => Some(brush),
         }
-    }
-
-    fn surface_clip(&self) -> Rect {
-        Rect::new(0.0, 0.0, f64::from(self.width), f64::from(self.height))
     }
 
     fn push_layer_kind(&mut self, kind: LayerKind) {
@@ -340,7 +127,7 @@ impl VelloRenderer {
     }
 }
 
-impl PaintSink for VelloRenderer {
+impl PaintSink for VelloSceneSink<'_> {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         if self.error.is_some() {
             return;
@@ -464,13 +251,12 @@ impl PaintSink for VelloRenderer {
                 },
             }
         } else {
-            let clip_box = self.surface_clip();
             self.scene.push_layer(
                 Fill::NonZero,
                 group.composite.blend,
                 group.composite.alpha,
                 Affine::IDENTITY,
-                &clip_box,
+                &self.surface_clip,
             );
         }
         self.push_layer_kind(LayerKind::Group);
@@ -668,116 +454,24 @@ impl PaintSink for VelloRenderer {
     }
 }
 
-async fn init_device_and_queue() -> Result<(wgpu::Device, wgpu::Queue), Error> {
-    let instance = wgpu::Instance::default();
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })
-        .await
-        .map_err(|_| Error::NoAdapter)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imaging::Filter;
 
-    adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("imaging_vello device"),
-            required_features: wgpu::Features::empty(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| Error::RequestDevice)
-}
-
-fn create_targets(
-    device: &wgpu::Device,
-    width: u16,
-    height: u16,
-) -> (wgpu::Texture, wgpu::TextureView, wgpu::Buffer, u32) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("imaging_vello render target"),
-        size: wgpu::Extent3d {
-            width: u32::from(width),
-            height: u32::from(height),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let bytes_per_row = u32::from(width) * 4;
-    let padded_bytes_per_row = bytes_per_row.div_ceil(256) * 256;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("imaging_vello readback"),
-        size: u64::from(padded_bytes_per_row) * u64::from(height),
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    (texture, texture_view, readback, padded_bytes_per_row)
-}
-
-fn readback_rgba8(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    readback: &wgpu::Buffer,
-    bytes_per_row: u32,
-    width: u16,
-    height: u16,
-) -> Result<Vec<u8>, Error> {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("imaging_vello readback"),
-    });
-
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: None,
-            },
-        },
-        wgpu::Extent3d {
-            width: u32::from(width),
-            height: u32::from(height),
-            depth_or_array_layers: 1,
-        },
-    );
-
-    queue.submit([encoder.finish()]);
-
-    let slice = readback.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|_| Error::Internal("device poll failed"))?;
-    rx.recv()
-        .map_err(|_| Error::Internal("map_async callback dropped"))?
-        .map_err(|_| Error::Internal("buffer map failed"))?;
-
-    let mapped = slice.get_mapped_range();
-    let width_bytes = usize::from(width) * 4;
-
-    let mut out = Vec::with_capacity(usize::from(width) * usize::from(height) * 4);
-    for row in mapped.chunks_exact(bytes_per_row as usize) {
-        out.extend_from_slice(&row[..width_bytes]);
+    #[test]
+    fn vello_scene_sink_reports_unbalanced_layer_stack() {
+        let mut scene = vello::Scene::new();
+        let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Err(Error::UnbalancedLayerStack)));
     }
-    drop(mapped);
-    readback.unmap();
-    Ok(out)
+
+    #[test]
+    fn vello_scene_sink_rejects_filters() {
+        let mut scene = vello::Scene::new();
+        let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
+        sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
+        assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+    }
 }

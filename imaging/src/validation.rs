@@ -5,6 +5,37 @@
 //!
 //! This module provides [`ValidatingSink`], a wrapper around a [`PaintSink`] that checks streamed
 //! commands for common validity issues before forwarding them to the wrapped sink.
+//!
+//! ```rust
+//! use imaging::{
+//!     record,
+//!     validation::{ValidatingSink, ValidationError},
+//!     Composite, Painter,
+//! };
+//! use kurbo::Rect;
+//! use peniko::{BlendMode, Brush, Color};
+//!
+//! let paint = Brush::Solid(Color::from_rgb8(0x20, 0x40, 0x80));
+//! let mut sink = ValidatingSink::new(record::Scene::new());
+//!
+//! {
+//!     let mut painter = Painter::new(&mut sink);
+//!     painter
+//!         .fill(Rect::new(0.0, 0.0, 32.0, 32.0), &paint)
+//!         .composite(Composite {
+//!             blend: BlendMode::default(),
+//!             alpha: f32::NAN,
+//!         })
+//!         .draw();
+//! }
+//!
+//! assert_eq!(sink.first_error(), Some(&ValidationError::InvalidAlpha));
+//! assert_eq!(sink.finish(), Ok(()));
+//!
+//! let (scene, first_error) = sink.into_inner();
+//! assert!(scene.commands().is_empty());
+//! assert_eq!(first_error, Some(ValidationError::InvalidAlpha));
+//! ```
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, Paint,

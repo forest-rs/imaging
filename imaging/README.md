@@ -21,6 +21,3 @@ Those retained types are exact recording data, not the preferred authoring surfa
 Pre-1.0 note: the streaming surface moved from the old owned `Sink` shape to the borrowed
 `PaintSink`/`Painter` model so command authoring does not have to construct owned IR payloads
 up-front.
-
-Migration note: retained types that previously lived at the crate root now live under
-`imaging::record`.

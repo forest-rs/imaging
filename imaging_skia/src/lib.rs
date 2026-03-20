@@ -5,9 +5,114 @@
 //!
 //! This crate provides a CPU raster renderer that consumes `imaging::record::Scene` (or accepts
 //! commands directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using Skia.
+//!
+//! # Render A Recorded Scene
+//!
+//! Record commands into [`imaging::record::Scene`], then hand the scene to [`SkiaRenderer`].
+//!
+//! ```no_run
+//! use imaging::{Painter, record};
+//! use imaging_skia::SkiaRenderer;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_skia::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb));
+//!     let mut scene = record::Scene::new();
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut scene);
+//!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
+//!     }
+//!
+//!     let mut renderer = SkiaRenderer::new(128, 128);
+//!     let rgba = renderer.render_scene_rgba8(&scene)?;
+//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Stream Commands Directly
+//!
+//! [`SkiaRenderer`] also implements [`imaging::PaintSink`], so you can stream commands directly
+//! into the backend and finish the frame with [`SkiaRenderer::finish_rgba8`].
+//!
+//! ```no_run
+//! use imaging::Painter;
+//! use imaging_skia::SkiaRenderer;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_skia::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
+//!     let mut renderer = SkiaRenderer::new(128, 128);
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut renderer);
+//!         painter.fill_rect(Rect::new(16.0, 16.0, 112.0, 112.0), &paint);
+//!     }
+//!
+//!     let rgba = renderer.finish_rgba8()?;
+//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Draw Into An Existing `Canvas`
+//!
+//! If you already have a Skia canvas, wrap it with [`SkCanvasSink`] and stream commands directly.
+//!
+//! ```no_run
+//! use imaging::Painter;
+//! use imaging_skia::SkCanvasSink;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//! use skia_safe::surfaces;
+//!
+//! fn main() -> Result<(), imaging_skia::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0x1d, 0x4e, 0x89));
+//!     let mut surface = surfaces::raster_n32_premul((128, 128)).unwrap();
+//!
+//!     {
+//!         let mut sink = SkCanvasSink::new(surface.canvas());
+//!         let mut painter = Painter::new(&mut sink);
+//!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
+//!         sink.finish()?;
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Record A `SkPicture`
+//!
+//! Use [`SkPictureRecorderSink`] when you want Skia's native retained recording format.
+//!
+//! ```no_run
+//! use imaging::Painter;
+//! use imaging_skia::SkPictureRecorderSink;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_skia::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0x7c, 0x3a, 0xed));
+//!     let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 128.0, 128.0));
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut sink);
+//!         painter.fill_rect(Rect::new(16.0, 16.0, 112.0, 112.0), &paint);
+//!     }
+//!
+//!     let picture = sink.finish_picture()?;
+//!     assert_eq!(picture.cull_rect().right, 128.0);
+//!     Ok(())
+//! }
+//! ```
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
+
+mod sinks;
 
 use imaging::{
     BlurredRoundedRect, ClipRef, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
@@ -18,6 +123,8 @@ use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
 use peniko::{Brush, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
+
+pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 
 /// Errors that can occur when rendering via Skia.
 #[derive(Debug)]

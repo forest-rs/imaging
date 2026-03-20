@@ -5,6 +5,58 @@
 //!
 //! This crate provides a CPU renderer that consumes `imaging::record::Scene` (or accepts commands
 //! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
+//!
+//! # Render A Recorded Scene
+//!
+//! Record commands into [`imaging::record::Scene`], then render them with [`VelloCpuRenderer`].
+//!
+//! ```no_run
+//! use imaging::{Painter, record};
+//! use imaging_vello_cpu::VelloCpuRenderer;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_vello_cpu::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb));
+//!     let mut scene = record::Scene::new();
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut scene);
+//!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
+//!     }
+//!
+//!     let mut renderer = VelloCpuRenderer::new(128, 128);
+//!     let rgba = renderer.render_scene_rgba8(&scene)?;
+//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Stream Commands Directly
+//!
+//! [`VelloCpuRenderer`] also implements [`imaging::PaintSink`], so you can stream commands
+//! directly and call [`VelloCpuRenderer::finish_rgba8`] when the frame is complete.
+//!
+//! ```no_run
+//! use imaging::Painter;
+//! use imaging_vello_cpu::VelloCpuRenderer;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_vello_cpu::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
+//!     let mut renderer = VelloCpuRenderer::new(128, 128);
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut renderer);
+//!         painter.fill_rect(Rect::new(16.0, 16.0, 112.0, 112.0), &paint);
+//!     }
+//!
+//!     let rgba = renderer.finish_rgba8()?;
+//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     Ok(())
+//! }
+//! ```
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]

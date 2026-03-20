@@ -6,9 +6,91 @@
 //! This crate provides a headless CPU/GPU renderer that consumes `imaging::record::Scene` (or
 //! accepts commands directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using
 //! `vello_hybrid` + `wgpu`.
+//!
+//! # Render A Recorded Scene
+//!
+//! Record commands into [`imaging::record::Scene`], then render them with
+//! [`VelloHybridRenderer`].
+//!
+//! ```no_run
+//! use imaging::{Painter, record};
+//! use imaging_vello_hybrid::VelloHybridRenderer;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_vello_hybrid::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb));
+//!     let mut scene = record::Scene::new();
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut scene);
+//!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
+//!     }
+//!
+//!     let mut renderer = VelloHybridRenderer::try_new(128, 128)?;
+//!     let rgba = renderer.render_scene_rgba8(&scene)?;
+//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Stream Commands Directly
+//!
+//! [`VelloHybridRenderer`] also implements [`imaging::PaintSink`], so you can stream commands
+//! directly and finish the frame with [`VelloHybridRenderer::finish_rgba8`].
+//!
+//! ```no_run
+//! use imaging::Painter;
+//! use imaging_vello_hybrid::VelloHybridRenderer;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_vello_hybrid::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
+//!     let mut renderer = VelloHybridRenderer::try_new(128, 128)?;
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut renderer);
+//!         painter.fill_rect(Rect::new(16.0, 16.0, 112.0, 112.0), &paint);
+//!     }
+//!
+//!     let rgba = renderer.finish_rgba8()?;
+//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Record Into `vello_hybrid::Scene`
+//!
+//! If you want a backend-native retained scene without owning a full renderer, wrap an existing
+//! [`vello_hybrid::Scene`] with [`VelloHybridSceneSink`].
+//!
+//! ```no_run
+//! use imaging::Painter;
+//! use imaging_vello_hybrid::VelloHybridSceneSink;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! fn main() -> Result<(), imaging_vello_hybrid::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0x1d, 0x4e, 0x89));
+//!     let mut scene = vello_hybrid::Scene::new(128, 128);
+//!     scene.reset();
+//!
+//!     {
+//!         let mut sink = VelloHybridSceneSink::new(&mut scene);
+//!         let mut painter = Painter::new(&mut sink);
+//!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
+//!         sink.finish()?;
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
+
+mod scene_sink;
 
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
@@ -23,6 +105,8 @@ use vello_hybrid::{RenderError, RenderSize, RenderTargetConfig};
 use wgpu::{
     CommandEncoderDescriptor, Extent3d, TextureDescriptor, TextureDimension, TextureFormat,
 };
+
+pub use scene_sink::VelloHybridSceneSink;
 
 /// Errors that can occur when rendering via Vello hybrid.
 #[derive(Debug)]
