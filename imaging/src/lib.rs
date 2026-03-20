@@ -1,14 +1,21 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! `imaging`: backend-agnostic 2D imaging IR + recorder.
+//! `imaging`: backend-agnostic 2D imaging recording + streaming API.
 //!
 //! This crate provides:
-//! - A lightweight, backend-agnostic command stream ([`Scene`]).
+//! - A borrowed streaming/authoring surface via [`PaintSink`] and [`Painter`].
+//! - A lightweight, backend-agnostic recorded command stream via [`Scene`].
 //! - Explicit semantics for:
 //!   - **Non-isolated clipping** via a dedicated clip stack ([`Command::PushClip`]/[`Command::PopClip`]).
 //!   - **Isolated compositing** via groups ([`Command::PushGroup`]/[`Command::PopGroup`]).
 //!   - **Per-draw compositing** via [`Composite`] (blend mode + global alpha).
+//!
+//! API hierarchy:
+//! - Use [`Painter`] and [`PaintSink`] for normal command authoring and streaming.
+//! - Use [`Scene`] when you want an owned semantic recording you can retain, validate, and replay.
+//! - Use raw payload types like [`Draw`], [`Clip`], [`Group`], and [`GlyphRun`] as lower-level
+//!   recording data when you need exact control over the recorded representation.
 //!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 
@@ -193,7 +200,9 @@ impl Default for Composite {
     }
 }
 
-/// A clip operation pushed onto the non-isolated clip stack.
+/// A low-level clip payload stored in a [`Scene`] recording.
+///
+/// Prefer using [`Painter`] or borrowed [`ClipRef`] values for normal command authoring.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Clip {
     /// Clip to the fill region of a shape.
@@ -321,7 +330,10 @@ impl GlyphRun {
     }
 }
 
-/// A drawing command that produces pixels.
+/// A low-level draw payload stored in a [`Scene`] recording.
+///
+/// Prefer using [`Painter`] or borrowed draw payloads like [`FillRef`] and [`StrokeRef`] for
+/// normal command authoring.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Draw {
     /// Fill a shape.
@@ -375,7 +387,11 @@ pub enum Command {
     Draw(DrawId),
 }
 
-/// A reusable, backend-agnostic sequence of imaging commands.
+/// An owned, backend-agnostic semantic recording.
+///
+/// [`Scene`] is the retained form of an imaging command stream. Use [`Painter`] and [`PaintSink`]
+/// to author commands, then record them into a scene when you need validation, replay, testing,
+/// or backend-independent storage.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
     commands: Vec<Command>,
