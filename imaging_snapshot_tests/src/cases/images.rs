@@ -15,7 +15,7 @@ impl SnapshotCase for GmImageBrushes {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "vello_cpu" | "vello")
+        matches!(backend, "skia" | "vello_cpu" | "vello" | "vello_hybrid")
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {

@@ -7,6 +7,11 @@
 //! native [`vello_hybrid::Scene`] and produces an RGBA8 image buffer using `vello_hybrid` +
 //! `wgpu`.
 //!
+//! Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
+//! and translated to backend-managed opaque image ids. Direct use of [`VelloHybridSceneSink::new`]
+//! still only supports solid and gradient brushes because it does not have access to the renderer
+//! upload path.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with
@@ -93,8 +98,10 @@
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+mod image_registry;
 mod scene_sink;
 
+use image_registry::HybridImageRegistry;
 use imaging::record::{Scene, ValidateError, replay};
 use std::sync::mpsc;
 use vello_hybrid::{RenderError, RenderSize, RenderTargetConfig};
@@ -109,7 +116,7 @@ pub use scene_sink::VelloHybridSceneSink;
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered; this backend does not support it.
+    /// An image brush was encountered on a sink path that has no renderer-backed image resolver.
     UnsupportedImageBrush,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
@@ -138,6 +145,7 @@ pub struct VelloHybridRenderer {
     width: u16,
     height: u16,
     tolerance: f64,
+    image_registry: HybridImageRegistry,
 }
 
 impl VelloHybridRenderer {
@@ -175,6 +183,7 @@ impl VelloHybridRenderer {
             width,
             height,
             tolerance: 0.1,
+            image_registry: HybridImageRegistry::new(),
         })
     }
 
@@ -183,15 +192,45 @@ impl VelloHybridRenderer {
         self.tolerance = tolerance;
     }
 
+    /// Destroy all uploaded hybrid image resources cached by this renderer.
+    pub fn clear_cached_images(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("imaging_vello_hybrid clear cached images"),
+            });
+        self.image_registry
+            .clear(&mut self.renderer, &self.device, &self.queue, &mut encoder);
+        self.queue.submit([encoder.finish()]);
+    }
+
     /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
+    ///
+    /// Inline image brushes are uploaded on demand and cached for the lifetime of this renderer
+    /// (or until [`Self::clear_cached_images`] is called).
     pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         let mut native = vello_hybrid::Scene::new(self.width, self.height);
         native.reset();
-        let mut sink = VelloHybridSceneSink::new(&mut native);
-        sink.set_tolerance(self.tolerance);
-        replay(scene, &mut sink);
-        sink.finish()?;
+        let mut upload_encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("imaging_vello_hybrid upload images"),
+            });
+        {
+            let mut image_resolver = self.image_registry.resolver(
+                &mut self.renderer,
+                &self.device,
+                &self.queue,
+                &mut upload_encoder,
+            );
+            let mut sink =
+                VelloHybridSceneSink::with_image_resolver(&mut native, &mut image_resolver);
+            sink.set_tolerance(self.tolerance);
+            replay(scene, &mut sink);
+            sink.finish()?;
+        }
+        self.queue.submit([upload_encoder.finish()]);
         self.render_vello_hybrid_scene_rgba8(&native)
     }
 

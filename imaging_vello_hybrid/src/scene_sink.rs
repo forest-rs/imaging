@@ -2,17 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::Error;
+use crate::image_registry::ImageBrushResolver;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
     StrokeRef,
 };
 use kurbo::{Affine, Shape as _};
-use peniko::{Brush, Style};
+use peniko::{Brush, ImageBrush, Style};
 use vello_common::glyph::Glyph as VelloGlyph;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`vello_hybrid::Scene`].
 pub struct VelloHybridSceneSink<'a> {
     scene: &'a mut vello_hybrid::Scene,
+    image_resolver: Option<&'a mut dyn ImageBrushResolver>,
     tolerance: f64,
     error: Option<Error>,
     clip_depth: u32,
@@ -35,6 +37,21 @@ impl<'a> VelloHybridSceneSink<'a> {
     pub fn new(scene: &'a mut vello_hybrid::Scene) -> Self {
         Self {
             scene,
+            image_resolver: None,
+            tolerance: 0.1,
+            error: None,
+            clip_depth: 0,
+            group_depth: 0,
+        }
+    }
+
+    pub(crate) fn with_image_resolver(
+        scene: &'a mut vello_hybrid::Scene,
+        image_resolver: &'a mut dyn ImageBrushResolver,
+    ) -> Self {
+        Self {
+            scene,
+            image_resolver: Some(image_resolver),
             tolerance: 0.1,
             error: None,
             clip_depth: 0,
@@ -76,8 +93,19 @@ impl<'a> VelloHybridSceneSink<'a> {
         match brush {
             Brush::Solid(c) => Some(Brush::Solid(c)),
             Brush::Gradient(g) => Some(Brush::Gradient(g)),
-            Brush::Image(_) => {
-                self.set_error_once(Error::UnsupportedImageBrush);
+            Brush::Image(image) => self.resolve_image_brush(&image).map(Brush::Image),
+        }
+    }
+
+    fn resolve_image_brush(&mut self, image: &ImageBrush) -> Option<vello_common::paint::Image> {
+        let Some(image_resolver) = self.image_resolver.as_deref_mut() else {
+            self.set_error_once(Error::UnsupportedImageBrush);
+            return None;
+        };
+        match image_resolver.resolve_image_brush(image) {
+            Ok(image) => Some(image),
+            Err(err) => {
+                self.set_error_once(err);
                 None
             }
         }
@@ -320,6 +348,8 @@ impl PaintSink for VelloHybridSceneSink<'_> {
 mod tests {
     use super::*;
     use imaging::Filter;
+    use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+    use std::sync::Arc;
 
     #[test]
     fn hybrid_scene_sink_reports_clip_underflow() {
@@ -340,5 +370,21 @@ mod tests {
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+    }
+
+    #[test]
+    fn hybrid_scene_sink_rejects_image_brushes_without_resolver() {
+        let mut scene = vello_hybrid::Scene::new(32, 32);
+        scene.reset();
+        let mut sink = VelloHybridSceneSink::new(&mut scene);
+        let image = Brush::Image(ImageBrush::new(ImageData {
+            data: Blob::new(Arc::new([255_u8; 16])),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 2,
+            height: 2,
+        }));
+        sink.fill(FillRef::new(kurbo::Rect::new(0.0, 0.0, 8.0, 8.0), &image));
+        assert!(matches!(sink.finish(), Err(Error::UnsupportedImageBrush)));
     }
 }
