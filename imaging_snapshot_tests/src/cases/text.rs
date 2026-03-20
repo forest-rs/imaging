@@ -1,7 +1,7 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, Draw, Glyph, GlyphRun, Sink, StrokeStyle};
+use imaging::{Glyph, PaintSink, Painter, StrokeStyle};
 use kurbo::Affine;
 use peniko::{Brush, Color, Fill, Style};
 use skrifa::{FontRef, MetadataProvider};
@@ -21,36 +21,30 @@ impl SnapshotCase for GmGlyphRuns {
         4
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgba8(247, 241, 232, 255));
+        let mut painter = Painter::new(sink);
 
         let font = test_font();
+        let fill_glyphs = glyphs_for_text(&font, 42.0, "imaging");
+        let fill_paint = Brush::Solid(Color::from_rgba8(28, 32, 36, 255));
+        let fill_style = Style::Fill(Fill::NonZero);
+        painter
+            .glyphs(&font, &fill_paint)
+            .transform(Affine::translate((18.0, 88.0)))
+            .font_size(42.0)
+            .hint(true)
+            .draw(&fill_style, &fill_glyphs);
 
-        sink.draw(Draw::GlyphRun(GlyphRun {
-            font: font.clone(),
-            transform: Affine::translate((18.0, 88.0)),
-            glyph_transform: None,
-            font_size: 42.0,
-            hint: true,
-            normalized_coords: Vec::new(),
-            style: Style::Fill(Fill::NonZero),
-            glyphs: glyphs_for_text(&font, 42.0, "imaging"),
-            paint: Brush::Solid(Color::from_rgba8(28, 32, 36, 255)),
-            composite: Composite::default(),
-        }));
-
-        sink.draw(Draw::GlyphRun(GlyphRun {
-            font,
-            transform: Affine::translate((22.0, 172.0)),
-            glyph_transform: Some(Affine::skew(0.28, 0.0)),
-            font_size: 34.0,
-            hint: false,
-            normalized_coords: Vec::new(),
-            style: Style::Stroke(StrokeStyle::new(1.5)),
-            glyphs: glyphs_for_text(&test_font(), 34.0, "glyph run"),
-            paint: Brush::Solid(Color::from_rgba8(178, 74, 30, 255)),
-            composite: Composite::default(),
-        }));
+        let stroke_glyphs = glyphs_for_text(&font, 34.0, "glyph run");
+        let stroke_paint = Brush::Solid(Color::from_rgba8(178, 74, 30, 255));
+        let stroke_style = Style::Stroke(StrokeStyle::new(1.5));
+        painter
+            .glyphs(&font, &stroke_paint)
+            .transform(Affine::translate((22.0, 172.0)))
+            .glyph_transform(Some(Affine::skew(0.28, 0.0)))
+            .font_size(34.0)
+            .draw(&stroke_style, &stroke_glyphs);
     }
 }
 

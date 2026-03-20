@@ -1,9 +1,9 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, Draw, Geometry, Sink, StrokeStyle};
+use imaging::{Composite, Geometry, PaintSink, Painter, StrokeStyle};
 use kurbo::{Affine, BezPath, Point, Rect, RoundedRect};
-use peniko::{BlendMode, Brush, Color, Extend, Fill, ImageBrush, ImageQuality, Mix};
+use peniko::{BlendMode, Brush, Color, Extend, ImageBrush, ImageQuality, Mix};
 
 use super::SnapshotCase;
 use super::util::{background, test_image};
@@ -18,79 +18,82 @@ impl SnapshotCase for GmImageBrushes {
         matches!(backend, "skia" | "vello_cpu" | "vello")
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(244, 244, 240));
+        let mut painter = Painter::new(sink);
 
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: Brush::Image(
-                ImageBrush::new(test_image())
-                    .with_extend(Extend::Pad)
-                    .with_quality(ImageQuality::Medium),
-            ),
-            paint_transform: Some(Affine::translate((-18.0, -12.0))),
-            shape: Geometry::RoundedRect(RoundedRect::new(
-                width * 0.08,
-                height * 0.12,
-                width * 0.42,
-                height * 0.84,
-                24.0,
-            )),
-            composite: Composite::default(),
-        });
+        let left = Brush::Image(
+            ImageBrush::new(test_image())
+                .with_extend(Extend::Pad)
+                .with_quality(ImageQuality::Medium),
+        );
+        painter
+            .fill(
+                Geometry::RoundedRect(RoundedRect::new(
+                    width * 0.08,
+                    height * 0.12,
+                    width * 0.42,
+                    height * 0.84,
+                    24.0,
+                )),
+                &left,
+            )
+            .paint_transform(Some(Affine::translate((-18.0, -12.0))))
+            .draw();
 
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: Brush::Image(
-                ImageBrush::new(test_image())
-                    .with_x_extend(Extend::Reflect)
-                    .with_y_extend(Extend::Pad)
-                    .with_quality(ImageQuality::Medium),
-            ),
-            paint_transform: Some(Affine::translate((-104.0, -8.0))),
-            shape: Geometry::Path(diamond(
-                width * 0.72,
-                height * 0.48,
-                width * 0.2,
-                height * 0.28,
-            )),
-            composite: Composite::new(BlendMode::from(Mix::Multiply), 1.0),
-        });
+        let diamond_brush = Brush::Image(
+            ImageBrush::new(test_image())
+                .with_x_extend(Extend::Reflect)
+                .with_y_extend(Extend::Pad)
+                .with_quality(ImageQuality::Medium),
+        );
+        painter
+            .fill(
+                Geometry::Path(diamond(
+                    width * 0.72,
+                    height * 0.48,
+                    width * 0.2,
+                    height * 0.28,
+                )),
+                &diamond_brush,
+            )
+            .paint_transform(Some(Affine::translate((-104.0, -8.0))))
+            .composite(Composite::new(BlendMode::from(Mix::Multiply), 1.0))
+            .draw();
 
-        sink.draw(Draw::Stroke {
-            transform: Affine::IDENTITY,
-            stroke: StrokeStyle::new(20.0),
-            paint: Brush::Image(
-                ImageBrush::new(test_image())
-                    .with_extend(Extend::Reflect)
-                    .with_quality(ImageQuality::Low),
-            ),
-            paint_transform: Some(Affine::translate((-126.0, -120.0))),
-            shape: Geometry::RoundedRect(RoundedRect::new(
-                width * 0.5,
-                height * 0.58,
-                width * 0.9,
-                height * 0.9,
-                30.0,
-            )),
-            composite: Composite::default(),
-        });
+        let frame_stroke = StrokeStyle::new(20.0);
+        let frame_brush = Brush::Image(
+            ImageBrush::new(test_image())
+                .with_extend(Extend::Reflect)
+                .with_quality(ImageQuality::Low),
+        );
+        painter
+            .stroke(
+                Geometry::RoundedRect(RoundedRect::new(
+                    width * 0.5,
+                    height * 0.58,
+                    width * 0.9,
+                    height * 0.9,
+                    30.0,
+                )),
+                &frame_stroke,
+                &frame_brush,
+            )
+            .paint_transform(Some(Affine::translate((-126.0, -120.0))))
+            .draw();
 
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: Brush::Solid(Color::from_rgba8(255, 255, 255, 170)),
-            paint_transform: None,
-            shape: Geometry::Rect(Rect::new(
-                width * 0.46,
-                height * 0.54,
-                width * 0.94,
-                height * 0.94,
-            )),
-            composite: Composite::default(),
-        });
+        let glaze = Brush::Solid(Color::from_rgba8(255, 255, 255, 170));
+        painter
+            .fill(
+                Geometry::Rect(Rect::new(
+                    width * 0.46,
+                    height * 0.54,
+                    width * 0.94,
+                    height * 0.94,
+                )),
+                &glaze,
+            )
+            .draw();
     }
 }
 

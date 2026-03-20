@@ -1,9 +1,9 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, Draw, Geometry, Sink};
-use kurbo::{Affine, RoundedRect};
-use peniko::{BlendMode, Brush, Color, Compose, Fill, Gradient, Mix};
+use imaging::{Composite, Geometry, PaintSink, Painter};
+use kurbo::RoundedRect;
+use peniko::{BlendMode, Brush, Color, Compose, Gradient, Mix};
 
 use super::SnapshotCase;
 use super::util::{background, circle_geometry, f32p};
@@ -41,8 +41,9 @@ impl SnapshotCase for GmBlendGrid {
         32
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(12, 12, 14));
+        let mut painter = Painter::new(sink);
 
         let cols = 4_usize;
         let cell_w = width / cols as f64;
@@ -73,33 +74,32 @@ impl SnapshotCase for GmBlendGrid {
             let x1 = x0 + cell_w;
             let y1 = y0 + cell_h;
 
-            sink.draw(Draw::Fill {
-                transform: Affine::IDENTITY,
-                fill_rule: Fill::NonZero,
-                paint: linear_rainbow((f32p(x0), f32p(y0)), (f32p(x1), f32p(y1))),
-                paint_transform: None,
-                shape: Geometry::RoundedRect(RoundedRect::new(
-                    x0 + pad,
-                    y0 + pad,
-                    x1 - pad,
-                    y1 - pad,
-                    14.0,
-                )),
-                composite: Composite::default(),
-            });
+            let linear = linear_rainbow((f32p(x0), f32p(y0)), (f32p(x1), f32p(y1)));
+            painter
+                .fill(
+                    Geometry::RoundedRect(RoundedRect::new(
+                        x0 + pad,
+                        y0 + pad,
+                        x1 - pad,
+                        y1 - pad,
+                        14.0,
+                    )),
+                    &linear,
+                )
+                .draw();
 
-            sink.draw(Draw::Fill {
-                transform: Affine::IDENTITY,
-                fill_rule: Fill::NonZero,
-                paint: sweep_rainbow((f32p((x0 + x1) * 0.5), f32p((y0 + y1) * 0.5))),
-                paint_transform: None,
-                shape: circle_geometry(
-                    ((x0 + x1) * 0.5, (y0 + y1) * 0.5),
-                    cell_w.min(cell_h) * 0.24,
-                    tol,
-                ),
-                composite: Composite::new(*mode, *alpha),
-            });
+            let sweep = sweep_rainbow((f32p((x0 + x1) * 0.5), f32p((y0 + y1) * 0.5)));
+            painter
+                .fill(
+                    circle_geometry(
+                        ((x0 + x1) * 0.5, (y0 + y1) * 0.5),
+                        cell_w.min(cell_h) * 0.24,
+                        tol,
+                    ),
+                    &sweep,
+                )
+                .composite(Composite::new(*mode, *alpha))
+                .draw();
         }
     }
 }

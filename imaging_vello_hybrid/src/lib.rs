@@ -4,14 +4,15 @@
 //! Vello hybrid backend for `imaging`.
 //!
 //! This crate provides a headless CPU/GPU renderer that consumes `imaging::Scene` (or accepts
-//! commands directly via `imaging::Sink`) and produces an RGBA8 image buffer using
+//! commands directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using
 //! `vello_hybrid` + `wgpu`.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use imaging::{
-    BlurredRoundedRect, Clip, Composite, Draw, Geometry, GlyphRun, Group, Scene, Sink, replay,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
+    Scene, StrokeRef, replay,
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, Style};
@@ -231,10 +232,10 @@ impl VelloHybridRenderer {
 
     fn brush_to_paint(
         &mut self,
-        brush: Brush,
+        brush: &Brush,
         composite: Composite,
     ) -> Option<vello_common::paint::PaintType> {
-        let brush = brush.multiply_alpha(composite.alpha);
+        let brush = brush.clone().multiply_alpha(composite.alpha);
         match brush {
             Brush::Solid(c) => Some(Brush::Solid(c)),
             Brush::Gradient(g) => Some(Brush::Gradient(g)),
@@ -245,22 +246,23 @@ impl VelloHybridRenderer {
         }
     }
 
-    fn geometry_to_path(&self, geom: &Geometry) -> kurbo::BezPath {
+    fn geometry_to_path(&self, geom: GeometryRef<'_>) -> kurbo::BezPath {
         match geom {
-            Geometry::Rect(r) => r.to_path(self.tolerance),
-            Geometry::RoundedRect(rr) => rr.to_path(self.tolerance),
-            Geometry::Path(p) => p.clone(),
+            GeometryRef::Rect(r) => r.to_path(self.tolerance),
+            GeometryRef::RoundedRect(rr) => rr.to_path(self.tolerance),
+            GeometryRef::Path(p) => p.clone(),
+            GeometryRef::OwnedPath(p) => p,
         }
     }
 
-    fn clip_to_path(&mut self, clip: &Clip) -> (Affine, kurbo::BezPath, peniko::Fill) {
+    fn clip_to_path(&mut self, clip: ClipRef<'_>) -> (Affine, kurbo::BezPath, peniko::Fill) {
         match clip {
-            Clip::Fill {
+            ClipRef::Fill {
                 transform,
                 shape,
                 fill_rule,
-            } => (*transform, self.geometry_to_path(shape), *fill_rule),
-            Clip::Stroke {
+            } => (transform, self.geometry_to_path(shape), fill_rule),
+            ClipRef::Stroke {
                 transform,
                 shape,
                 stroke,
@@ -272,12 +274,12 @@ impl VelloHybridRenderer {
                     &kurbo::StrokeOpts::default(),
                     self.tolerance,
                 );
-                (*transform, outline, peniko::Fill::NonZero)
+                (transform, outline, peniko::Fill::NonZero)
             }
         }
     }
 
-    fn draw_glyph_run(&mut self, glyph_run: GlyphRun) {
+    fn draw_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>) {
         let Some(paint) = self.brush_to_paint(glyph_run.paint, glyph_run.composite) else {
             return;
         };
@@ -287,19 +289,19 @@ impl VelloHybridRenderer {
 
         match glyph_run.style {
             Style::Fill(fill_rule) => {
-                self.scene.set_fill_rule(fill_rule);
+                self.scene.set_fill_rule(*fill_rule);
                 let builder = self
                     .scene
-                    .glyph_run(&glyph_run.font)
+                    .glyph_run(glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
-                    .normalized_coords(&glyph_run.normalized_coords);
+                    .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
                     builder.glyph_transform(transform)
                 } else {
                     builder
                 };
-                let glyphs = glyph_run.glyphs.into_iter().map(|glyph| VelloGlyph {
+                let glyphs = glyph_run.glyphs.iter().map(|glyph| VelloGlyph {
                     id: glyph.id,
                     x: glyph.x,
                     y: glyph.y,
@@ -307,19 +309,19 @@ impl VelloHybridRenderer {
                 builder.fill_glyphs(glyphs);
             }
             Style::Stroke(stroke) => {
-                self.scene.set_stroke(stroke);
+                self.scene.set_stroke(stroke.clone());
                 let builder = self
                     .scene
-                    .glyph_run(&glyph_run.font)
+                    .glyph_run(glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
-                    .normalized_coords(&glyph_run.normalized_coords);
+                    .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
                     builder.glyph_transform(transform)
                 } else {
                     builder
                 };
-                let glyphs = glyph_run.glyphs.into_iter().map(|glyph| VelloGlyph {
+                let glyphs = glyph_run.glyphs.iter().map(|glyph| VelloGlyph {
                     id: glyph.id,
                     x: glyph.x,
                     y: glyph.y,
@@ -334,12 +336,12 @@ impl VelloHybridRenderer {
     }
 }
 
-impl Sink for VelloHybridRenderer {
-    fn push_clip(&mut self, clip: Clip) {
+impl PaintSink for VelloHybridRenderer {
+    fn push_clip(&mut self, clip: ClipRef<'_>) {
         if self.error.is_some() {
             return;
         }
-        let (xf, path, fill_rule) = self.clip_to_path(&clip);
+        let (xf, path, fill_rule) = self.clip_to_path(clip);
         self.scene.set_transform(xf);
         self.scene.set_fill_rule(fill_rule);
         self.scene.push_clip_path(&path);
@@ -358,7 +360,7 @@ impl Sink for VelloHybridRenderer {
         self.clip_depth -= 1;
     }
 
-    fn push_group(&mut self, group: Group) {
+    fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
             return;
         }
@@ -367,7 +369,7 @@ impl Sink for VelloHybridRenderer {
             self.set_error_once(Error::UnsupportedFilter);
             return;
         }
-        let clip_path = group.clip.as_ref().map(|clip| {
+        let clip_path = group.clip.map(|clip| {
             let (xf, path, fill_rule) = self.clip_to_path(clip);
             self.scene.set_transform(xf);
             self.scene.set_fill_rule(fill_rule);
@@ -393,92 +395,88 @@ impl Sink for VelloHybridRenderer {
         self.group_depth -= 1;
     }
 
-    fn draw(&mut self, draw: Draw) {
+    fn fill(&mut self, draw: FillRef<'_>) {
         if self.error.is_some() {
             return;
         }
 
-        match draw {
-            Draw::Fill {
-                transform,
-                fill_rule,
-                paint,
-                paint_transform,
-                shape,
-                composite,
-            } => {
-                let Some(paint) = self.brush_to_paint(paint, composite) else {
-                    return;
-                };
-                self.scene.set_transform(transform);
-                self.scene.set_fill_rule(fill_rule);
-                self.scene
-                    .set_paint_transform(paint_transform.unwrap_or(Affine::IDENTITY));
+        let Some(paint) = self.brush_to_paint(draw.paint, draw.composite) else {
+            return;
+        };
+        self.scene.set_transform(draw.transform);
+        self.scene.set_fill_rule(draw.fill_rule);
+        self.scene
+            .set_paint_transform(draw.paint_transform.unwrap_or(Affine::IDENTITY));
 
-                // Workaround for vello#1408:
-                // `Compose::Copy` with a fully transparent solid source is semantically a clear,
-                // but vello_hybrid currently treats fully transparent solid paints as "not
-                // visible" and skips generating any strips. Avoid that by mapping to `Clear` with
-                // an arbitrary opaque paint.
-                let (blend, paint) = match (&paint, composite.blend.compose) {
-                    (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
-                        peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                        Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
-                    ),
-                    _ => (composite.blend, paint),
-                };
+        let (blend, paint) = match (&paint, draw.composite.blend.compose) {
+            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
+                peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
+                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+            ),
+            _ => (draw.composite.blend, paint),
+        };
 
-                self.scene.set_blend_mode(blend);
-                self.scene.set_paint(paint);
+        self.scene.set_blend_mode(blend);
+        self.scene.set_paint(paint);
 
-                match shape {
-                    Geometry::Rect(r) => self.scene.fill_rect(&r),
-                    Geometry::RoundedRect(rr) => {
-                        let path = rr.to_path(self.tolerance);
-                        self.scene.fill_path(&path);
-                    }
-                    Geometry::Path(p) => self.scene.fill_path(&p),
-                }
+        match draw.shape {
+            GeometryRef::Rect(r) => self.scene.fill_rect(&r),
+            GeometryRef::RoundedRect(rr) => {
+                let path = rr.to_path(self.tolerance);
+                self.scene.fill_path(&path);
             }
-            Draw::Stroke {
-                transform,
-                stroke,
-                paint,
-                paint_transform,
-                shape,
-                composite,
-            } => {
-                let Some(paint) = self.brush_to_paint(paint, composite) else {
-                    return;
-                };
-                self.scene.set_transform(transform);
-                self.scene.set_stroke(stroke);
-                self.scene
-                    .set_paint_transform(paint_transform.unwrap_or(Affine::IDENTITY));
-                // Workaround for vello#1408: see the fill path case above.
-                let (blend, paint) = match (&paint, composite.blend.compose) {
-                    (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
-                        peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                        Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
-                    ),
-                    _ => (composite.blend, paint),
-                };
-
-                self.scene.set_blend_mode(blend);
-                self.scene.set_paint(paint);
-
-                match shape {
-                    Geometry::Rect(r) => self.scene.stroke_rect(&r),
-                    Geometry::RoundedRect(rr) => {
-                        let path = rr.to_path(self.tolerance);
-                        self.scene.stroke_path(&path);
-                    }
-                    Geometry::Path(p) => self.scene.stroke_path(&p),
-                }
-            }
-            Draw::GlyphRun(glyph_run) => self.draw_glyph_run(glyph_run),
-            Draw::BlurredRoundedRect(draw) => self.draw_blurred_rounded_rect(draw),
+            GeometryRef::Path(p) => self.scene.fill_path(p),
+            GeometryRef::OwnedPath(p) => self.scene.fill_path(&p),
         }
+    }
+
+    fn stroke(&mut self, draw: StrokeRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+
+        let Some(paint) = self.brush_to_paint(draw.paint, draw.composite) else {
+            return;
+        };
+        self.scene.set_transform(draw.transform);
+        self.scene.set_stroke(draw.stroke.clone());
+        self.scene
+            .set_paint_transform(draw.paint_transform.unwrap_or(Affine::IDENTITY));
+
+        let (blend, paint) = match (&paint, draw.composite.blend.compose) {
+            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
+                peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
+                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+            ),
+            _ => (draw.composite.blend, paint),
+        };
+
+        self.scene.set_blend_mode(blend);
+        self.scene.set_paint(paint);
+
+        match draw.shape {
+            GeometryRef::Rect(r) => self.scene.stroke_rect(&r),
+            GeometryRef::RoundedRect(rr) => {
+                let path = rr.to_path(self.tolerance);
+                self.scene.stroke_path(&path);
+            }
+            GeometryRef::Path(p) => self.scene.stroke_path(p),
+            GeometryRef::OwnedPath(p) => self.scene.stroke_path(&p),
+        }
+    }
+
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+        self.draw_glyph_run(draw);
+    }
+
+    fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        if self.error.is_some() {
+            return;
+        }
+        self.draw_blurred_rounded_rect(draw);
     }
 }
 

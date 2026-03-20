@@ -20,7 +20,14 @@ use alloc::vec::Vec;
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
 use peniko::{BlendMode, Brush, Fill, FontData, Style};
 
+mod paint;
+mod painter;
 pub mod validation;
+
+pub use paint::{
+    ClipRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef, replay,
+};
+pub use painter::{FillBuilder, GlyphRunBuilder, Painter, StrokeBuilder};
 
 /// Fill rule used by fills and fill-style clips.
 pub type FillRule = Fill;
@@ -455,25 +462,6 @@ pub struct Scene {
     draws: Vec<Draw>,
 }
 
-/// A backend that can accept imaging commands.
-///
-/// Implementations may render commands immediately, record them, translate them to another IR, etc.
-///
-/// The core crate treats this as a pure command sink; resource management and pixel output are
-/// intentionally out of scope here.
-pub trait Sink {
-    /// Push a non-isolated clip onto the clip stack.
-    fn push_clip(&mut self, clip: Clip);
-    /// Pop the most recently pushed non-isolated clip.
-    fn pop_clip(&mut self);
-    /// Push an isolated group onto the group stack.
-    fn push_group(&mut self, group: Group);
-    /// Pop the most recently pushed isolated group.
-    fn pop_group(&mut self);
-    /// Emit a draw operation.
-    fn draw(&mut self, draw: Draw);
-}
-
 impl Scene {
     /// Create an empty scene.
     #[inline]
@@ -595,10 +583,10 @@ impl Scene {
     }
 }
 
-impl Sink for Scene {
+impl PaintSink for Scene {
     #[inline]
-    fn push_clip(&mut self, clip: Clip) {
-        let _ = Self::push_clip(self, clip);
+    fn push_clip(&mut self, clip: ClipRef<'_>) {
+        let _ = Self::push_clip(self, clip.to_owned());
     }
 
     #[inline]
@@ -607,8 +595,8 @@ impl Sink for Scene {
     }
 
     #[inline]
-    fn push_group(&mut self, group: Group) {
-        let _ = Self::push_group(self, group);
+    fn push_group(&mut self, group: GroupRef<'_>) {
+        let _ = Self::push_group(self, group.to_owned());
     }
 
     #[inline]
@@ -617,21 +605,23 @@ impl Sink for Scene {
     }
 
     #[inline]
-    fn draw(&mut self, draw: Draw) {
-        let _ = Self::draw(self, draw);
+    fn fill(&mut self, draw: FillRef<'_>) {
+        let _ = Self::draw(self, draw.to_owned());
     }
-}
 
-/// Replay a recorded [`Scene`] into a [`Sink`].
-pub fn replay(scene: &Scene, sink: &mut impl Sink) {
-    for cmd in scene.commands() {
-        match *cmd {
-            Command::PushClip(id) => sink.push_clip(scene.clip(id).clone()),
-            Command::PopClip => sink.pop_clip(),
-            Command::PushGroup(id) => sink.push_group(scene.group(id).clone()),
-            Command::PopGroup => sink.pop_group(),
-            Command::Draw(id) => sink.draw(scene.draw_op(id).clone()),
-        }
+    #[inline]
+    fn stroke(&mut self, draw: StrokeRef<'_>) {
+        let _ = Self::draw(self, draw.to_owned());
+    }
+
+    #[inline]
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+        let _ = Self::draw(self, Draw::GlyphRun(draw.to_owned()));
+    }
+
+    #[inline]
+    fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        let _ = Self::draw(self, Draw::BlurredRoundedRect(draw));
     }
 }
 

@@ -3,12 +3,12 @@
 
 //! Defensive validation helpers for `imaging`.
 //!
-//! This module provides [`ValidatingSink`], a wrapper around a [`Sink`] that checks streamed
+//! This module provides [`ValidatingSink`], a wrapper around a [`PaintSink`] that checks streamed
 //! commands for common validity issues before forwarding them to the wrapped sink.
 
 use crate::{
-    BlurredRoundedRect, Clip, Composite, Draw, Filter, Geometry, GlyphRun, Group, Paint, Sink,
-    StrokeStyle,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, Geometry, GlyphRunRef, GroupRef,
+    Paint, PaintSink, StrokeRef, StrokeStyle,
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect};
 
@@ -83,7 +83,7 @@ pub fn default_validation_hook(_: &ValidationError) -> ValidationDecision {
     ValidationDecision::Abort
 }
 
-/// A wrapper around a [`Sink`] that validates inputs before forwarding them.
+/// A wrapper around a [`PaintSink`] that validates inputs before forwarding them.
 ///
 /// This is intended as a defensive layer for streaming command sinks and backends.
 #[derive(Debug)]
@@ -390,7 +390,7 @@ where
         true
     }
 
-    fn validate_glyph_run(&mut self, glyph_run: &GlyphRun) -> bool {
+    fn validate_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>) -> bool {
         let glyphs_ok = glyph_run
             .glyphs
             .iter()
@@ -402,10 +402,10 @@ where
             })
             && font_size_ok
             && glyphs_ok
-            && self.validate_paint(&glyph_run.paint)
+            && self.validate_paint(glyph_run.paint)
             && match glyph_run.style {
                 peniko::Style::Fill(_) => true,
-                peniko::Style::Stroke(ref stroke) => self.validate_stroke(stroke),
+                peniko::Style::Stroke(stroke) => self.validate_stroke(stroke),
             }
             && self.validate_composite(&glyph_run.composite);
         if ok {
@@ -446,35 +446,38 @@ where
         }
     }
 
-    fn validate_clip(&mut self, clip: &Clip, transform_name: &'static str) -> bool {
+    fn validate_clip(&mut self, clip: ClipRef<'_>, transform_name: &'static str) -> bool {
         match clip {
-            Clip::Fill {
+            ClipRef::Fill {
                 transform, shape, ..
-            } => self.validate_affine(transform_name, transform) && self.validate_geometry(shape),
-            Clip::Stroke {
+            } => {
+                self.validate_affine(transform_name, &transform)
+                    && self.validate_geometry(&shape.to_owned())
+            }
+            ClipRef::Stroke {
                 transform,
                 shape,
                 stroke,
             } => {
-                self.validate_affine(transform_name, transform)
-                    && self.validate_geometry(shape)
+                self.validate_affine(transform_name, &transform)
+                    && self.validate_geometry(&shape.to_owned())
                     && self.validate_stroke(stroke)
             }
         }
     }
 }
 
-impl<S, H> Sink for ValidatingSink<S, H>
+impl<S, H> PaintSink for ValidatingSink<S, H>
 where
-    S: Sink,
+    S: PaintSink,
     H: FnMut(&ValidationError) -> ValidationDecision,
 {
-    fn push_clip(&mut self, clip: Clip) {
+    fn push_clip(&mut self, clip: ClipRef<'_>) {
         if self.aborted {
             return;
         }
 
-        if !self.validate_clip(&clip, "Clip::transform") {
+        if !self.validate_clip(clip.clone(), "Clip::transform") {
             return;
         }
 
@@ -494,16 +497,16 @@ where
         self.inner.pop_clip();
     }
 
-    fn push_group(&mut self, group: Group) {
+    fn push_group(&mut self, group: GroupRef<'_>) {
         if self.aborted {
             return;
         }
 
         let mut ok = self.validate_composite(&group.composite);
-        if let Some(clip) = group.clip.as_ref() {
+        if let Some(clip) = group.clip.clone() {
             ok &= self.validate_clip(clip, "Group::clip::transform");
         }
-        for filter in &group.filters {
+        for filter in group.filters {
             ok &= self.validate_filter(filter);
         }
         if !ok {
@@ -526,66 +529,76 @@ where
         self.inner.pop_group();
     }
 
-    fn draw(&mut self, draw: Draw) {
+    fn fill(&mut self, draw: FillRef<'_>) {
         if self.aborted {
             return;
         }
 
-        let ok = match &draw {
-            Draw::Fill {
-                transform,
-                paint,
-                paint_transform,
-                shape,
-                composite,
-                ..
-            } => {
-                self.validate_affine("Draw::Fill::transform", transform)
-                    && self.validate_paint(paint)
-                    && paint_transform
-                        .as_ref()
-                        .is_none_or(|xf| self.validate_affine("Draw::Fill::paint_transform", xf))
-                    && self.validate_geometry(shape)
-                    && self.validate_composite(composite)
-            }
-            Draw::Stroke {
-                transform,
-                paint,
-                paint_transform,
-                stroke,
-                shape,
-                composite,
-                ..
-            } => {
-                self.validate_affine("Draw::Stroke::transform", transform)
-                    && self.validate_paint(paint)
-                    && paint_transform
-                        .as_ref()
-                        .is_none_or(|xf| self.validate_affine("Draw::Stroke::paint_transform", xf))
-                    && self.validate_stroke(stroke)
-                    && self.validate_geometry(shape)
-                    && self.validate_composite(composite)
-            }
-            Draw::GlyphRun(glyph_run) => self.validate_glyph_run(glyph_run),
-            Draw::BlurredRoundedRect(blurred_rounded_rect) => {
-                self.validate_blurred_rounded_rect(blurred_rounded_rect)
-            }
-        };
+        let ok = self.validate_affine("Draw::Fill::transform", &draw.transform)
+            && self.validate_paint(draw.paint)
+            && draw
+                .paint_transform
+                .as_ref()
+                .is_none_or(|xf| self.validate_affine("Draw::Fill::paint_transform", xf))
+            && self.validate_geometry(&draw.shape.clone().to_owned())
+            && self.validate_composite(&draw.composite);
         if !ok {
             return;
         }
 
-        self.inner.draw(draw);
+        self.inner.fill(draw);
+    }
+
+    fn stroke(&mut self, draw: StrokeRef<'_>) {
+        if self.aborted {
+            return;
+        }
+
+        let ok = self.validate_affine("Draw::Stroke::transform", &draw.transform)
+            && self.validate_paint(draw.paint)
+            && draw
+                .paint_transform
+                .as_ref()
+                .is_none_or(|xf| self.validate_affine("Draw::Stroke::paint_transform", xf))
+            && self.validate_stroke(draw.stroke)
+            && self.validate_geometry(&draw.shape.clone().to_owned())
+            && self.validate_composite(&draw.composite);
+        if !ok {
+            return;
+        }
+
+        self.inner.stroke(draw);
+    }
+
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+        if self.aborted {
+            return;
+        }
+        if !self.validate_glyph_run(draw.clone()) {
+            return;
+        }
+        self.inner.glyph_run(draw);
+    }
+
+    fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        if self.aborted {
+            return;
+        }
+        if !self.validate_blurred_rounded_rect(&draw) {
+            return;
+        }
+        self.inner.blurred_rounded_rect(draw);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Composite, FillRule, Geometry, Glyph, Paint, Scene};
+    use crate::{
+        ClipRef, Composite, FillRef, FillRule, Geometry, Glyph, GlyphRunRef, Paint, Scene,
+    };
     use alloc::sync::Arc;
     use alloc::vec;
-    use alloc::vec::Vec;
     use kurbo::Rect;
     use peniko::{
         Blob, Brush, Color, FontData, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
@@ -595,14 +608,11 @@ mod tests {
     fn validating_sink_records_nan_and_aborts_by_default() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
-        sink.draw(Draw::Fill {
-            transform: Affine::translate((f64::NAN, 0.0)),
-            fill_rule: FillRule::NonZero,
-            paint: Paint::default(),
-            paint_transform: None,
-            shape: Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
-            composite: Composite::default(),
-        });
+        let paint = Paint::default();
+        sink.fill(
+            FillRef::new(Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)), &paint)
+                .transform(Affine::translate((f64::NAN, 0.0))),
+        );
         assert!(matches!(
             sink.first_error(),
             Some(ValidationError::NonFinite { .. })
@@ -614,14 +624,11 @@ mod tests {
     fn validating_sink_hook_can_continue() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::with_hook(inner, |_err| ValidationDecision::Continue);
-        sink.draw(Draw::Fill {
-            transform: Affine::translate((f64::NAN, 0.0)),
-            fill_rule: FillRule::NonZero,
-            paint: Paint::default(),
-            paint_transform: None,
-            shape: Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
-            composite: Composite::default(),
-        });
+        let paint = Paint::default();
+        sink.fill(
+            FillRef::new(Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)), &paint)
+                .transform(Affine::translate((f64::NAN, 0.0))),
+        );
         assert!(sink.first_error().is_some());
         assert_eq!(sink.inner().commands().len(), 1);
     }
@@ -630,11 +637,7 @@ mod tests {
     fn finish_catches_unclosed_stacks() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
-        sink.push_clip(Clip::Fill {
-            transform: Affine::IDENTITY,
-            shape: Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
-            fill_rule: FillRule::NonZero,
-        });
+        sink.push_clip(ClipRef::fill(Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0))));
         assert_eq!(
             sink.finish(),
             Err(ValidationError::UnclosedClips { depth: 1 })
@@ -649,22 +652,26 @@ mod tests {
     fn glyph_runs_validate_positions_and_font_size() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
-        sink.draw(Draw::GlyphRun(GlyphRun {
-            font: FontData::new(Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0),
+        let font = FontData::new(Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
+        let style = peniko::Style::Fill(FillRule::NonZero);
+        let glyphs = vec![Glyph {
+            id: 1,
+            x: 0.0,
+            y: f32::NAN,
+        }];
+        let paint = Paint::Solid(Color::BLACK);
+        sink.glyph_run(GlyphRunRef {
+            font: &font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
             font_size: -1.0,
             hint: false,
-            normalized_coords: Vec::default(),
-            style: peniko::Style::Fill(FillRule::NonZero),
-            glyphs: vec![Glyph {
-                id: 1,
-                x: 0.0,
-                y: f32::NAN,
-            }],
-            paint: Paint::Solid(Color::BLACK),
+            normalized_coords: &[],
+            style: &style,
+            glyphs: &glyphs,
+            paint: &paint,
             composite: Composite::default(),
-        }));
+        });
         assert_eq!(
             sink.first_error(),
             Some(&ValidationError::InvalidGlyphRun {
@@ -677,14 +684,14 @@ mod tests {
     fn blurred_rounded_rect_validates_sigma() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
-        sink.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {
+        sink.blurred_rounded_rect(BlurredRoundedRect {
             transform: Affine::IDENTITY,
             rect: Rect::new(0.0, 0.0, 10.0, 10.0),
             color: Color::BLACK,
             radius: 4.0,
             std_dev: -1.0,
             composite: Composite::default(),
-        }));
+        });
         assert_eq!(
             sink.first_error(),
             Some(&ValidationError::InvalidBlurredRoundedRect {
@@ -697,17 +704,14 @@ mod tests {
     fn gradients_validate_stop_offsets() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: FillRule::NonZero,
-            paint: Brush::Gradient(
-                Gradient::new_linear((0.0, 0.0), (10.0, 0.0))
-                    .with_stops([(0.5, Color::BLACK), (0.25, Color::WHITE)]),
-            ),
-            paint_transform: None,
-            shape: Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
-            composite: Composite::default(),
-        });
+        let paint = Brush::Gradient(
+            Gradient::new_linear((0.0, 0.0), (10.0, 0.0))
+                .with_stops([(0.5, Color::BLACK), (0.25, Color::WHITE)]),
+        );
+        sink.fill(FillRef::new(
+            Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
+            &paint,
+        ));
         assert_eq!(
             sink.first_error(),
             Some(&ValidationError::InvalidPaint {
@@ -720,20 +724,17 @@ mod tests {
     fn image_brushes_validate_byte_length() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: FillRule::NonZero,
-            paint: Brush::Image(ImageBrush::new(ImageData {
-                data: Blob::from(vec![0_u8; 3]),
-                format: ImageFormat::Rgba8,
-                alpha_type: ImageAlphaType::Alpha,
-                width: 1,
-                height: 1,
-            })),
-            paint_transform: None,
-            shape: Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
-            composite: Composite::default(),
-        });
+        let paint = Brush::Image(ImageBrush::new(ImageData {
+            data: Blob::from(vec![0_u8; 3]),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 1,
+            height: 1,
+        }));
+        sink.fill(FillRef::new(
+            Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
+            &paint,
+        ));
         assert_eq!(
             sink.first_error(),
             Some(&ValidationError::InvalidPaint {

@@ -1,9 +1,9 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{BlurredRoundedRect, Composite, Draw, Filter, Geometry, Group, Sink};
+use imaging::{BlurredRoundedRect, Composite, Filter, Geometry, GroupRef, PaintSink, Painter};
 use kurbo::{Affine, Rect};
-use peniko::{Brush, Color, Fill};
+use peniko::{Brush, Color};
 
 use super::SnapshotCase;
 use super::util::{background, circle_geometry};
@@ -18,28 +18,25 @@ impl SnapshotCase for GmGroupBlurFilter {
         matches!(backend, "skia" | "vello_cpu")
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::WHITE);
+        let mut painter = Painter::new(sink);
+        let filters = [Filter::blur(6.0)];
 
-        sink.push_group(Group {
-            clip: None,
-            filters: vec![Filter::blur(6.0)],
-            composite: Composite::default(),
+        painter.with_group(GroupRef::new().with_filters(&filters), |painter| {
+            let paint = Brush::Solid(Color::from_rgb8(0, 0, 0));
+            painter
+                .fill(
+                    Geometry::Rect(Rect::new(
+                        width * 0.35,
+                        height * 0.35,
+                        width * 0.65,
+                        height * 0.65,
+                    )),
+                    &paint,
+                )
+                .draw();
         });
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: Brush::Solid(Color::from_rgb8(0, 0, 0)),
-            paint_transform: None,
-            shape: Geometry::Rect(Rect::new(
-                width * 0.35,
-                height * 0.35,
-                width * 0.65,
-                height * 0.65,
-            )),
-            composite: Composite::default(),
-        });
-        sink.pop_group();
     }
 }
 
@@ -53,30 +50,26 @@ impl SnapshotCase for GmGroupDropShadow {
         matches!(backend, "skia" | "vello_cpu")
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(240, 240, 245));
+        let mut painter = Painter::new(sink);
+        let filters = [Filter::DropShadow {
+            dx: 8.0,
+            dy: 10.0,
+            std_deviation_x: 6.0,
+            std_deviation_y: 6.0,
+            color: Color::from_rgba8(0, 0, 0, 130),
+        }];
 
-        sink.push_group(Group {
-            clip: None,
-            filters: vec![Filter::DropShadow {
-                dx: 8.0,
-                dy: 10.0,
-                std_deviation_x: 6.0,
-                std_deviation_y: 6.0,
-                color: Color::from_rgba8(0, 0, 0, 130),
-            }],
-            composite: Composite::default(),
+        painter.with_group(GroupRef::new().with_filters(&filters), |painter| {
+            let paint = Brush::Solid(Color::from_rgb8(0, 140, 255));
+            painter
+                .fill(
+                    circle_geometry((width * 0.45, height * 0.45), width.min(height) * 0.22, 0.1),
+                    &paint,
+                )
+                .draw();
         });
-
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: Brush::Solid(Color::from_rgb8(0, 140, 255)),
-            paint_transform: None,
-            shape: circle_geometry((width * 0.45, height * 0.45), width.min(height) * 0.22, 0.1),
-            composite: Composite::default(),
-        });
-        sink.pop_group();
     }
 }
 
@@ -90,32 +83,31 @@ impl SnapshotCase for GmBlurredRoundedRect {
         matches!(backend, "skia" | "vello_cpu" | "vello")
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(242, 243, 247));
+        let mut painter = Painter::new(sink);
 
-        sink.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {
+        painter.blurred_rounded_rect(BlurredRoundedRect {
             transform: Affine::translate((0.0, 10.0)),
             rect: Rect::new(width * 0.18, height * 0.22, width * 0.82, height * 0.68),
             color: Color::from_rgba8(23, 33, 66, 150),
             radius: 26.0,
             std_dev: 12.0,
             composite: Composite::default(),
-        }));
-
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: Brush::Solid(Color::WHITE),
-            paint_transform: None,
-            shape: Geometry::RoundedRect(kurbo::RoundedRect::new(
-                width * 0.18,
-                height * 0.22,
-                width * 0.82,
-                height * 0.68,
-                26.0,
-            )),
-            composite: Composite::default(),
         });
+        let white = Brush::Solid(Color::WHITE);
+        painter
+            .fill(
+                Geometry::RoundedRect(kurbo::RoundedRect::new(
+                    width * 0.18,
+                    height * 0.22,
+                    width * 0.82,
+                    height * 0.68,
+                    26.0,
+                )),
+                &white,
+            )
+            .draw();
     }
 }
 
@@ -133,8 +125,9 @@ impl SnapshotCase for GmBlurredRoundedRectVariants {
         4
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(236, 238, 244));
+        let mut painter = Painter::new(sink);
 
         let cards = [
             (
@@ -158,24 +151,23 @@ impl SnapshotCase for GmBlurredRoundedRectVariants {
         ];
 
         for (rect, radius, std_dev, color) in cards {
-            sink.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {
+            painter.blurred_rounded_rect(BlurredRoundedRect {
                 transform: Affine::translate((0.0, 8.0)),
                 rect,
                 color,
                 radius,
                 std_dev,
                 composite: Composite::default(),
-            }));
-            sink.draw(Draw::Fill {
-                transform: Affine::IDENTITY,
-                fill_rule: Fill::NonZero,
-                paint: Brush::Solid(Color::WHITE),
-                paint_transform: None,
-                shape: Geometry::RoundedRect(kurbo::RoundedRect::new(
-                    rect.x0, rect.y0, rect.x1, rect.y1, radius,
-                )),
-                composite: Composite::default(),
             });
+            let white = Brush::Solid(Color::WHITE);
+            painter
+                .fill(
+                    Geometry::RoundedRect(kurbo::RoundedRect::new(
+                        rect.x0, rect.y0, rect.x1, rect.y1, radius,
+                    )),
+                    &white,
+                )
+                .draw();
         }
     }
 }

@@ -3,9 +3,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use imaging::{Draw, Geometry, Sink};
-use kurbo::{Affine, Circle, Point, Rect, Shape as _};
-use peniko::{Blob, Brush, Color, Fill, FontData, ImageAlphaType, ImageData, ImageFormat};
+use imaging::{Geometry, PaintSink, Painter};
+use kurbo::{Circle, Point, Rect, Shape as _};
+use peniko::{Blob, Brush, Color, FontData, ImageAlphaType, ImageData, ImageFormat};
 
 /// Default snapshot width in pixels.
 pub const DEFAULT_WIDTH: u16 = 256;
@@ -14,15 +14,9 @@ pub const DEFAULT_HEIGHT: u16 = 256;
 
 const ROBOTO_FONT_BYTES: &[u8] = include_bytes!("../assets/roboto/Roboto-Regular.ttf");
 
-pub(crate) fn background(sink: &mut dyn Sink, width: f64, height: f64, color: Color) {
-    sink.draw(Draw::Fill {
-        transform: Affine::IDENTITY,
-        fill_rule: Fill::NonZero,
-        paint: Brush::Solid(color),
-        paint_transform: None,
-        shape: Geometry::Rect(Rect::new(0.0, 0.0, width, height)),
-        composite: imaging::Composite::default(),
-    });
+pub(crate) fn background(sink: &mut dyn PaintSink, width: f64, height: f64, color: Color) {
+    let paint = Brush::Solid(color);
+    Painter::new(sink).fill_rect(Rect::new(0.0, 0.0, width, height), &paint);
 }
 
 pub(crate) fn circle_geometry(center: (f64, f64), radius: f64, tolerance: f64) -> Geometry {

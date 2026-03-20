@@ -14,7 +14,7 @@ mod strokes;
 mod text;
 mod util;
 
-use imaging::{Scene, Sink};
+use imaging::{PaintSink, Scene};
 
 pub use self::util::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
 
@@ -90,7 +90,7 @@ pub trait SnapshotCase: Sync {
     }
 
     /// Emit commands into the given sink.
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64);
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64);
 }
 
 /// All snapshot cases.

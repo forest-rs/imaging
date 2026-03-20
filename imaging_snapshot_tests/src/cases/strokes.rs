@@ -1,9 +1,9 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, Draw, Geometry, Sink, StrokeStyle};
+use imaging::{Geometry, PaintSink, Painter, StrokeStyle};
 use kurbo::{Affine, BezPath, Cap, Join, Point};
-use peniko::{Brush, Color, Fill};
+use peniko::{Brush, Color};
 
 use super::SnapshotCase;
 use super::util::background;
@@ -14,8 +14,9 @@ impl SnapshotCase for GmStrokes {
         "gm_strokes"
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(245, 245, 250));
+        let mut painter = Painter::new(sink);
 
         let mut path = BezPath::new();
         path.move_to(Point::new(width * 0.15, height * 0.75));
@@ -42,29 +43,26 @@ impl SnapshotCase for GmStrokes {
                 stroke.dash_offset = 0.0;
             }
 
-            sink.draw(Draw::Stroke {
-                transform,
-                stroke,
-                paint: Brush::Solid(Color::from_rgb8(20, 80, 200)),
-                paint_transform: None,
-                shape: Geometry::Path(path.clone()),
-                composite: Composite::default(),
-            });
+            let stroke_paint = Brush::Solid(Color::from_rgb8(20, 80, 200));
+            painter
+                .stroke(Geometry::Path(path.clone()), &stroke, &stroke_paint)
+                .transform(transform)
+                .draw();
 
             // Underlay to show caps clearly.
-            sink.draw(Draw::Fill {
-                transform,
-                fill_rule: Fill::NonZero,
-                paint: Brush::Solid(Color::from_rgba8(0, 0, 0, 18)),
-                paint_transform: None,
-                shape: Geometry::Rect(kurbo::Rect::new(
-                    width * 0.1,
-                    height * 0.78,
-                    width * 0.8,
-                    height * 0.82,
-                )),
-                composite: Composite::default(),
-            });
+            let underlay = Brush::Solid(Color::from_rgba8(0, 0, 0, 18));
+            painter
+                .fill(
+                    Geometry::Rect(kurbo::Rect::new(
+                        width * 0.1,
+                        height * 0.78,
+                        width * 0.8,
+                        height * 0.82,
+                    )),
+                    &underlay,
+                )
+                .transform(transform)
+                .draw();
         }
     }
 }

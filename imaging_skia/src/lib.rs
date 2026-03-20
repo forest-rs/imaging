@@ -4,13 +4,14 @@
 //! Skia backend for `imaging`.
 //!
 //! This crate provides a CPU raster renderer that consumes `imaging::Scene` (or accepts commands
-//! directly via `imaging::Sink`) and produces an RGBA8 image buffer using Skia.
+//! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using Skia.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use imaging::{
-    BlurredRoundedRect, Clip, Draw, Filter, Geometry, GlyphRun, Group, Scene, Sink, replay,
+    BlurredRoundedRect, ClipRef, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
+    Scene, StrokeRef, replay,
 };
 use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
@@ -147,19 +148,19 @@ impl SkiaRenderer {
         canvas.concat(&affine_to_matrix(xf));
     }
 
-    fn clip_path(&mut self, clip: &Clip) -> Option<sk::Path> {
+    fn clip_path(&mut self, clip: ClipRef<'_>) -> Option<sk::Path> {
         match clip {
-            Clip::Fill {
+            ClipRef::Fill {
                 transform,
                 shape,
                 fill_rule,
             } => {
                 let mut path = geometry_to_sk_path(shape, self.tolerance)?;
-                self.set_matrix(*transform);
-                path = path_with_fill_rule(&path, *fill_rule);
+                self.set_matrix(transform);
+                path = path_with_fill_rule(&path, fill_rule);
                 Some(path)
             }
-            Clip::Stroke {
+            ClipRef::Stroke {
                 transform,
                 shape,
                 stroke,
@@ -173,23 +174,23 @@ impl SkiaRenderer {
                     &kurbo::StrokeOpts::default(),
                     self.tolerance,
                 );
-                self.set_matrix(*transform);
+                self.set_matrix(transform);
                 bez_to_sk_path(&outline)
             }
         }
     }
 
-    fn push_group_impl(&mut self, group: &Group) -> u8 {
+    fn push_group_impl(&mut self, group: GroupRef<'_>) -> u8 {
         let filter = if group.filters.is_empty() {
             None
         } else {
-            build_filter_chain(&group.filters)
+            build_filter_chain(group.filters)
         };
         if !group.filters.is_empty() && filter.is_none() {
             self.set_error_once(Error::UnsupportedFilter);
         }
 
-        let clip_path = group.clip.as_ref().and_then(|clip| self.clip_path(clip));
+        let clip_path = group.clip.and_then(|clip| self.clip_path(clip));
         let mut restores = 0_u8;
 
         let mut paint = sk::Paint::default();
@@ -231,7 +232,7 @@ impl SkiaRenderer {
         restores
     }
 
-    fn draw_glyph_run(&mut self, glyph_run: GlyphRun) {
+    fn draw_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>) {
         if !glyph_run.normalized_coords.is_empty() {
             self.set_error_once(Error::UnsupportedGlyphVariations);
             return;
@@ -244,11 +245,9 @@ impl SkiaRenderer {
 
         self.set_matrix(glyph_run.transform);
 
-        let Some(mut sk_paint) = brush_to_paint(
-            &glyph_run.paint,
-            glyph_run.composite.alpha,
-            Affine::IDENTITY,
-        ) else {
+        let Some(mut sk_paint) =
+            brush_to_paint(glyph_run.paint, glyph_run.composite.alpha, Affine::IDENTITY)
+        else {
             self.set_error_once(Error::Internal("invalid image brush"));
             return;
         };
@@ -258,7 +257,7 @@ impl SkiaRenderer {
             peniko::Style::Fill(_) => {
                 sk_paint.set_style(sk::PaintStyle::Fill);
             }
-            peniko::Style::Stroke(ref stroke) => apply_stroke_style(&mut sk_paint, stroke),
+            peniko::Style::Stroke(stroke) => apply_stroke_style(&mut sk_paint, stroke),
         }
 
         let Ok(glyph_ids) = glyph_run
@@ -318,12 +317,12 @@ impl SkiaRenderer {
     }
 }
 
-impl Sink for SkiaRenderer {
-    fn push_clip(&mut self, clip: Clip) {
+impl PaintSink for SkiaRenderer {
+    fn push_clip(&mut self, clip: ClipRef<'_>) {
         if self.error.is_some() {
             return;
         }
-        let Some(path) = self.clip_path(&clip) else {
+        let Some(path) = self.clip_path(clip) else {
             return;
         };
         let canvas = self.surface.canvas();
@@ -344,11 +343,11 @@ impl Sink for SkiaRenderer {
         self.clip_depth -= 1;
     }
 
-    fn push_group(&mut self, group: Group) {
+    fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
             return;
         }
-        let restores = self.push_group_impl(&group);
+        let restores = self.push_group_impl(group);
         self.group_stack.push(restores);
     }
 
@@ -365,99 +364,107 @@ impl Sink for SkiaRenderer {
         }
     }
 
-    fn draw(&mut self, draw: Draw) {
+    fn fill(&mut self, draw: FillRef<'_>) {
         if self.error.is_some() {
             return;
         }
 
-        match draw {
-            Draw::Fill {
-                transform,
-                fill_rule,
-                paint,
-                paint_transform,
-                shape,
-                composite,
-            } => {
-                self.set_matrix(transform);
-                let Some(mut sk_paint) = brush_to_paint(
-                    &paint,
-                    composite.alpha,
-                    paint_transform.unwrap_or(Affine::IDENTITY),
-                ) else {
-                    self.set_error_once(Error::Internal("invalid image brush"));
-                    return;
-                };
-                sk_paint.set_blend_mode(map_blend_mode(&composite.blend));
-                sk_paint.set_style(sk::PaintStyle::Fill);
+        self.set_matrix(draw.transform);
+        let Some(mut sk_paint) = brush_to_paint(
+            draw.paint,
+            draw.composite.alpha,
+            draw.paint_transform.unwrap_or(Affine::IDENTITY),
+        ) else {
+            self.set_error_once(Error::Internal("invalid image brush"));
+            return;
+        };
+        sk_paint.set_blend_mode(map_blend_mode(&draw.composite.blend));
+        sk_paint.set_style(sk::PaintStyle::Fill);
 
-                match shape {
-                    Geometry::Rect(r) => {
-                        let rect = sk::Rect::new(
-                            f64_to_f32(r.x0),
-                            f64_to_f32(r.y0),
-                            f64_to_f32(r.x1),
-                            f64_to_f32(r.y1),
-                        );
-                        self.surface.canvas().draw_rect(rect, &sk_paint);
-                    }
-                    Geometry::RoundedRect(rr) => {
-                        let path = rr.to_path(self.tolerance);
-                        let sk_path = bez_to_sk_path(&path).expect("rounded rect to sk path");
-                        let sk_path = path_with_fill_rule(&sk_path, fill_rule);
-                        self.surface.canvas().draw_path(&sk_path, &sk_paint);
-                    }
-                    Geometry::Path(p) => {
-                        let sk_path = bez_to_sk_path(&p).expect("path to sk path");
-                        let sk_path = path_with_fill_rule(&sk_path, fill_rule);
-                        self.surface.canvas().draw_path(&sk_path, &sk_paint);
-                    }
-                }
+        match draw.shape {
+            GeometryRef::Rect(r) => {
+                let rect = sk::Rect::new(
+                    f64_to_f32(r.x0),
+                    f64_to_f32(r.y0),
+                    f64_to_f32(r.x1),
+                    f64_to_f32(r.y1),
+                );
+                self.surface.canvas().draw_rect(rect, &sk_paint);
             }
-            Draw::Stroke {
-                transform,
-                stroke,
-                paint,
-                paint_transform,
-                shape,
-                composite,
-            } => {
-                self.set_matrix(transform);
-                let Some(mut sk_paint) = brush_to_paint(
-                    &paint,
-                    composite.alpha,
-                    paint_transform.unwrap_or(Affine::IDENTITY),
-                ) else {
-                    self.set_error_once(Error::Internal("invalid image brush"));
-                    return;
-                };
-                sk_paint.set_blend_mode(map_blend_mode(&composite.blend));
-                apply_stroke_style(&mut sk_paint, &stroke);
-
-                match shape {
-                    Geometry::Rect(r) => {
-                        let rect = sk::Rect::new(
-                            f64_to_f32(r.x0),
-                            f64_to_f32(r.y0),
-                            f64_to_f32(r.x1),
-                            f64_to_f32(r.y1),
-                        );
-                        self.surface.canvas().draw_rect(rect, &sk_paint);
-                    }
-                    Geometry::RoundedRect(rr) => {
-                        let path = rr.to_path(self.tolerance);
-                        let sk_path = bez_to_sk_path(&path).expect("rounded rect to sk path");
-                        self.surface.canvas().draw_path(&sk_path, &sk_paint);
-                    }
-                    Geometry::Path(p) => {
-                        let sk_path = bez_to_sk_path(&p).expect("path to sk path");
-                        self.surface.canvas().draw_path(&sk_path, &sk_paint);
-                    }
-                }
+            GeometryRef::RoundedRect(rr) => {
+                let path = rr.to_path(self.tolerance);
+                let sk_path = bez_to_sk_path(&path).expect("rounded rect to sk path");
+                let sk_path = path_with_fill_rule(&sk_path, draw.fill_rule);
+                self.surface.canvas().draw_path(&sk_path, &sk_paint);
             }
-            Draw::GlyphRun(glyph_run) => self.draw_glyph_run(glyph_run),
-            Draw::BlurredRoundedRect(draw) => self.draw_blurred_rounded_rect(draw),
+            GeometryRef::Path(p) => {
+                let sk_path = bez_to_sk_path(p).expect("path to sk path");
+                let sk_path = path_with_fill_rule(&sk_path, draw.fill_rule);
+                self.surface.canvas().draw_path(&sk_path, &sk_paint);
+            }
+            GeometryRef::OwnedPath(p) => {
+                let sk_path = bez_to_sk_path(&p).expect("path to sk path");
+                let sk_path = path_with_fill_rule(&sk_path, draw.fill_rule);
+                self.surface.canvas().draw_path(&sk_path, &sk_paint);
+            }
         }
+    }
+
+    fn stroke(&mut self, draw: StrokeRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+
+        self.set_matrix(draw.transform);
+        let Some(mut sk_paint) = brush_to_paint(
+            draw.paint,
+            draw.composite.alpha,
+            draw.paint_transform.unwrap_or(Affine::IDENTITY),
+        ) else {
+            self.set_error_once(Error::Internal("invalid image brush"));
+            return;
+        };
+        sk_paint.set_blend_mode(map_blend_mode(&draw.composite.blend));
+        apply_stroke_style(&mut sk_paint, draw.stroke);
+
+        match draw.shape {
+            GeometryRef::Rect(r) => {
+                let rect = sk::Rect::new(
+                    f64_to_f32(r.x0),
+                    f64_to_f32(r.y0),
+                    f64_to_f32(r.x1),
+                    f64_to_f32(r.y1),
+                );
+                self.surface.canvas().draw_rect(rect, &sk_paint);
+            }
+            GeometryRef::RoundedRect(rr) => {
+                let path = rr.to_path(self.tolerance);
+                let sk_path = bez_to_sk_path(&path).expect("rounded rect to sk path");
+                self.surface.canvas().draw_path(&sk_path, &sk_paint);
+            }
+            GeometryRef::Path(p) => {
+                let sk_path = bez_to_sk_path(p).expect("path to sk path");
+                self.surface.canvas().draw_path(&sk_path, &sk_paint);
+            }
+            GeometryRef::OwnedPath(p) => {
+                let sk_path = bez_to_sk_path(&p).expect("path to sk path");
+                self.surface.canvas().draw_path(&sk_path, &sk_paint);
+            }
+        }
+    }
+
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+        self.draw_glyph_run(draw);
+    }
+
+    fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        if self.error.is_some() {
+            return;
+        }
+        self.draw_blurred_rounded_rect(draw);
     }
 }
 
@@ -488,7 +495,7 @@ fn affine_to_matrix(xf: Affine) -> sk::Matrix {
     )
 }
 
-fn skia_font_from_glyph_run(glyph_run: &GlyphRun) -> Option<sk::Font> {
+fn skia_font_from_glyph_run(glyph_run: &GlyphRunRef<'_>) -> Option<sk::Font> {
     let typeface = sk::FontMgr::default()
         .new_from_data(glyph_run.font.data.as_ref(), glyph_run.font.index as usize)?;
 
@@ -532,15 +539,16 @@ fn path_with_fill_rule(path: &sk::Path, rule: peniko::Fill) -> sk::Path {
     }
 }
 
-fn geometry_to_bez_path(geom: &Geometry, tolerance: f64) -> Option<kurbo::BezPath> {
+fn geometry_to_bez_path(geom: GeometryRef<'_>, tolerance: f64) -> Option<kurbo::BezPath> {
     Some(match geom {
-        Geometry::Rect(r) => r.to_path(tolerance),
-        Geometry::RoundedRect(rr) => rr.to_path(tolerance),
-        Geometry::Path(p) => p.clone(),
+        GeometryRef::Rect(r) => r.to_path(tolerance),
+        GeometryRef::RoundedRect(rr) => rr.to_path(tolerance),
+        GeometryRef::Path(p) => p.clone(),
+        GeometryRef::OwnedPath(p) => p,
     })
 }
 
-fn geometry_to_sk_path(geom: &Geometry, tolerance: f64) -> Option<sk::Path> {
+fn geometry_to_sk_path(geom: GeometryRef<'_>, tolerance: f64) -> Option<sk::Path> {
     let bez = geometry_to_bez_path(geom, tolerance)?;
     bez_to_sk_path(&bez)
 }

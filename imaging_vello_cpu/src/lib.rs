@@ -4,14 +4,14 @@
 //! Vello CPU backend for `imaging`.
 //!
 //! This crate provides a CPU renderer that consumes `imaging::Scene` (or accepts commands directly
-//! via `imaging::Sink`) and produces an RGBA8 image buffer using `vello_cpu`.
+//! via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use imaging::{
-    BlurredRoundedRect, Clip, Composite, Draw, Filter, Geometry, GlyphRun, Group, Scene, Sink,
-    replay,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
+    PaintSink, Scene, StrokeRef, replay,
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{BlendMode, Brush, Fill, Style};
@@ -121,10 +121,10 @@ impl VelloCpuRenderer {
 
     fn brush_to_paint(
         &mut self,
-        brush: Brush,
+        brush: &Brush,
         composite: Composite,
     ) -> Option<vello_cpu::PaintType> {
-        let brush = brush.multiply_alpha(composite.alpha);
+        let brush = brush.clone().multiply_alpha(composite.alpha);
         let paint: vello_cpu::PaintType = match brush {
             Brush::Solid(c) => Brush::Solid(c),
             Brush::Gradient(g) => Brush::Gradient(g),
@@ -136,29 +136,30 @@ impl VelloCpuRenderer {
         Some(paint)
     }
 
-    fn geometry_to_path(&self, geom: &Geometry) -> BezPath {
+    fn geometry_to_path(&self, geom: GeometryRef<'_>) -> BezPath {
         match geom {
-            Geometry::Rect(r) => r.to_path(self.tolerance),
-            Geometry::RoundedRect(rr) => rr.to_path(self.tolerance),
-            Geometry::Path(p) => p.clone(),
+            GeometryRef::Rect(r) => r.to_path(self.tolerance),
+            GeometryRef::RoundedRect(rr) => rr.to_path(self.tolerance),
+            GeometryRef::Path(p) => p.clone(),
+            GeometryRef::OwnedPath(p) => p,
         }
     }
 
-    fn clip_to_path(&mut self, clip: &Clip) -> (Affine, BezPath, Fill) {
+    fn clip_to_path(&mut self, clip: ClipRef<'_>) -> (Affine, BezPath, Fill) {
         match clip {
-            Clip::Fill {
+            ClipRef::Fill {
                 transform,
                 shape,
                 fill_rule,
-            } => (*transform, self.geometry_to_path(shape), *fill_rule),
-            Clip::Stroke {
+            } => (transform, self.geometry_to_path(shape), fill_rule),
+            ClipRef::Stroke {
                 transform,
                 shape,
                 stroke: style,
             } => {
                 let path = self.geometry_to_path(shape);
                 let outline = stroke(path.iter(), style, &StrokeOpts::default(), self.tolerance);
-                (*transform, outline, Fill::NonZero)
+                (transform, outline, Fill::NonZero)
             }
         }
     }
@@ -208,7 +209,7 @@ impl VelloCpuRenderer {
         })
     }
 
-    fn draw_glyph_run(&mut self, glyph_run: GlyphRun) {
+    fn draw_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>) {
         let Some(paint) = self.brush_to_paint(glyph_run.paint, glyph_run.composite) else {
             return;
         };
@@ -218,19 +219,19 @@ impl VelloCpuRenderer {
 
         match glyph_run.style {
             Style::Fill(fill_rule) => {
-                self.ctx.set_fill_rule(fill_rule);
+                self.ctx.set_fill_rule(*fill_rule);
                 let builder = self
                     .ctx
-                    .glyph_run(&glyph_run.font)
+                    .glyph_run(glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
-                    .normalized_coords(&glyph_run.normalized_coords);
+                    .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
                     builder.glyph_transform(transform)
                 } else {
                     builder
                 };
-                let glyphs = glyph_run.glyphs.into_iter().map(|glyph| VelloGlyph {
+                let glyphs = glyph_run.glyphs.iter().map(|glyph| VelloGlyph {
                     id: glyph.id,
                     x: glyph.x,
                     y: glyph.y,
@@ -238,19 +239,19 @@ impl VelloCpuRenderer {
                 builder.fill_glyphs(glyphs);
             }
             Style::Stroke(stroke) => {
-                self.ctx.set_stroke(stroke);
+                self.ctx.set_stroke(stroke.clone());
                 let builder = self
                     .ctx
-                    .glyph_run(&glyph_run.font)
+                    .glyph_run(glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
-                    .normalized_coords(&glyph_run.normalized_coords);
+                    .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
                     builder.glyph_transform(transform)
                 } else {
                     builder
                 };
-                let glyphs = glyph_run.glyphs.into_iter().map(|glyph| VelloGlyph {
+                let glyphs = glyph_run.glyphs.iter().map(|glyph| VelloGlyph {
                     id: glyph.id,
                     x: glyph.x,
                     y: glyph.y,
@@ -282,12 +283,12 @@ fn f64_to_f32(v: f64) -> f32 {
     v as f32
 }
 
-impl Sink for VelloCpuRenderer {
-    fn push_clip(&mut self, clip: Clip) {
+impl PaintSink for VelloCpuRenderer {
+    fn push_clip(&mut self, clip: ClipRef<'_>) {
         if self.error.is_some() {
             return;
         }
-        let (xf, path, fill_rule) = self.clip_to_path(&clip);
+        let (xf, path, fill_rule) = self.clip_to_path(clip);
         self.ctx.set_transform(xf);
         self.ctx.set_fill_rule(fill_rule);
         self.ctx.push_clip_path(&path);
@@ -306,11 +307,11 @@ impl Sink for VelloCpuRenderer {
         self.clip_depth -= 1;
     }
 
-    fn push_group(&mut self, group: Group) {
+    fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
             return;
         }
-        let (clip_path, clip_transform) = match group.clip.as_ref() {
+        let (clip_path, clip_transform) = match group.clip {
             None => (None, Affine::IDENTITY),
             Some(clip) => {
                 let (xf, path, fill_rule) = self.clip_to_path(clip);
@@ -323,7 +324,7 @@ impl Sink for VelloCpuRenderer {
 
         let blend: Option<BlendMode> = Some(group.composite.blend);
         let opacity: Option<f32> = Some(group.composite.alpha);
-        let filter = self.filters_to_vello(&group.filters);
+        let filter = self.filters_to_vello(group.filters);
         self.ctx
             .push_layer(clip_path.as_ref(), blend, opacity, None, filter);
         self.group_depth += 1;
@@ -341,68 +342,69 @@ impl Sink for VelloCpuRenderer {
         self.group_depth -= 1;
     }
 
-    fn draw(&mut self, draw: Draw) {
+    fn fill(&mut self, draw: FillRef<'_>) {
         if self.error.is_some() {
             return;
         }
 
-        match draw {
-            Draw::Fill {
-                transform,
-                fill_rule,
-                paint,
-                paint_transform,
-                shape,
-                composite,
-            } => {
-                let Some(paint) = self.brush_to_paint(paint, composite) else {
-                    return;
-                };
-                self.ctx.set_transform(transform);
-                self.ctx.set_fill_rule(fill_rule);
-                self.ctx
-                    .set_paint_transform(paint_transform.unwrap_or(Affine::IDENTITY));
-                self.ctx.set_blend_mode(composite.blend);
-                self.ctx.set_paint(paint);
+        let Some(paint) = self.brush_to_paint(draw.paint, draw.composite) else {
+            return;
+        };
+        self.ctx.set_transform(draw.transform);
+        self.ctx.set_fill_rule(draw.fill_rule);
+        self.ctx
+            .set_paint_transform(draw.paint_transform.unwrap_or(Affine::IDENTITY));
+        self.ctx.set_blend_mode(draw.composite.blend);
+        self.ctx.set_paint(paint);
 
-                match shape {
-                    Geometry::Rect(r) => self.ctx.fill_rect(&r),
-                    Geometry::RoundedRect(rr) => {
-                        let path = rr.to_path(self.tolerance);
-                        self.ctx.fill_path(&path);
-                    }
-                    Geometry::Path(p) => self.ctx.fill_path(&p),
-                }
+        match draw.shape {
+            GeometryRef::Rect(r) => self.ctx.fill_rect(&r),
+            GeometryRef::RoundedRect(rr) => {
+                let path = rr.to_path(self.tolerance);
+                self.ctx.fill_path(&path);
             }
-            Draw::Stroke {
-                transform,
-                stroke,
-                paint,
-                paint_transform,
-                shape,
-                composite,
-            } => {
-                let Some(paint) = self.brush_to_paint(paint, composite) else {
-                    return;
-                };
-                self.ctx.set_transform(transform);
-                self.ctx.set_stroke(stroke);
-                self.ctx
-                    .set_paint_transform(paint_transform.unwrap_or(Affine::IDENTITY));
-                self.ctx.set_blend_mode(composite.blend);
-                self.ctx.set_paint(paint);
-
-                match shape {
-                    Geometry::Rect(r) => self.ctx.stroke_rect(&r),
-                    Geometry::RoundedRect(rr) => {
-                        let path = rr.to_path(self.tolerance);
-                        self.ctx.stroke_path(&path);
-                    }
-                    Geometry::Path(p) => self.ctx.stroke_path(&p),
-                }
-            }
-            Draw::GlyphRun(glyph_run) => self.draw_glyph_run(glyph_run),
-            Draw::BlurredRoundedRect(draw) => self.draw_blurred_rounded_rect(draw),
+            GeometryRef::Path(p) => self.ctx.fill_path(p),
+            GeometryRef::OwnedPath(p) => self.ctx.fill_path(&p),
         }
+    }
+
+    fn stroke(&mut self, draw: StrokeRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+
+        let Some(paint) = self.brush_to_paint(draw.paint, draw.composite) else {
+            return;
+        };
+        self.ctx.set_transform(draw.transform);
+        self.ctx.set_stroke(draw.stroke.clone());
+        self.ctx
+            .set_paint_transform(draw.paint_transform.unwrap_or(Affine::IDENTITY));
+        self.ctx.set_blend_mode(draw.composite.blend);
+        self.ctx.set_paint(paint);
+
+        match draw.shape {
+            GeometryRef::Rect(r) => self.ctx.stroke_rect(&r),
+            GeometryRef::RoundedRect(rr) => {
+                let path = rr.to_path(self.tolerance);
+                self.ctx.stroke_path(&path);
+            }
+            GeometryRef::Path(p) => self.ctx.stroke_path(p),
+            GeometryRef::OwnedPath(p) => self.ctx.stroke_path(&p),
+        }
+    }
+
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+        self.draw_glyph_run(draw);
+    }
+
+    fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        if self.error.is_some() {
+            return;
+        }
+        self.draw_blurred_rounded_rect(draw);
     }
 }

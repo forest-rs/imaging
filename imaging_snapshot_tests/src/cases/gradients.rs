@@ -1,9 +1,9 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Clip, Composite, Draw, Geometry, Sink};
-use kurbo::{Affine, RoundedRect};
-use peniko::{BlendMode, Brush, Color, Compose, Extend, Fill, Gradient};
+use imaging::{ClipRef, Composite, Geometry, PaintSink, Painter};
+use kurbo::RoundedRect;
+use peniko::{BlendMode, Brush, Color, Compose, Extend, Gradient};
 
 use super::SnapshotCase;
 use super::util::{background, circle_geometry, f32p};
@@ -52,29 +52,23 @@ impl SnapshotCase for GmGradientsLinear {
         16
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(18, 18, 22));
+        let mut painter = Painter::new(sink);
 
         let band = RoundedRect::new(24.0, 32.0, width - 24.0, height - 32.0, 28.0);
         let g = linear_rainbow((20.0, 20.0), (f32p(width - 20.0), f32p(height - 20.0)));
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: g,
-            paint_transform: None,
-            shape: Geometry::RoundedRect(band),
-            composite: Composite::default(),
-        });
+        painter.fill(Geometry::RoundedRect(band), &g).draw();
 
         // Punch a transparent hole using a nontrivial compose mode (Copy).
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: Brush::Solid(Color::TRANSPARENT),
-            paint_transform: None,
-            shape: circle_geometry((width * 0.5, height * 0.5), width.min(height) * 0.14, 0.1),
-            composite: Composite::new(BlendMode::from(Compose::Copy), 1.0),
-        });
+        let clear = Brush::Solid(Color::TRANSPARENT);
+        painter
+            .fill(
+                circle_geometry((width * 0.5, height * 0.5), width.min(height) * 0.14, 0.1),
+                &clear,
+            )
+            .composite(Composite::new(BlendMode::from(Compose::Copy), 1.0))
+            .draw();
     }
 }
 
@@ -84,33 +78,32 @@ impl SnapshotCase for GmGradientsSweep {
         "gm_gradients_sweep"
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(10, 10, 12));
+        let mut painter = Painter::new(sink);
 
-        sink.push_clip(Clip::Fill {
-            transform: Affine::IDENTITY,
-            shape: Geometry::RoundedRect(RoundedRect::new(
+        painter.with_clip(
+            ClipRef::fill(Geometry::RoundedRect(RoundedRect::new(
                 16.0,
                 16.0,
                 width - 16.0,
                 height - 16.0,
                 24.0,
-            )),
-            fill_rule: Fill::NonZero,
-        });
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: sweep_rainbow(
-                (f32p(width * 0.5), f32p(height * 0.5)),
-                0.0,
-                std::f32::consts::TAU,
-            ),
-            paint_transform: None,
-            shape: circle_geometry((width * 0.5, height * 0.5), width.min(height) * 0.35, 0.1),
-            composite: Composite::default(),
-        });
-        sink.pop_clip();
+            ))),
+            |painter| {
+                let sweep = sweep_rainbow(
+                    (f32p(width * 0.5), f32p(height * 0.5)),
+                    0.0,
+                    std::f32::consts::TAU,
+                );
+                painter
+                    .fill(
+                        circle_geometry((width * 0.5, height * 0.5), width.min(height) * 0.35, 0.1),
+                        &sweep,
+                    )
+                    .draw();
+            },
+        );
     }
 }
 
@@ -124,8 +117,9 @@ impl SnapshotCase for GmGradientsTwoPointRadial {
         4
     }
 
-    fn run(&self, sink: &mut dyn Sink, width: f64, height: f64) {
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(16, 16, 18));
+        let mut painter = Painter::new(sink);
 
         // Two-point radial gradient "spotlight".
         let stops = [
@@ -143,19 +137,17 @@ impl SnapshotCase for GmGradientsTwoPointRadial {
             .with_extend(Extend::Pad)
             .with_stops(stops),
         );
-        sink.draw(Draw::Fill {
-            transform: Affine::IDENTITY,
-            fill_rule: Fill::NonZero,
-            paint: g,
-            paint_transform: None,
-            shape: Geometry::RoundedRect(RoundedRect::new(
-                24.0,
-                24.0,
-                width - 24.0,
-                height - 24.0,
-                30.0,
-            )),
-            composite: Composite::default(),
-        });
+        painter
+            .fill(
+                Geometry::RoundedRect(RoundedRect::new(
+                    24.0,
+                    24.0,
+                    width - 24.0,
+                    height - 24.0,
+                    30.0,
+                )),
+                &g,
+            )
+            .draw();
     }
 }
