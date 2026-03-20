@@ -4,13 +4,17 @@
 //! Borrowed paint/streaming API.
 //!
 //! These types let callers stream imaging commands as borrowed data into a [`PaintSink`] without
-//! first constructing owned IR payloads. [`Scene`] remains the owned semantic recording format.
+//! first constructing owned recording payloads. [`crate::record::Scene`] remains the owned
+//! semantic recording format.
 
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _};
 
 use crate::{
-    BlurredRoundedRect, Clip, ClipId, Command, Composite, Draw, DrawId, FillRule, Filter, Geometry,
-    Glyph, GlyphRun, GlyphStyle, Group, GroupId, NormalizedCoord, Paint, Scene, StrokeStyle,
+    BlurredRoundedRect, Composite, FillRule, Filter, GlyphStyle, NormalizedCoord, Paint,
+    StrokeStyle,
+    record::{
+        Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group, GroupId, Scene,
+    },
 };
 
 /// Borrowed geometry payload.
@@ -616,8 +620,8 @@ fn replay_draw(scene: &Scene, id: DrawId, sink: &mut impl PaintSink) {
     }
 }
 
-/// Replay a recorded [`Scene`] into a [`PaintSink`].
-pub fn replay(scene: &Scene, sink: &mut impl PaintSink) {
+/// Replay a recorded [`crate::record::Scene`] into a [`PaintSink`].
+pub(crate) fn replay(scene: &Scene, sink: &mut impl PaintSink) {
     for cmd in scene.commands() {
         match *cmd {
             Command::PushClip(id) => replay_clip(scene, id, sink),

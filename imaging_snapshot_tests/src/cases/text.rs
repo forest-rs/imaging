@@ -1,7 +1,7 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Glyph, PaintSink, Painter, StrokeStyle};
+use imaging::{PaintSink, Painter, StrokeStyle, record::Glyph};
 use kurbo::Affine;
 use peniko::{Brush, Color, Fill, Style};
 use skrifa::{FontRef, MetadataProvider};

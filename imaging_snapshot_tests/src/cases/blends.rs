@@ -1,7 +1,7 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, Geometry, PaintSink, Painter};
+use imaging::{Composite, PaintSink, Painter, record::Geometry};
 use kurbo::RoundedRect;
 use peniko::{BlendMode, Brush, Color, Compose, Gradient, Mix};
 

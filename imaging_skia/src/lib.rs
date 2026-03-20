@@ -3,15 +3,16 @@
 
 //! Skia backend for `imaging`.
 //!
-//! This crate provides a CPU raster renderer that consumes `imaging::Scene` (or accepts commands
-//! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using Skia.
+//! This crate provides a CPU raster renderer that consumes `imaging::record::Scene` (or accepts
+//! commands directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using Skia.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use imaging::{
     BlurredRoundedRect, ClipRef, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    Scene, StrokeRef, replay,
+    StrokeRef,
+    record::{Scene, ValidateError, replay},
 };
 use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
@@ -22,7 +23,7 @@ use skia_safe as sk;
 #[derive(Debug)]
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
-    InvalidScene(imaging::ValidateError),
+    InvalidScene(ValidateError),
     /// An image brush was encountered; this backend does not support it.
     UnsupportedImageBrush,
     /// A filter configuration could not be translated.

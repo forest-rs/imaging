@@ -14,7 +14,7 @@ mod strokes;
 mod text;
 mod util;
 
-use imaging::{PaintSink, Scene};
+use imaging::{PaintSink, record::Scene};
 
 pub use self::util::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
 

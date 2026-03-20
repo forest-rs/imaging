@@ -7,8 +7,8 @@
 //! commands for common validity issues before forwarding them to the wrapped sink.
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, Geometry, GlyphRunRef, GroupRef,
-    Paint, PaintSink, StrokeRef, StrokeStyle,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, Paint,
+    PaintSink, StrokeRef, StrokeStyle, record::Geometry,
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect};
 
@@ -595,7 +595,8 @@ where
 mod tests {
     use super::*;
     use crate::{
-        ClipRef, Composite, FillRef, FillRule, Geometry, Glyph, GlyphRunRef, Paint, Scene,
+        ClipRef, Composite, FillRef, FillRule, GlyphRunRef, Paint,
+        record::{Geometry, Glyph, Scene},
     };
     use alloc::sync::Arc;
     use alloc::vec;

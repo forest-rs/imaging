@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use imaging::{Geometry, PaintSink, Painter};
+use imaging::{PaintSink, Painter, record::Geometry};
 use kurbo::{Circle, Point, Rect, Shape as _};
 use peniko::{Blob, Brush, Color, FontData, ImageAlphaType, ImageData, ImageFormat};
 

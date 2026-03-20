@@ -8,7 +8,10 @@
 
 #[cfg(test)]
 mod tests {
-    use imaging::{Clip, FillRule, Geometry, Group, Scene, ValidateError};
+    use imaging::{
+        FillRule,
+        record::{Clip, Geometry, Group, Scene, ValidateError},
+    };
     use kurbo::Rect;
 
     #[test]

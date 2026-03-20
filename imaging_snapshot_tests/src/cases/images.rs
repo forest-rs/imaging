@@ -1,7 +1,7 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, Geometry, PaintSink, Painter, StrokeStyle};
+use imaging::{Composite, PaintSink, Painter, StrokeStyle, record::Geometry};
 use kurbo::{Affine, BezPath, Point, Rect, RoundedRect};
 use peniko::{BlendMode, Brush, Color, Extend, ImageBrush, ImageQuality, Mix};
 

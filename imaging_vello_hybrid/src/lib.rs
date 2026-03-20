@@ -3,8 +3,8 @@
 
 //! Vello hybrid backend for `imaging`.
 //!
-//! This crate provides a headless CPU/GPU renderer that consumes `imaging::Scene` (or accepts
-//! commands directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using
+//! This crate provides a headless CPU/GPU renderer that consumes `imaging::record::Scene` (or
+//! accepts commands directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using
 //! `vello_hybrid` + `wgpu`.
 
 #![deny(unsafe_code)]
@@ -12,7 +12,8 @@
 
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    Scene, StrokeRef, replay,
+    StrokeRef,
+    record::{Scene, ValidateError, replay},
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, Style};
@@ -27,7 +28,7 @@ use wgpu::{
 #[derive(Debug)]
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
-    InvalidScene(imaging::ValidateError),
+    InvalidScene(ValidateError),
     /// An image brush was encountered; this backend does not support it.
     UnsupportedImageBrush,
     /// A filter configuration could not be translated.

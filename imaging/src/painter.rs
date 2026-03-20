@@ -6,8 +6,8 @@
 use kurbo::{Affine, Rect};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, Glyph, GlyphRunRef, GlyphStyle,
-    GroupRef, NormalizedCoord, Paint, PaintSink, StrokeRef, StrokeStyle,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GlyphStyle,
+    GroupRef, NormalizedCoord, Paint, PaintSink, StrokeRef, StrokeStyle, record::Glyph,
 };
 
 /// Painter-style authoring wrapper over a [`PaintSink`].

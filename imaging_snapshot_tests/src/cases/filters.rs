@@ -1,7 +1,9 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{BlurredRoundedRect, Composite, Filter, Geometry, GroupRef, PaintSink, Painter};
+use imaging::{
+    BlurredRoundedRect, Composite, Filter, GroupRef, PaintSink, Painter, record::Geometry,
+};
 use kurbo::{Affine, Rect};
 use peniko::{Brush, Color};
 
