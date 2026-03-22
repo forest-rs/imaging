@@ -12,6 +12,7 @@ mod gradients;
 mod images;
 mod masks;
 mod strokes;
+mod svg;
 mod text;
 mod util;
 
@@ -111,6 +112,9 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &blends::GmBlendGrid,
     &strokes::GmStrokes,
     &text::GmGlyphRuns,
+    &svg::GmSvgLayeredCard,
+    &svg::GmSvgLuminanceMask,
+    &svg::GmSvgTextBanner,
 ];
 
 /// List of cases to run for a given backend.

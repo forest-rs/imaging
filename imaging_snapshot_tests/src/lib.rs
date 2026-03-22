@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use imaging as _;
+use svg_imaging as _;
 
 #[cfg(feature = "vello_cpu")]
 use imaging_vello_cpu as _;

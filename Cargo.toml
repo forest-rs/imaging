@@ -9,6 +9,7 @@ members = [
     "imaging_vello_cpu",
     "imaging_vello_hybrid",
     "imaging_wind_tunnel",
+    "svg_imaging",
     "xtask",
 ]
 
@@ -27,9 +28,13 @@ imaging_skia = { path = "imaging_skia" }
 imaging_vello = { path = "imaging_vello" }
 imaging_vello_cpu = { path = "imaging_vello_cpu" }
 imaging_vello_hybrid = { path = "imaging_vello_hybrid" }
+svg_imaging = { path = "svg_imaging" }
 
+hashbrown = { default-features = false, features = ["default-hasher"], version = "0.16" }
+image = { default-features = false, version = "0.25" }
 kurbo = { default-features = false, version = "0.13" }
 peniko = { default-features = false, version = "0.6" }
+usvg = { default-features = false, features = ["text"], version = "0.47.0" }
 
 [workspace.lints]
 # LINEBENDER LINT SET - Cargo.toml - v7
