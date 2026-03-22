@@ -6,6 +6,13 @@
 //! This module provides [`ValidatingSink`], a wrapper around a [`PaintSink`] that checks streamed
 //! commands for common validity issues before forwarding them to the wrapped sink.
 //!
+//! The intended integration point is the paint pass boundary around a backend sink:
+//! - construct the backend sink
+//! - wrap it in [`ValidatingSink`]
+//! - paint through [`crate::Painter`]
+//! - call [`ValidatingSink::finish`] to check stack balance
+//! - unwrap the backend sink and finish it normally
+//!
 //! ```rust
 //! use imaging::{
 //!     record,
@@ -34,6 +41,33 @@
 //! let (scene, first_error) = sink.into_inner();
 //! assert!(scene.commands().is_empty());
 //! assert_eq!(first_error, Some(ValidationError::InvalidAlpha));
+//! ```
+//!
+//! ```rust
+//! use imaging::{
+//!     record,
+//!     validation::ValidatingSink,
+//!     PaintSink, Painter,
+//! };
+//! use kurbo::Rect;
+//! use peniko::Color;
+//!
+//! let backend_sink = record::Scene::new();
+//! let mut validating = ValidatingSink::new(backend_sink);
+//!
+//! {
+//!     let sink: &mut dyn PaintSink = &mut validating;
+//!     let mut painter = Painter::new(sink);
+//!     painter
+//!         .fill(Rect::new(0.0, 0.0, 8.0, 8.0), Color::BLACK)
+//!         .draw();
+//! }
+//!
+//! assert_eq!(validating.finish(), Ok(()));
+//!
+//! let (scene, first_error) = validating.into_inner();
+//! assert!(first_error.is_none());
+//! assert_eq!(scene.commands().len(), 1);
 //! ```
 
 use crate::{
@@ -117,7 +151,10 @@ pub fn default_validation_hook(_: &ValidationError) -> ValidationDecision {
 
 /// A wrapper around a [`PaintSink`] that validates inputs before forwarding them.
 ///
-/// This is intended as a defensive layer for streaming command sinks and backends.
+/// This is intended as a defensive layer around a streaming backend sink. The usual flow is:
+/// create the backend sink, wrap it in `ValidatingSink`, paint through [`crate::Painter`], call
+/// [`Self::finish`] to validate stack balance, then unwrap the backend sink with
+/// [`Self::into_inner`] and finish or consume it normally.
 #[derive(Debug)]
 pub struct ValidatingSink<S, H = fn(&ValidationError) -> ValidationDecision> {
     inner: S,
