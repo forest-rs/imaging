@@ -7,7 +7,7 @@ use imaging::{
     StrokeRef,
 };
 use kurbo::{Affine, Rect};
-use peniko::{Brush, Fill};
+use peniko::{Brush, BrushRef, Fill};
 use vello::Glyph as VelloGlyph;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`vello::Scene`].
@@ -63,8 +63,8 @@ impl<'a> VelloSceneSink<'a> {
         }
     }
 
-    fn brush_to_brush(&mut self, brush: &Brush, composite: Composite) -> Option<Brush> {
-        let brush = brush.clone().multiply_alpha(composite.alpha);
+    fn brush_to_brush(&mut self, brush: BrushRef<'_>, composite: Composite) -> Option<Brush> {
+        let brush = brush.to_owned().multiply_alpha(composite.alpha);
         match brush {
             Brush::Solid(_) | Brush::Gradient(_) | Brush::Image(_) => Some(brush),
         }

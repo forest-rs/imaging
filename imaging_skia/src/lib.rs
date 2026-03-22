@@ -121,7 +121,7 @@ use imaging::{
 };
 use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
-use peniko::{Brush, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
+use peniko::{BrushRef, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
 
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
@@ -404,19 +404,19 @@ fn color_to_sk_color4f(color: peniko::Color) -> sk::Color4f {
     sk::Color4f::new(comps[0], comps[1], comps[2], comps[3])
 }
 
-fn brush_to_paint(brush: &Brush, opacity: f32, paint_xf: Affine) -> Option<sk::Paint> {
+fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option<sk::Paint> {
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
     let alpha_scale = opacity.clamp(0.0, 1.0);
 
     match brush {
-        Brush::Solid(color) => {
+        BrushRef::Solid(color) => {
             // Use float color to avoid quantizing alpha (important for Porter-Duff ops like XOR).
             let comps = color.components;
             let c = sk::Color4f::new(comps[0], comps[1], comps[2], comps[3] * alpha_scale);
             paint.set_color4f(c, None);
         }
-        Brush::Gradient(grad) => {
+        BrushRef::Gradient(grad) => {
             let stops = grad.stops.as_ref();
             if stops.is_empty() {
                 paint.set_color(sk::Color::TRANSPARENT);
@@ -516,8 +516,8 @@ fn brush_to_paint(brush: &Brush, opacity: f32, paint_xf: Affine) -> Option<sk::P
                 paint.set_color(color_to_sk_color(color));
             }
         }
-        Brush::Image(image_brush) => {
-            let image = skia_image_from_peniko(&image_brush.image)?;
+        BrushRef::Image(image_brush) => {
+            let image = skia_image_from_peniko(image_brush.image)?;
             let shader = image.to_shader(
                 Some((
                     tile_mode_from_extend(image_brush.sampler.x_extend),

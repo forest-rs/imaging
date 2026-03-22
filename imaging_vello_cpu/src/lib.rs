@@ -67,7 +67,7 @@ use imaging::{
     record::{Scene, ValidateError, replay},
 };
 use kurbo::{Affine, Shape as _};
-use peniko::{BlendMode, Brush, Fill, Style};
+use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
 use std::vec::Vec;
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::glyph::Glyph as VelloGlyph;
@@ -174,10 +174,10 @@ impl VelloCpuRenderer {
 
     fn brush_to_paint(
         &mut self,
-        brush: &Brush,
+        brush: BrushRef<'_>,
         composite: Composite,
     ) -> Option<vello_cpu::PaintType> {
-        let brush = brush.clone().multiply_alpha(composite.alpha);
+        let brush = brush.to_owned().multiply_alpha(composite.alpha);
         let paint: vello_cpu::PaintType = match brush {
             Brush::Solid(c) => Brush::Solid(c),
             Brush::Gradient(g) => Brush::Gradient(g),

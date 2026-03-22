@@ -13,15 +13,14 @@
 //!     Composite, Painter,
 //! };
 //! use kurbo::Rect;
-//! use peniko::{BlendMode, Brush, Color};
+//! use peniko::{BlendMode, Color};
 //!
-//! let paint = Brush::Solid(Color::from_rgb8(0x20, 0x40, 0x80));
 //! let mut sink = ValidatingSink::new(record::Scene::new());
 //!
 //! {
 //!     let mut painter = Painter::new(&mut sink);
 //!     painter
-//!         .fill(Rect::new(0.0, 0.0, 32.0, 32.0), &paint)
+//!         .fill(Rect::new(0.0, 0.0, 32.0, 32.0), Color::from_rgb8(0x20, 0x40, 0x80))
 //!         .composite(Composite {
 //!             blend: BlendMode::default(),
 //!             alpha: f32::NAN,
@@ -43,7 +42,7 @@ use crate::{
     record::{Geometry, Glyph},
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
-use peniko::Brush;
+use peniko::BrushRef;
 
 /// Decision returned by a [`ValidatingSink`] violation hook.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -327,11 +326,11 @@ where
         }
     }
 
-    fn validate_brush(&mut self, brush: &Brush) -> bool {
+    fn validate_brush(&mut self, brush: BrushRef<'_>) -> bool {
         match brush {
-            Brush::Solid(_) => true,
-            Brush::Gradient(gradient) => self.validate_gradient(gradient),
-            Brush::Image(image_brush) => self.validate_image_brush(image_brush),
+            BrushRef::Solid(_) => true,
+            BrushRef::Gradient(gradient) => self.validate_gradient(gradient),
+            BrushRef::Image(image_brush) => self.validate_image_brush(image_brush),
         }
     }
 
@@ -402,14 +401,17 @@ where
         }
     }
 
-    fn validate_image_brush(&mut self, image_brush: &peniko::ImageBrush) -> bool {
+    fn validate_image_brush(
+        &mut self,
+        image_brush: peniko::ImageBrush<&peniko::ImageData>,
+    ) -> bool {
         if !(image_brush.sampler.alpha.is_finite() && image_brush.sampler.alpha >= 0.0) {
             return !self.violate(ValidationError::InvalidBrush {
                 what: "Brush::Image::alpha",
             });
         }
 
-        let image = &image_brush.image;
+        let image = image_brush.image;
         if image
             .format
             .size_in_bytes(image.width, image.height)
@@ -704,7 +706,7 @@ mod tests {
                 hint: false,
                 normalized_coords: &[],
                 style: &style,
-                brush: &paint,
+                brush: (&paint).into(),
                 composite: Composite::default(),
             },
             &mut glyphs.into_iter(),

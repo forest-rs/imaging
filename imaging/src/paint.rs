@@ -8,7 +8,7 @@
 //! semantic recording format.
 
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
-use peniko::{Brush, Fill, Style};
+use peniko::{BrushRef, Fill, Style};
 
 use crate::{
     BlurredRoundedRect, Composite, Filter, NormalizedCoord,
@@ -261,7 +261,7 @@ pub struct FillRef<'a> {
     /// Fill rule used to determine inside/outside for paths.
     pub fill_rule: Fill,
     /// Brush used by this draw.
-    pub brush: &'a Brush,
+    pub brush: BrushRef<'a>,
     /// Optional brush-space transform (for gradients/images).
     pub brush_transform: Option<Affine>,
     /// Geometry to fill.
@@ -273,11 +273,11 @@ pub struct FillRef<'a> {
 impl<'a> FillRef<'a> {
     /// Create a fill draw with default transform, brush transform, fill rule, and composite state.
     #[must_use]
-    pub fn new(shape: impl Into<GeometryRef<'a>>, brush: &'a Brush) -> Self {
+    pub fn new(shape: impl Into<GeometryRef<'a>>, brush: impl Into<BrushRef<'a>>) -> Self {
         Self {
             transform: Affine::IDENTITY,
             fill_rule: Fill::NonZero,
-            brush,
+            brush: brush.into(),
             brush_transform: None,
             shape: shape.into(),
             composite: Composite::default(),
@@ -318,7 +318,7 @@ impl<'a> FillRef<'a> {
         Draw::Fill {
             transform: self.transform,
             fill_rule: self.fill_rule,
-            brush: self.brush.clone(),
+            brush: self.brush.to_owned(),
             brush_transform: self.brush_transform,
             shape: self.shape.to_owned(),
             composite: self.composite,
@@ -334,7 +334,7 @@ pub struct StrokeRef<'a> {
     /// Stroke style.
     pub stroke: &'a Stroke,
     /// Brush used by this draw.
-    pub brush: &'a Brush,
+    pub brush: BrushRef<'a>,
     /// Optional brush-space transform (for gradients/images).
     pub brush_transform: Option<Affine>,
     /// Geometry to stroke.
@@ -346,11 +346,15 @@ pub struct StrokeRef<'a> {
 impl<'a> StrokeRef<'a> {
     /// Create a stroke draw with default transform, brush transform, and composite state.
     #[must_use]
-    pub fn new(shape: impl Into<GeometryRef<'a>>, stroke: &'a Stroke, brush: &'a Brush) -> Self {
+    pub fn new(
+        shape: impl Into<GeometryRef<'a>>,
+        stroke: &'a Stroke,
+        brush: impl Into<BrushRef<'a>>,
+    ) -> Self {
         Self {
             transform: Affine::IDENTITY,
             stroke,
-            brush,
+            brush: brush.into(),
             brush_transform: None,
             shape: shape.into(),
             composite: Composite::default(),
@@ -384,7 +388,7 @@ impl<'a> StrokeRef<'a> {
         Draw::Stroke {
             transform: self.transform,
             stroke: self.stroke.clone(),
-            brush: self.brush.clone(),
+            brush: self.brush.to_owned(),
             brush_transform: self.brush_transform,
             shape: self.shape.to_owned(),
             composite: self.composite,
@@ -410,7 +414,7 @@ pub struct GlyphRunRef<'a> {
     /// Fill or stroke style for the glyphs.
     pub style: &'a Style,
     /// Brush used for the run.
-    pub brush: &'a Brush,
+    pub brush: BrushRef<'a>,
     /// Per-draw compositing.
     pub composite: Composite,
 }
@@ -418,7 +422,11 @@ pub struct GlyphRunRef<'a> {
 impl<'a> GlyphRunRef<'a> {
     /// Create a glyph run with default transform, hinting, variations, and compositing state.
     #[must_use]
-    pub fn new(font: &'a peniko::FontData, style: &'a Style, brush: &'a Brush) -> Self {
+    pub fn new(
+        font: &'a peniko::FontData,
+        style: &'a Style,
+        brush: impl Into<BrushRef<'a>>,
+    ) -> Self {
         Self {
             font,
             transform: Affine::IDENTITY,
@@ -427,7 +435,7 @@ impl<'a> GlyphRunRef<'a> {
             hint: false,
             normalized_coords: &[],
             style,
-            brush,
+            brush: brush.into(),
             composite: Composite::default(),
         }
     }
@@ -444,7 +452,7 @@ impl<'a> GlyphRunRef<'a> {
             normalized_coords: self.normalized_coords.to_vec(),
             style: self.style.clone(),
             glyphs: glyphs.into_iter().collect(),
-            brush: self.brush.clone(),
+            brush: self.brush.to_owned(),
             composite: self.composite,
         }
     }
@@ -562,7 +570,7 @@ impl GlyphRun {
             hint: self.hint,
             normalized_coords: &self.normalized_coords,
             style: &self.style,
-            brush: &self.brush,
+            brush: (&self.brush).into(),
             composite: self.composite,
         }
     }
@@ -583,7 +591,7 @@ impl Draw {
             } => DrawRef::Fill(FillRef {
                 transform: *transform,
                 fill_rule: *fill_rule,
-                brush,
+                brush: brush.into(),
                 brush_transform: *brush_transform,
                 shape: shape.as_ref(),
                 composite: *composite,
@@ -598,7 +606,7 @@ impl Draw {
             } => DrawRef::Stroke(StrokeRef {
                 transform: *transform,
                 stroke,
-                brush,
+                brush: brush.into(),
                 brush_transform: *brush_transform,
                 shape: shape.as_ref(),
                 composite: *composite,

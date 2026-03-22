@@ -21,7 +21,7 @@
 //!     BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, StrokeRef,
 //! };
 //! use kurbo::Rect;
-//! use peniko::{Brush, Color};
+//! use peniko::Color;
 //!
 //! #[derive(Default)]
 //! struct CountingSink {
@@ -55,14 +55,13 @@
 //!     fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
 //! }
 //!
-//! let paint = Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb));
 //! let mut sink = CountingSink::default();
 //!
 //! {
 //!     let mut painter = Painter::new(&mut sink);
-//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), &paint);
+//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
 //!     painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |p| {
-//!         p.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), &paint);
+//!         p.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
 //!     });
 //! }
 //!
@@ -78,14 +77,13 @@
 //! ```rust
 //! use imaging::{record, Painter};
 //! use kurbo::Rect;
-//! use peniko::{Brush, Color};
+//! use peniko::Color;
 //!
-//! let paint = Brush::Solid(Color::from_rgb8(0x12, 0x34, 0x56));
 //! let mut scene = record::Scene::new();
 //!
 //! {
 //!     let mut painter = Painter::new(&mut scene);
-//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), &paint);
+//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::from_rgb8(0x12, 0x34, 0x56));
 //! }
 //!
 //! scene.validate()?;

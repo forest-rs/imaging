@@ -6,7 +6,7 @@
 use core::borrow::Borrow;
 
 use kurbo::{Affine, Rect, Stroke};
-use peniko::{Brush, Style};
+use peniko::{BrushRef, Style};
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef,
@@ -33,7 +33,7 @@ where
     pub fn fill<'b>(
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
-        brush: &'b Brush,
+        brush: impl Into<BrushRef<'b>>,
     ) -> FillBuilder<'b, S> {
         FillBuilder {
             sink: self.sink,
@@ -42,7 +42,7 @@ where
     }
 
     /// Fill a rectangle using default transform, fill rule, brush transform, and composite state.
-    pub fn fill_rect(&mut self, rect: Rect, brush: &Brush) {
+    pub fn fill_rect<'b>(&mut self, rect: Rect, brush: impl Into<BrushRef<'b>>) {
         self.sink.fill(FillRef::new(rect, brush));
     }
 
@@ -51,7 +51,7 @@ where
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
         stroke: &'b Stroke,
-        brush: &'b Brush,
+        brush: impl Into<BrushRef<'b>>,
     ) -> StrokeBuilder<'b, S> {
         StrokeBuilder {
             sink: self.sink,
@@ -63,7 +63,7 @@ where
     pub fn glyphs<'b>(
         &'b mut self,
         font: &'b peniko::FontData,
-        brush: &'b Brush,
+        brush: impl Into<BrushRef<'b>>,
     ) -> GlyphRunBuilder<'b, S> {
         GlyphRunBuilder {
             sink: self.sink,
@@ -73,7 +73,7 @@ where
             font_size: 16.0,
             hint: false,
             normalized_coords: &[],
-            brush,
+            brush: brush.into(),
             composite: Composite::default(),
         }
     }
@@ -329,7 +329,7 @@ pub struct GlyphRunBuilder<'a, S: ?Sized> {
     font_size: f32,
     hint: bool,
     normalized_coords: &'a [NormalizedCoord],
-    brush: &'a Brush,
+    brush: BrushRef<'a>,
     composite: Composite,
 }
 
