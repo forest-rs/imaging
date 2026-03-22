@@ -38,9 +38,21 @@ impl<'a> PaintShape<'a> for Rect {
     }
 }
 
+impl<'a> PaintShape<'a> for &'a Rect {
+    fn into_geometry_ref(self) -> GeometryRef<'a> {
+        (*self).into()
+    }
+}
+
 impl<'a> PaintShape<'a> for RoundedRect {
     fn into_geometry_ref(self) -> GeometryRef<'a> {
         self.into()
+    }
+}
+
+impl<'a> PaintShape<'a> for &'a RoundedRect {
+    fn into_geometry_ref(self) -> GeometryRef<'a> {
+        (*self).into()
     }
 }
 
@@ -74,6 +86,12 @@ macro_rules! impl_path_shape {
             impl<'a> PaintShape<'a> for $ty {
                 fn into_geometry_ref(self) -> GeometryRef<'a> {
                     GeometryRef::OwnedPath(kurbo::Shape::to_path(&self, DEFAULT_SHAPE_TOLERANCE))
+                }
+            }
+
+            impl<'a> PaintShape<'a> for &'a $ty {
+                fn into_geometry_ref(self) -> GeometryRef<'a> {
+                    GeometryRef::OwnedPath(kurbo::Shape::to_path(self, DEFAULT_SHAPE_TOLERANCE))
                 }
             }
         )*
@@ -459,6 +477,27 @@ mod tests {
                 ..
             } => {}
             other => panic!("expected path-backed fill draw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn borrowed_rect_shape_stays_rect_backed() {
+        let rect = Rect::new(1.0, 2.0, 3.0, 4.0);
+        let rect_ref: &Rect = &rect;
+        let geometry = <&Rect as PaintShape<'_>>::into_geometry_ref(rect_ref);
+
+        assert_eq!(geometry, GeometryRef::Rect(rect));
+    }
+
+    #[test]
+    fn borrowed_line_shape_flattens_to_path() {
+        let line = Line::new((1.0, 2.0), (3.0, 4.0));
+        let line_ref: &Line = &line;
+        let geometry = <&Line as PaintShape<'_>>::into_geometry_ref(line_ref);
+
+        match geometry {
+            GeometryRef::OwnedPath(_) => {}
+            other => panic!("expected path-backed borrowed line shape, got {other:?}"),
         }
     }
 }
