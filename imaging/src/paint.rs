@@ -646,15 +646,24 @@ impl Draw {
     }
 }
 
-fn replay_clip(scene: &Scene, id: ClipId, sink: &mut impl PaintSink) {
+fn replay_clip<S>(scene: &Scene, id: ClipId, sink: &mut S)
+where
+    S: PaintSink + ?Sized,
+{
     sink.push_clip(scene.clip(id).as_ref());
 }
 
-fn replay_group(scene: &Scene, id: GroupId, sink: &mut impl PaintSink) {
+fn replay_group<S>(scene: &Scene, id: GroupId, sink: &mut S)
+where
+    S: PaintSink + ?Sized,
+{
     sink.push_group(scene.group(id).as_ref());
 }
 
-fn replay_draw(scene: &Scene, id: DrawId, sink: &mut impl PaintSink) {
+fn replay_draw<S>(scene: &Scene, id: DrawId, sink: &mut S)
+where
+    S: PaintSink + ?Sized,
+{
     match scene.draw_op(id) {
         Draw::GlyphRun(glyph_run) => {
             let mut glyphs = glyph_run.glyphs.iter().copied();
@@ -672,7 +681,10 @@ fn replay_draw(scene: &Scene, id: DrawId, sink: &mut impl PaintSink) {
 }
 
 /// Replay a recorded [`crate::record::Scene`] into a [`PaintSink`].
-pub(crate) fn replay(scene: &Scene, sink: &mut impl PaintSink) {
+pub(crate) fn replay<S>(scene: &Scene, sink: &mut S)
+where
+    S: PaintSink + ?Sized,
+{
     for cmd in scene.commands() {
         match *cmd {
             Command::PushClip(id) => replay_clip(scene, id, sink),

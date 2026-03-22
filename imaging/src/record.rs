@@ -399,7 +399,10 @@ impl PaintSink for Scene {
 }
 
 /// Replay a recorded [`Scene`] into a [`crate::PaintSink`].
-pub fn replay(scene: &Scene, sink: &mut impl PaintSink) {
+pub fn replay<S>(scene: &Scene, sink: &mut S)
+where
+    S: PaintSink + ?Sized,
+{
     crate::paint::replay(scene, sink);
 }
 

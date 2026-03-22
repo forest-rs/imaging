@@ -10,7 +10,7 @@ use peniko::{BrushRef, ImageBrushRef, Style};
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef,
-    NormalizedCoord, PaintSink, StrokeRef, record::Glyph,
+    NormalizedCoord, PaintSink, StrokeRef, record,
 };
 
 const DEFAULT_SHAPE_TOLERANCE: f64 = 0.1;
@@ -56,13 +56,13 @@ impl<'a> PaintShape<'a> for BezPath {
     }
 }
 
-impl<'a> PaintShape<'a> for crate::record::Geometry {
+impl<'a> PaintShape<'a> for record::Geometry {
     fn into_geometry_ref(self) -> GeometryRef<'a> {
         self.into()
     }
 }
 
-impl<'a> PaintShape<'a> for &'a crate::record::Geometry {
+impl<'a> PaintShape<'a> for &'a record::Geometry {
     fn into_geometry_ref(self) -> GeometryRef<'a> {
         self.into()
     }
@@ -103,6 +103,22 @@ where
     #[must_use]
     pub fn new(sink: &'a mut S) -> Self {
         Self { sink }
+    }
+
+    /// Borrow the wrapped sink directly.
+    ///
+    /// This is the low-level escape hatch for APIs that need the underlying [`PaintSink`]
+    /// instead of painter-style helpers.
+    pub fn sink_mut(&mut self) -> &mut S {
+        self.sink
+    }
+
+    /// Replay a recorded scene into the wrapped sink.
+    ///
+    /// This forwards to [`record::replay`] without requiring callers to peel the sink back out of
+    /// the painter.
+    pub fn replay(&mut self, scene: &record::Scene) {
+        record::replay(scene, self.sink);
     }
 
     /// Start configuring a fill draw.
@@ -286,7 +302,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
-        pushed_clips: Vec<crate::record::Clip>,
+        pushed_clips: Vec<record::Clip>,
     }
 
     impl PaintSink for RecordingSink {
@@ -304,7 +320,12 @@ mod tests {
 
         fn stroke(&mut self, _draw: StrokeRef<'_>) {}
 
-        fn glyph_run(&mut self, _draw: GlyphRunRef<'_>, _glyphs: &mut dyn Iterator<Item = Glyph>) {}
+        fn glyph_run(
+            &mut self,
+            _draw: GlyphRunRef<'_>,
+            _glyphs: &mut dyn Iterator<Item = record::Glyph>,
+        ) {
+        }
 
         fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
     }
@@ -319,9 +340,9 @@ mod tests {
 
         assert_eq!(
             sink.pushed_clips,
-            vec![crate::record::Clip::Fill {
+            vec![record::Clip::Fill {
                 transform,
-                shape: crate::record::Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 12.0)),
+                shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 12.0)),
                 fill_rule: Fill::NonZero,
             }]
         );
@@ -340,9 +361,9 @@ mod tests {
 
         assert_eq!(
             sink.pushed_clips,
-            vec![crate::record::Clip::Stroke {
+            vec![record::Clip::Stroke {
                 transform,
-                shape: crate::record::Geometry::Path(path),
+                shape: record::Geometry::Path(path),
                 stroke,
             }]
         );
@@ -365,7 +386,7 @@ mod tests {
 
     #[test]
     fn draw_image_uses_natural_size_rect() {
-        let mut scene = crate::record::Scene::new();
+        let mut scene = record::Scene::new();
         let mut painter = Painter::new(&mut scene);
         let image = peniko::ImageData {
             data: peniko::Blob::new(Arc::new([0_u8; 16])),
@@ -379,30 +400,62 @@ mod tests {
         painter.draw_image(&image, transform);
 
         assert_eq!(
-            scene.draw_op(crate::record::DrawId(0)),
-            &crate::record::Draw::Fill {
+            scene.draw_op(record::DrawId(0)),
+            &record::Draw::Fill {
                 transform,
                 fill_rule: Fill::NonZero,
                 brush: peniko::Brush::Image(peniko::ImageBrush::new(image)),
                 brush_transform: None,
-                shape: crate::record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
+                shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
                 composite: Composite::default(),
             }
         );
     }
 
     #[test]
+    fn replay_forwards_recorded_scene_into_wrapped_sink() {
+        let mut source = record::Scene::new();
+        source.draw(record::Draw::Fill {
+            transform: Affine::IDENTITY,
+            fill_rule: Fill::NonZero,
+            brush: peniko::Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 3.0)),
+            composite: Composite::default(),
+        });
+
+        let mut sink = record::Scene::new();
+        let mut painter = Painter::new(&mut sink);
+        painter.replay(&source);
+
+        assert_eq!(source, sink);
+    }
+
+    #[test]
+    fn sink_mut_exposes_wrapped_sink() {
+        let mut sink = record::Scene::new();
+        let mut painter = Painter::new(&mut sink);
+
+        painter.sink_mut().fill(FillRef::new(
+            Rect::new(1.0, 2.0, 3.0, 4.0),
+            peniko::Color::BLACK,
+        ));
+
+        assert_eq!(sink.commands().len(), 1);
+    }
+
+    #[test]
     fn fill_accepts_circle_shape_directly() {
-        let mut scene = crate::record::Scene::new();
+        let mut scene = record::Scene::new();
         let mut painter = Painter::new(&mut scene);
 
         painter
             .fill(Circle::new((5.0, 5.0), 3.0), peniko::Color::BLACK)
             .draw();
 
-        match scene.draw_op(crate::record::DrawId(0)) {
-            crate::record::Draw::Fill {
-                shape: crate::record::Geometry::Path(_),
+        match scene.draw_op(record::DrawId(0)) {
+            record::Draw::Fill {
+                shape: record::Geometry::Path(_),
                 ..
             } => {}
             other => panic!("expected path-backed fill draw, got {other:?}"),
@@ -557,7 +610,7 @@ where
     pub fn draw<I, G>(self, style: &'a Style, glyphs: I)
     where
         I: IntoIterator<Item = G>,
-        G: Borrow<Glyph>,
+        G: Borrow<record::Glyph>,
     {
         let mut glyphs = glyphs.into_iter().map(|glyph| *glyph.borrow());
         self.sink.glyph_run(
