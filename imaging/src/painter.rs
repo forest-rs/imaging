@@ -13,7 +13,7 @@ use crate::{
 
 /// Painter-style authoring wrapper over a [`PaintSink`].
 #[derive(Debug)]
-pub struct Painter<'a, S: ?Sized> {
+pub struct Painter<'a, S: PaintSink + ?Sized = dyn PaintSink + 'a> {
     sink: &'a mut S,
 }
 
