@@ -118,7 +118,11 @@ pub enum ClipRef<'a> {
 }
 
 impl<'a> ClipRef<'a> {
-    /// Create a fill-style clip with the default non-zero fill rule.
+    /// Create a fill-style clip.
+    ///
+    /// Defaults:
+    /// - clip transform: [`Affine::IDENTITY`]
+    /// - fill rule: [`Fill::NonZero`]
     #[must_use]
     pub fn fill(shape: impl Into<GeometryRef<'a>>) -> Self {
         Self::Fill {
@@ -129,6 +133,9 @@ impl<'a> ClipRef<'a> {
     }
 
     /// Create a fill-style clip with an explicit fill rule.
+    ///
+    /// Default:
+    /// - clip transform: [`Affine::IDENTITY`]
     #[must_use]
     pub fn fill_with_rule(shape: impl Into<GeometryRef<'a>>, fill_rule: Fill) -> Self {
         Self::Fill {
@@ -139,6 +146,9 @@ impl<'a> ClipRef<'a> {
     }
 
     /// Create a stroke-style clip.
+    ///
+    /// Default:
+    /// - clip transform: [`Affine::IDENTITY`]
     #[must_use]
     pub fn stroke(shape: impl Into<GeometryRef<'a>>, stroke: &'a Stroke) -> Self {
         Self::Stroke {
@@ -271,7 +281,13 @@ pub struct FillRef<'a> {
 }
 
 impl<'a> FillRef<'a> {
-    /// Create a fill draw with default transform, brush transform, fill rule, and composite state.
+    /// Create a fill draw with default state.
+    ///
+    /// Defaults:
+    /// - geometry transform: [`Affine::IDENTITY`]
+    /// - fill rule: [`Fill::NonZero`]
+    /// - brush transform: `None`
+    /// - compositing: [`Composite::default()`]
     #[must_use]
     pub fn new(shape: impl Into<GeometryRef<'a>>, brush: impl Into<BrushRef<'a>>) -> Self {
         Self {
@@ -344,7 +360,12 @@ pub struct StrokeRef<'a> {
 }
 
 impl<'a> StrokeRef<'a> {
-    /// Create a stroke draw with default transform, brush transform, and composite state.
+    /// Create a stroke draw with default state.
+    ///
+    /// Defaults:
+    /// - geometry transform: [`Affine::IDENTITY`]
+    /// - brush transform: `None`
+    /// - compositing: [`Composite::default()`]
     #[must_use]
     pub fn new(
         shape: impl Into<GeometryRef<'a>>,
@@ -420,7 +441,15 @@ pub struct GlyphRunRef<'a> {
 }
 
 impl<'a> GlyphRunRef<'a> {
-    /// Create a glyph run with default transform, hinting, variations, and compositing state.
+    /// Create a glyph run with default state.
+    ///
+    /// Defaults:
+    /// - run transform: [`Affine::IDENTITY`]
+    /// - per-glyph transform: `None`
+    /// - font size: `16.0`
+    /// - hinting: `false`
+    /// - normalized variation coordinates: `&[]`
+    /// - compositing: [`Composite::default()`]
     #[must_use]
     pub fn new(
         font: &'a peniko::FontData,

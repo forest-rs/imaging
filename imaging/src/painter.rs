@@ -106,6 +106,12 @@ where
     }
 
     /// Start configuring a fill draw.
+    ///
+    /// Defaults:
+    /// - geometry transform: [`Affine::IDENTITY`]
+    /// - fill rule: [`peniko::Fill::NonZero`]
+    /// - brush transform: `None`
+    /// - compositing: [`Composite::default()`]
     pub fn fill<'b>(
         &'b mut self,
         shape: impl PaintShape<'b>,
@@ -117,12 +123,23 @@ where
         }
     }
 
-    /// Fill a rectangle using default transform, fill rule, brush transform, and composite state.
+    /// Fill a rectangle using default draw state.
+    ///
+    /// Defaults:
+    /// - geometry transform: [`Affine::IDENTITY`]
+    /// - fill rule: [`peniko::Fill::NonZero`]
+    /// - brush transform: `None`
+    /// - compositing: [`Composite::default()`]
     pub fn fill_rect<'b>(&mut self, rect: Rect, brush: impl Into<BrushRef<'b>>) {
         self.sink.fill(FillRef::new(rect, brush));
     }
 
     /// Start configuring a stroke draw.
+    ///
+    /// Defaults:
+    /// - geometry transform: [`Affine::IDENTITY`]
+    /// - brush transform: `None`
+    /// - compositing: [`Composite::default()`]
     pub fn stroke<'b>(
         &'b mut self,
         shape: impl PaintShape<'b>,
@@ -136,6 +153,14 @@ where
     }
 
     /// Start configuring a glyph run.
+    ///
+    /// Defaults:
+    /// - run transform: [`Affine::IDENTITY`]
+    /// - per-glyph transform: `None`
+    /// - font size: `16.0`
+    /// - hinting: `false`
+    /// - normalized variation coordinates: `&[]`
+    /// - compositing: [`Composite::default()`]
     pub fn glyphs<'b>(
         &'b mut self,
         font: &'b peniko::FontData,
@@ -160,6 +185,11 @@ where
     }
 
     /// Draw an image at its natural size with the given transform.
+    ///
+    /// This is shorthand for filling a `0,0,width,height` rectangle with an image brush using:
+    /// - fill rule: [`peniko::Fill::NonZero`]
+    /// - brush transform: `None`
+    /// - compositing: [`Composite::default()`]
     pub fn draw_image<'b>(&'b mut self, image: impl Into<ImageBrushRef<'b>>, transform: Affine) {
         let image = image.into();
         let rect = Rect::new(
@@ -182,6 +212,10 @@ where
     }
 
     /// Push a fill-style clip, run the provided closure, then pop the clip.
+    ///
+    /// Defaults:
+    /// - clip transform: [`Affine::IDENTITY`]
+    /// - fill rule: [`peniko::Fill::NonZero`]
     pub fn with_fill_clip<'b>(
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
@@ -192,6 +226,8 @@ where
 
     /// Push a fill-style clip with an explicit transform, run the provided closure, then pop the
     /// clip.
+    ///
+    /// The clip still uses [`peniko::Fill::NonZero`] unless replaced through [`ClipRef`].
     pub fn with_fill_clip_transformed<'b>(
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
@@ -202,6 +238,9 @@ where
     }
 
     /// Push a stroke-style clip, run the provided closure, then pop the clip.
+    ///
+    /// Default:
+    /// - clip transform: [`Affine::IDENTITY`]
     pub fn with_stroke_clip<'b>(
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
