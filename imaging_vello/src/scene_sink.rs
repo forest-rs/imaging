@@ -84,7 +84,11 @@ impl<'a> VelloSceneSink<'a> {
         }
     }
 
-    fn draw_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>) {
+    fn draw_glyph_run(
+        &mut self,
+        glyph_run: GlyphRunRef<'_>,
+        glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+    ) {
         if glyph_run.composite.blend != peniko::BlendMode::default() {
             self.set_error_once(Error::UnsupportedGlyphBlend);
             return;
@@ -104,7 +108,7 @@ impl<'a> VelloSceneSink<'a> {
             .brush(&paint)
             .brush_alpha(glyph_run.composite.alpha);
         let builder = builder.glyph_transform(glyph_run.glyph_transform);
-        let glyphs = glyph_run.glyphs.iter().map(|glyph| VelloGlyph {
+        let glyphs = glyphs.map(|glyph| VelloGlyph {
             id: glyph.id,
             x: glyph.x,
             y: glyph.y,
@@ -439,11 +443,15 @@ impl PaintSink for VelloSceneSink<'_> {
         }
     }
 
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+    fn glyph_run(
+        &mut self,
+        draw: GlyphRunRef<'_>,
+        glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+    ) {
         if self.error.is_some() {
             return;
         }
-        self.draw_glyph_run(draw);
+        self.draw_glyph_run(draw, glyphs);
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {

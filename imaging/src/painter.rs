@@ -3,6 +3,8 @@
 
 //! Painter-style authoring helpers built on top of [`PaintSink`].
 
+use core::borrow::Borrow;
+
 use kurbo::{Affine, Rect, Stroke};
 use peniko::{Brush, Style};
 
@@ -265,18 +267,25 @@ where
     }
 
     /// Emit the glyph run to the wrapped sink.
-    pub fn draw(self, style: &'a Style, glyphs: &'a [Glyph]) {
-        self.sink.glyph_run(GlyphRunRef {
-            font: self.font,
-            transform: self.transform,
-            glyph_transform: self.glyph_transform,
-            font_size: self.font_size,
-            hint: self.hint,
-            normalized_coords: self.normalized_coords,
-            style,
-            glyphs,
-            brush: self.brush,
-            composite: self.composite,
-        });
+    pub fn draw<I, G>(self, style: &'a Style, glyphs: I)
+    where
+        I: IntoIterator<Item = G>,
+        G: Borrow<Glyph>,
+    {
+        let mut glyphs = glyphs.into_iter().map(|glyph| *glyph.borrow());
+        self.sink.glyph_run(
+            GlyphRunRef {
+                font: self.font,
+                transform: self.transform,
+                glyph_transform: self.glyph_transform,
+                font_size: self.font_size,
+                hint: self.hint,
+                normalized_coords: self.normalized_coords,
+                style,
+                brush: self.brush,
+                composite: self.composite,
+            },
+            &mut glyphs,
+        );
     }
 }

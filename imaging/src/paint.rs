@@ -390,8 +390,6 @@ pub struct GlyphRunRef<'a> {
     pub normalized_coords: &'a [NormalizedCoord],
     /// Fill or stroke style for the glyphs.
     pub style: &'a Style,
-    /// Positioned glyphs in the run.
-    pub glyphs: &'a [Glyph],
     /// Brush used for the run.
     pub brush: &'a Brush,
     /// Per-draw compositing.
@@ -401,12 +399,7 @@ pub struct GlyphRunRef<'a> {
 impl<'a> GlyphRunRef<'a> {
     /// Create a glyph run with default transform, hinting, variations, and compositing state.
     #[must_use]
-    pub fn new(
-        font: &'a peniko::FontData,
-        style: &'a Style,
-        glyphs: &'a [Glyph],
-        brush: &'a Brush,
-    ) -> Self {
+    pub fn new(font: &'a peniko::FontData, style: &'a Style, brush: &'a Brush) -> Self {
         Self {
             font,
             transform: Affine::IDENTITY,
@@ -415,7 +408,6 @@ impl<'a> GlyphRunRef<'a> {
             hint: false,
             normalized_coords: &[],
             style,
-            glyphs,
             brush,
             composite: Composite::default(),
         }
@@ -423,7 +415,7 @@ impl<'a> GlyphRunRef<'a> {
 
     /// Convert a borrowed glyph run into an owned [`GlyphRun`].
     #[must_use]
-    pub fn to_owned(self) -> GlyphRun {
+    pub fn to_owned(self, glyphs: impl IntoIterator<Item = Glyph>) -> GlyphRun {
         GlyphRun {
             font: self.font.clone(),
             transform: self.transform,
@@ -432,7 +424,7 @@ impl<'a> GlyphRunRef<'a> {
             hint: self.hint,
             normalized_coords: self.normalized_coords.to_vec(),
             style: self.style.clone(),
-            glyphs: self.glyphs.to_vec(),
+            glyphs: glyphs.into_iter().collect(),
             brush: self.brush.clone(),
             composite: self.composite,
         }
@@ -455,11 +447,11 @@ pub enum DrawRef<'a> {
 impl<'a> DrawRef<'a> {
     /// Convert a borrowed draw payload into an owned [`Draw`].
     #[must_use]
-    pub fn to_owned(self) -> Draw {
+    pub fn to_owned(self, glyphs: impl IntoIterator<Item = Glyph>) -> Draw {
         match self {
             Self::Fill(draw) => draw.to_owned(),
             Self::Stroke(draw) => draw.to_owned(),
-            Self::GlyphRun(draw) => Draw::GlyphRun(draw.to_owned()),
+            Self::GlyphRun(draw) => Draw::GlyphRun(draw.to_owned(glyphs)),
             Self::BlurredRoundedRect(draw) => Draw::BlurredRoundedRect(draw),
         }
     }
@@ -483,7 +475,7 @@ pub trait PaintSink {
     /// Emit a stroke draw.
     fn stroke(&mut self, draw: StrokeRef<'_>);
     /// Emit a glyph run draw.
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>);
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>);
     /// Emit a blurred rounded rect draw.
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect);
 }
@@ -551,7 +543,6 @@ impl GlyphRun {
             hint: self.hint,
             normalized_coords: &self.normalized_coords,
             style: &self.style,
-            glyphs: &self.glyphs,
             brush: &self.brush,
             composite: self.composite,
         }
@@ -608,11 +599,19 @@ fn replay_group(scene: &Scene, id: GroupId, sink: &mut impl PaintSink) {
 }
 
 fn replay_draw(scene: &Scene, id: DrawId, sink: &mut impl PaintSink) {
-    match scene.draw_op(id).as_ref() {
-        DrawRef::Fill(draw) => sink.fill(draw),
-        DrawRef::Stroke(draw) => sink.stroke(draw),
-        DrawRef::GlyphRun(draw) => sink.glyph_run(draw),
-        DrawRef::BlurredRoundedRect(draw) => sink.blurred_rounded_rect(draw),
+    match scene.draw_op(id) {
+        Draw::GlyphRun(glyph_run) => {
+            let mut glyphs = glyph_run.glyphs.iter().copied();
+            sink.glyph_run(glyph_run.as_ref(), &mut glyphs);
+        }
+        draw => match draw.as_ref() {
+            DrawRef::Fill(draw) => sink.fill(draw),
+            DrawRef::Stroke(draw) => sink.stroke(draw),
+            DrawRef::BlurredRoundedRect(draw) => sink.blurred_rounded_rect(draw),
+            DrawRef::GlyphRun(_) => {
+                unreachable!("glyph runs are handled using the owned glyph slice")
+            }
+        },
     }
 }
 

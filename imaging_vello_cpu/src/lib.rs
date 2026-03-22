@@ -262,7 +262,11 @@ impl VelloCpuRenderer {
         })
     }
 
-    fn draw_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>) {
+    fn draw_glyph_run(
+        &mut self,
+        glyph_run: GlyphRunRef<'_>,
+        glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+    ) {
         let Some(paint) = self.brush_to_paint(glyph_run.brush, glyph_run.composite) else {
             return;
         };
@@ -284,7 +288,7 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                let glyphs = glyph_run.glyphs.iter().map(|glyph| VelloGlyph {
+                let glyphs = glyphs.map(|glyph| VelloGlyph {
                     id: glyph.id,
                     x: glyph.x,
                     y: glyph.y,
@@ -304,7 +308,7 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                let glyphs = glyph_run.glyphs.iter().map(|glyph| VelloGlyph {
+                let glyphs = glyphs.map(|glyph| VelloGlyph {
                     id: glyph.id,
                     x: glyph.x,
                     y: glyph.y,
@@ -447,11 +451,15 @@ impl PaintSink for VelloCpuRenderer {
         }
     }
 
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+    fn glyph_run(
+        &mut self,
+        draw: GlyphRunRef<'_>,
+        glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+    ) {
         if self.error.is_some() {
             return;
         }
-        self.draw_glyph_run(draw);
+        self.draw_glyph_run(draw, glyphs);
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {

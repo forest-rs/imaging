@@ -46,7 +46,11 @@
 //!
 //!     fn stroke(&mut self, _draw: StrokeRef<'_>) {}
 //!
-//!     fn glyph_run(&mut self, _draw: GlyphRunRef<'_>) {}
+//!     fn glyph_run(
+//!         &mut self,
+//!         _draw: GlyphRunRef<'_>,
+//!         _glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+//!     ) {}
 //!
 //!     fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
 //! }

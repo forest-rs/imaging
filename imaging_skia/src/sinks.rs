@@ -132,7 +132,12 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
     restores
 }
 
-fn draw_glyph_run(canvas: &sk::Canvas, state: &mut StreamState, glyph_run: GlyphRunRef<'_>) {
+fn draw_glyph_run(
+    canvas: &sk::Canvas,
+    state: &mut StreamState,
+    glyph_run: GlyphRunRef<'_>,
+    glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+) {
     if !glyph_run.normalized_coords.is_empty() {
         state.set_error_once(Error::UnsupportedGlyphVariations);
         return;
@@ -160,20 +165,16 @@ fn draw_glyph_run(canvas: &sk::Canvas, state: &mut StreamState, glyph_run: Glyph
         peniko::Style::Stroke(stroke) => apply_stroke_style(&mut sk_paint, stroke),
     }
 
-    let Ok(glyph_ids) = glyph_run
-        .glyphs
-        .iter()
-        .map(|glyph| sk::GlyphId::try_from(glyph.id))
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        state.set_error_once(Error::InvalidGlyphId);
-        return;
-    };
-    let positions = glyph_run
-        .glyphs
-        .iter()
-        .map(|glyph| sk::Point::new(glyph.x, glyph.y))
-        .collect::<Vec<_>>();
+    let mut glyph_ids = Vec::new();
+    let mut positions = Vec::new();
+    for glyph in glyphs {
+        let Ok(glyph_id) = sk::GlyphId::try_from(glyph.id) else {
+            state.set_error_once(Error::InvalidGlyphId);
+            return;
+        };
+        glyph_ids.push(glyph_id);
+        positions.push(sk::Point::new(glyph.x, glyph.y));
+    }
 
     font.set_subpixel(true);
     canvas.draw_glyphs_at(
@@ -416,11 +417,15 @@ impl PaintSink for SkCanvasSink<'_> {
         paint_sink_stroke(self.canvas, &mut self.state, draw);
     }
 
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+    fn glyph_run(
+        &mut self,
+        draw: GlyphRunRef<'_>,
+        glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+    ) {
         if self.state.error.is_some() {
             return;
         }
-        draw_glyph_run(self.canvas, &mut self.state, draw);
+        draw_glyph_run(self.canvas, &mut self.state, draw, glyphs);
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
@@ -545,7 +550,11 @@ impl PaintSink for SkPictureRecorderSink {
         paint_sink_stroke(canvas, state, draw);
     }
 
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+    fn glyph_run(
+        &mut self,
+        draw: GlyphRunRef<'_>,
+        glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
+    ) {
         let recorder = &mut self.recorder;
         let state = &mut self.state;
         let Some(canvas) = recorder.recording_canvas() else {
@@ -555,7 +564,7 @@ impl PaintSink for SkPictureRecorderSink {
         if state.error.is_some() {
             return;
         }
-        draw_glyph_run(canvas, state, draw);
+        draw_glyph_run(canvas, state, draw, glyphs);
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {

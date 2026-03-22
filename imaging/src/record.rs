@@ -388,8 +388,8 @@ impl PaintSink for Scene {
     }
 
     #[inline]
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
-        let _ = Self::draw(self, Draw::GlyphRun(draw.to_owned()));
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>) {
+        let _ = Self::draw(self, Draw::GlyphRun(draw.to_owned(glyphs)));
     }
 
     #[inline]

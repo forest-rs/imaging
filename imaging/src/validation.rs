@@ -39,7 +39,8 @@
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef, record::Geometry,
+    StrokeRef,
+    record::{Geometry, Glyph},
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
 use peniko::Brush;
@@ -422,9 +423,8 @@ where
         true
     }
 
-    fn validate_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>) -> bool {
-        let glyphs_ok = glyph_run
-            .glyphs
+    fn validate_glyph_run(&mut self, glyph_run: GlyphRunRef<'_>, glyphs: &[Glyph]) -> bool {
+        let glyphs_ok = glyphs
             .iter()
             .all(|glyph| glyph.x.is_finite() && glyph.y.is_finite());
         let font_size_ok = glyph_run.font_size.is_finite() && glyph_run.font_size >= 0.0;
@@ -602,14 +602,15 @@ where
         self.inner.stroke(draw);
     }
 
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>) {
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>) {
         if self.aborted {
             return;
         }
-        if !self.validate_glyph_run(draw.clone()) {
+        let glyphs = glyphs.collect::<alloc::vec::Vec<_>>();
+        if !self.validate_glyph_run(draw.clone(), &glyphs) {
             return;
         }
-        self.inner.glyph_run(draw);
+        self.inner.glyph_run(draw, &mut glyphs.into_iter());
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
@@ -694,18 +695,20 @@ mod tests {
             y: f32::NAN,
         }];
         let paint = Brush::Solid(Color::BLACK);
-        sink.glyph_run(GlyphRunRef {
-            font: &font,
-            transform: Affine::IDENTITY,
-            glyph_transform: None,
-            font_size: -1.0,
-            hint: false,
-            normalized_coords: &[],
-            style: &style,
-            glyphs: &glyphs,
-            brush: &paint,
-            composite: Composite::default(),
-        });
+        sink.glyph_run(
+            GlyphRunRef {
+                font: &font,
+                transform: Affine::IDENTITY,
+                glyph_transform: None,
+                font_size: -1.0,
+                hint: false,
+                normalized_coords: &[],
+                style: &style,
+                brush: &paint,
+                composite: Composite::default(),
+            },
+            &mut glyphs.into_iter(),
+        );
         assert_eq!(
             sink.first_error(),
             Some(&ValidationError::InvalidGlyphRun {
