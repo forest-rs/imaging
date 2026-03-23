@@ -257,6 +257,34 @@ impl Scene {
         self.draws.clear();
     }
 
+    /// Reserve space for additional recorded payloads.
+    ///
+    /// This is useful when composing many retained scenes into one destination scene.
+    #[inline]
+    pub fn reserve_additional(
+        &mut self,
+        commands: usize,
+        clips: usize,
+        groups: usize,
+        draws: usize,
+    ) {
+        self.commands.reserve(commands);
+        self.clips.reserve(clips);
+        self.groups.reserve(groups);
+        self.draws.reserve(draws);
+    }
+
+    /// Reserve enough additional space to append another scene's current contents.
+    #[inline]
+    pub fn reserve_like(&mut self, other: &Self) {
+        self.reserve_additional(
+            other.commands.len(),
+            other.clips.len(),
+            other.groups.len(),
+            other.draws.len(),
+        );
+    }
+
     /// Borrow the recorded command stream.
     #[inline]
     pub fn commands(&self) -> &[Command] {
@@ -354,6 +382,15 @@ impl Scene {
         }
         Ok(())
     }
+
+    /// Append another retained scene with an extra transform applied to its commands.
+    ///
+    /// The extra transform prefixes clip transforms, draw transforms, group clip transforms, and
+    /// brush transforms (treating a missing brush transform as identity).
+    pub fn append_transformed(&mut self, other: &Self, transform: Affine) {
+        self.reserve_like(other);
+        replay_transformed(other, self, transform);
+    }
 }
 
 impl PaintSink for Scene {
@@ -404,6 +441,17 @@ where
     S: PaintSink + ?Sized,
 {
     crate::paint::replay(scene, sink);
+}
+
+/// Replay a recorded [`Scene`] into a [`crate::PaintSink`] with an extra transform.
+///
+/// The extra transform prefixes clip transforms, draw transforms, group clip transforms, and
+/// brush transforms (treating a missing brush transform as identity).
+pub fn replay_transformed<S>(scene: &Scene, sink: &mut S, transform: Affine)
+where
+    S: PaintSink + ?Sized,
+{
+    crate::paint::replay_transformed(scene, sink, transform);
 }
 
 /// Errors returned by [`Scene::validate`].
@@ -495,5 +543,35 @@ mod tests {
         let mut b = Scene::new();
         replay(&a, &mut b);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn append_transformed_reserves_and_appends() {
+        let mut source = Scene::new();
+        source.draw(Draw::Fill {
+            transform: Affine::translate((1.0, 2.0)),
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+            composite: Composite::default(),
+        });
+
+        let mut dest = Scene::new();
+        dest.reserve_like(&source);
+        dest.append_transformed(&source, Affine::translate((5.0, 6.0)));
+
+        assert_eq!(dest.commands().len(), 1);
+        assert_eq!(
+            dest.draw_op(DrawId(0)),
+            &Draw::Fill {
+                transform: Affine::translate((6.0, 8.0)),
+                fill_rule: Fill::NonZero,
+                brush: Brush::Solid(peniko::Color::WHITE),
+                brush_transform: Some(Affine::translate((5.0, 6.0))),
+                shape: Geometry::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+                composite: Composite::default(),
+            }
+        );
     }
 }

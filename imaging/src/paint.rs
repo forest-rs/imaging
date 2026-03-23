@@ -177,6 +177,30 @@ impl<'a> ClipRef<'a> {
         }
     }
 
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        match self {
+            Self::Fill {
+                transform,
+                shape,
+                fill_rule,
+            } => Self::Fill {
+                transform: prefix * transform,
+                shape,
+                fill_rule,
+            },
+            Self::Stroke {
+                transform,
+                shape,
+                stroke,
+            } => Self::Stroke {
+                transform: prefix * transform,
+                shape,
+                stroke,
+            },
+        }
+    }
+
     /// Convert a borrowed clip payload into an owned [`Clip`].
     #[must_use]
     pub fn to_owned(self) -> Clip {
@@ -253,6 +277,14 @@ impl<'a> GroupRef<'a> {
             clip: self.clip.map(ClipRef::to_owned),
             filters: self.filters.to_vec(),
             composite: self.composite,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            clip: self.clip.map(|clip| clip.prepend_transform(prefix)),
+            ..self
         }
     }
 }
@@ -340,6 +372,19 @@ impl<'a> FillRef<'a> {
             composite: self.composite,
         }
     }
+
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            transform: prefix * self.transform,
+            brush_transform: if prefix == Affine::IDENTITY {
+                self.brush_transform
+            } else {
+                Some(prefix * self.brush_transform.unwrap_or(Affine::IDENTITY))
+            },
+            ..self
+        }
+    }
 }
 
 /// Borrowed stroke draw payload.
@@ -415,6 +460,19 @@ impl<'a> StrokeRef<'a> {
             composite: self.composite,
         }
     }
+
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            transform: prefix * self.transform,
+            brush_transform: if prefix == Affine::IDENTITY {
+                self.brush_transform
+            } else {
+                Some(prefix * self.brush_transform.unwrap_or(Affine::IDENTITY))
+            },
+            ..self
+        }
+    }
 }
 
 /// Borrowed glyph run payload.
@@ -483,6 +541,14 @@ impl<'a> GlyphRunRef<'a> {
             glyphs: glyphs.into_iter().collect(),
             brush: self.brush.to_owned(),
             composite: self.composite,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            transform: prefix * self.transform,
+            ..self
         }
     }
 }
@@ -646,6 +712,51 @@ impl Draw {
     }
 }
 
+struct TransformingSink<'a, S: ?Sized> {
+    inner: &'a mut S,
+    transform: Affine,
+}
+
+impl<S> PaintSink for TransformingSink<'_, S>
+where
+    S: PaintSink + ?Sized,
+{
+    fn push_clip(&mut self, clip: ClipRef<'_>) {
+        self.inner.push_clip(clip.prepend_transform(self.transform));
+    }
+
+    fn pop_clip(&mut self) {
+        self.inner.pop_clip();
+    }
+
+    fn push_group(&mut self, group: GroupRef<'_>) {
+        self.inner
+            .push_group(group.prepend_transform(self.transform));
+    }
+
+    fn pop_group(&mut self) {
+        self.inner.pop_group();
+    }
+
+    fn fill(&mut self, draw: FillRef<'_>) {
+        self.inner.fill(draw.prepend_transform(self.transform));
+    }
+
+    fn stroke(&mut self, draw: StrokeRef<'_>) {
+        self.inner.stroke(draw.prepend_transform(self.transform));
+    }
+
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>) {
+        self.inner
+            .glyph_run(draw.prepend_transform(self.transform), glyphs);
+    }
+
+    fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        self.inner
+            .blurred_rounded_rect(draw.prepend_transform(self.transform));
+    }
+}
+
 fn replay_clip<S>(scene: &Scene, id: ClipId, sink: &mut S)
 where
     S: PaintSink + ?Sized,
@@ -685,13 +796,263 @@ pub(crate) fn replay<S>(scene: &Scene, sink: &mut S)
 where
     S: PaintSink + ?Sized,
 {
+    replay_transformed(scene, sink, Affine::IDENTITY);
+}
+
+/// Replay a recorded [`crate::record::Scene`] into a [`PaintSink`] with an extra transform.
+pub(crate) fn replay_transformed<S>(scene: &Scene, sink: &mut S, transform: Affine)
+where
+    S: PaintSink + ?Sized,
+{
+    let mut sink = TransformingSink {
+        inner: sink,
+        transform,
+    };
     for cmd in scene.commands() {
         match *cmd {
-            Command::PushClip(id) => replay_clip(scene, id, sink),
+            Command::PushClip(id) => replay_clip(scene, id, &mut sink),
             Command::PopClip => sink.pop_clip(),
-            Command::PushGroup(id) => replay_group(scene, id, sink),
+            Command::PushGroup(id) => replay_group(scene, id, &mut sink),
             Command::PopGroup => sink.pop_group(),
-            Command::Draw(id) => replay_draw(scene, id, sink),
+            Command::Draw(id) => replay_draw(scene, id, &mut sink),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    use super::*;
+    use crate::{Composite, record::Geometry};
+    use peniko::{Brush, FontData};
+
+    #[test]
+    fn clip_ref_prepend_transform_prefixes_clip_transform() {
+        let clip = ClipRef::fill(Rect::new(0.0, 0.0, 3.0, 4.0))
+            .with_transform(Affine::translate((1.0, 2.0)));
+
+        assert_eq!(
+            clip.prepend_transform(Affine::translate((5.0, 6.0))),
+            ClipRef::Fill {
+                transform: Affine::translate((6.0, 8.0)),
+                shape: GeometryRef::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+                fill_rule: Fill::NonZero,
+            }
+        );
+    }
+
+    #[test]
+    fn group_ref_prepend_transform_prefixes_isolated_clip() {
+        let stroke = Stroke::new(2.0);
+        let group = GroupRef::new().with_clip(
+            ClipRef::stroke(Rect::new(0.0, 0.0, 3.0, 4.0), &stroke)
+                .with_transform(Affine::translate((1.0, 2.0))),
+        );
+
+        assert_eq!(
+            group.prepend_transform(Affine::translate((5.0, 6.0))),
+            GroupRef {
+                clip: Some(ClipRef::Stroke {
+                    transform: Affine::translate((6.0, 8.0)),
+                    shape: GeometryRef::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+                    stroke: &stroke,
+                }),
+                filters: &[],
+                composite: Composite::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn fill_ref_prepend_transform_prefixes_draw_and_brush_transform() {
+        let draw = FillRef::new(
+            Rect::new(0.0, 0.0, 3.0, 4.0),
+            Brush::Solid(peniko::Color::WHITE),
+        )
+        .transform(Affine::translate((1.0, 2.0)))
+        .brush_transform(Some(Affine::translate((3.0, 4.0))));
+
+        assert_eq!(
+            draw.prepend_transform(Affine::translate((5.0, 6.0))),
+            FillRef {
+                transform: Affine::translate((6.0, 8.0)),
+                fill_rule: Fill::NonZero,
+                brush: BrushRef::Solid(peniko::Color::WHITE),
+                brush_transform: Some(Affine::translate((8.0, 10.0))),
+                shape: GeometryRef::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+                composite: Composite::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn fill_ref_prepend_transform_injects_identity_brush_transform_when_needed() {
+        let draw = FillRef::new(
+            Rect::new(0.0, 0.0, 3.0, 4.0),
+            Brush::Solid(peniko::Color::WHITE),
+        );
+
+        assert_eq!(
+            draw.prepend_transform(Affine::translate((5.0, 6.0)))
+                .brush_transform,
+            Some(Affine::translate((5.0, 6.0)))
+        );
+    }
+
+    #[test]
+    fn glyph_run_ref_prepend_transform_only_prefixes_run_transform() {
+        let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
+        let style = Style::Fill(Fill::NonZero);
+        let draw = GlyphRunRef::new(&font, &style, Brush::Solid(peniko::Color::BLACK));
+        let draw = GlyphRunRef {
+            transform: Affine::translate((1.0, 2.0)),
+            glyph_transform: Some(Affine::translate((3.0, 4.0))),
+            font_size: 12.0,
+            ..draw
+        };
+
+        let transformed = draw.prepend_transform(Affine::translate((5.0, 6.0)));
+        assert_eq!(transformed.transform, Affine::translate((6.0, 8.0)));
+        assert_eq!(
+            transformed.glyph_transform,
+            Some(Affine::translate((3.0, 4.0)))
+        );
+    }
+
+    #[test]
+    fn replay_transformed_prefixes_recorded_transforms() {
+        let mut source = Scene::new();
+        let clip_id = source.push_clip(Clip::Fill {
+            transform: Affine::translate((1.0, 2.0)),
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+            fill_rule: Fill::NonZero,
+        });
+        let group_id = source.push_group(Group {
+            clip: Some(Clip::Stroke {
+                transform: Affine::translate((5.0, 6.0)),
+                shape: Geometry::Rect(Rect::new(0.0, 0.0, 7.0, 8.0)),
+                stroke: Stroke::new(2.0),
+            }),
+            filters: vec![],
+            composite: Composite::default(),
+        });
+        let fill_id = source.draw(Draw::Fill {
+            transform: Affine::translate((9.0, 10.0)),
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::WHITE),
+            brush_transform: Some(Affine::translate((11.0, 12.0))),
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 13.0, 14.0)),
+            composite: Composite::default(),
+        });
+        let stroke_id = source.draw(Draw::Stroke {
+            transform: Affine::translate((15.0, 16.0)),
+            stroke: Stroke::new(3.0),
+            brush: Brush::Solid(peniko::Color::BLACK),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 17.0, 18.0)),
+            composite: Composite::default(),
+        });
+        let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
+        let glyph_id = source.draw(Draw::GlyphRun(GlyphRun {
+            font,
+            transform: Affine::translate((19.0, 20.0)),
+            glyph_transform: Some(Affine::translate((21.0, 22.0))),
+            font_size: 12.0,
+            hint: false,
+            normalized_coords: vec![],
+            style: Style::Fill(Fill::NonZero),
+            glyphs: vec![Glyph {
+                id: 7,
+                x: 0.0,
+                y: 0.0,
+            }],
+            brush: Brush::Solid(peniko::Color::BLACK),
+            composite: Composite::default(),
+        }));
+        let blur_id = source.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {
+            transform: Affine::translate((23.0, 24.0)),
+            rect: Rect::new(0.0, 0.0, 4.0, 3.0),
+            color: peniko::Color::BLACK,
+            radius: 1.0,
+            std_dev: 2.0,
+            composite: Composite::default(),
+        }));
+        source.pop_group();
+        source.pop_clip();
+
+        let transform = Affine::translate((100.0, 200.0));
+        let mut replayed = Scene::new();
+        replay_transformed(&source, &mut replayed, transform);
+
+        assert_eq!(replayed.commands(), source.commands());
+        assert_eq!(
+            replayed.clip(clip_id),
+            &Clip::Fill {
+                transform: transform * Affine::translate((1.0, 2.0)),
+                shape: Geometry::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+                fill_rule: Fill::NonZero,
+            }
+        );
+        assert_eq!(
+            replayed.group(group_id),
+            &Group {
+                clip: Some(Clip::Stroke {
+                    transform: transform * Affine::translate((5.0, 6.0)),
+                    shape: Geometry::Rect(Rect::new(0.0, 0.0, 7.0, 8.0)),
+                    stroke: Stroke::new(2.0),
+                }),
+                filters: vec![],
+                composite: Composite::default(),
+            }
+        );
+        assert_eq!(
+            replayed.draw_op(fill_id),
+            &Draw::Fill {
+                transform: transform * Affine::translate((9.0, 10.0)),
+                fill_rule: Fill::NonZero,
+                brush: Brush::Solid(peniko::Color::WHITE),
+                brush_transform: Some(transform * Affine::translate((11.0, 12.0))),
+                shape: Geometry::Rect(Rect::new(0.0, 0.0, 13.0, 14.0)),
+                composite: Composite::default(),
+            }
+        );
+        assert_eq!(
+            replayed.draw_op(stroke_id),
+            &Draw::Stroke {
+                transform: transform * Affine::translate((15.0, 16.0)),
+                stroke: Stroke::new(3.0),
+                brush: Brush::Solid(peniko::Color::BLACK),
+                brush_transform: Some(transform),
+                shape: Geometry::Rect(Rect::new(0.0, 0.0, 17.0, 18.0)),
+                composite: Composite::default(),
+            }
+        );
+        match replayed.draw_op(glyph_id) {
+            Draw::GlyphRun(glyph_run) => {
+                assert_eq!(
+                    glyph_run.transform,
+                    transform * Affine::translate((19.0, 20.0))
+                );
+                assert_eq!(
+                    glyph_run.glyph_transform,
+                    Some(Affine::translate((21.0, 22.0)))
+                );
+                assert_eq!(glyph_run.brush, Brush::Solid(peniko::Color::BLACK));
+            }
+            other => panic!("expected glyph run draw, got {other:?}"),
+        }
+        assert_eq!(
+            replayed.draw_op(blur_id),
+            &Draw::BlurredRoundedRect(BlurredRoundedRect {
+                transform: transform * Affine::translate((23.0, 24.0)),
+                rect: Rect::new(0.0, 0.0, 4.0, 3.0),
+                color: peniko::Color::BLACK,
+                radius: 1.0,
+                std_dev: 2.0,
+                composite: Composite::default(),
+            })
+        );
     }
 }

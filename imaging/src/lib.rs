@@ -213,6 +213,15 @@ pub struct BlurredRoundedRect {
     pub composite: Composite,
 }
 
+impl BlurredRoundedRect {
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            transform: prefix * self.transform,
+            ..self
+        }
+    }
+}
+
 /// Canvas-style compositing state.
 ///
 /// This corresponds to HTML Canvas 2D's `globalCompositeOperation` (blend) plus `globalAlpha`
