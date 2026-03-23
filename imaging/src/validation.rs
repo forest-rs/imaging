@@ -10,7 +10,7 @@
 //! - construct the backend sink
 //! - wrap it in [`ValidatingSink`]
 //! - paint through [`crate::Painter`]
-//! - call [`ValidatingSink::finish`] to check stack balance
+//! - call [`ValidatingSink::finish`] to get the final validation result
 //! - unwrap the backend sink and finish it normally
 //!
 //! ```rust
@@ -36,7 +36,7 @@
 //! }
 //!
 //! assert_eq!(sink.first_error(), Some(&ValidationError::InvalidAlpha));
-//! assert_eq!(sink.finish(), Ok(()));
+//! assert_eq!(sink.finish(), Err(ValidationError::InvalidAlpha));
 //!
 //! let (scene, first_error) = sink.into_inner();
 //! assert!(scene.commands().is_empty());
@@ -153,8 +153,8 @@ pub fn default_validation_hook(_: &ValidationError) -> ValidationDecision {
 ///
 /// This is intended as a defensive layer around a streaming backend sink. The usual flow is:
 /// create the backend sink, wrap it in `ValidatingSink`, paint through [`crate::Painter`], call
-/// [`Self::finish`] to validate stack balance, then unwrap the backend sink with
-/// [`Self::into_inner`] and finish or consume it normally.
+/// [`Self::finish`] to get the final validation result for the whole stream, then unwrap the
+/// backend sink with [`Self::into_inner`] and finish or consume it normally.
 #[derive(Debug)]
 pub struct ValidatingSink<S, H = fn(&ValidationError) -> ValidationDecision> {
     inner: S,
@@ -214,23 +214,27 @@ where
         (self.inner, self.first_error)
     }
 
-    /// Validate that streaming push/pop stacks are balanced at end-of-stream.
+    /// Return the final validation result for the stream.
+    ///
+    /// This checks end-of-stream clip/group balance and also returns any earlier validation error
+    /// recorded while forwarding commands.
     pub fn finish(&mut self) -> Result<(), ValidationError> {
         if self.clip_depth != 0 {
             let err = ValidationError::UnclosedClips {
                 depth: self.clip_depth,
             };
             self.note_error(err.clone());
-            return Err(err);
         }
         if self.group_depth != 0 {
             let err = ValidationError::UnclosedGroups {
                 depth: self.group_depth,
             };
             self.note_error(err.clone());
-            return Err(err);
         }
-        Ok(())
+        match &self.first_error {
+            Some(err) => Err(err.clone()),
+            None => Ok(()),
+        }
     }
 
     fn note_error(&mut self, err: ValidationError) {
@@ -692,6 +696,10 @@ mod tests {
             Some(ValidationError::NonFinite { .. })
         ));
         assert!(sink.inner().commands().is_empty());
+        assert!(matches!(
+            sink.finish(),
+            Err(ValidationError::NonFinite { .. })
+        ));
     }
 
     #[test]
@@ -705,6 +713,10 @@ mod tests {
         );
         assert!(sink.first_error().is_some());
         assert_eq!(sink.inner().commands().len(), 1);
+        assert!(matches!(
+            sink.finish(),
+            Err(ValidationError::NonFinite { .. })
+        ));
     }
 
     #[test]
@@ -720,6 +732,22 @@ mod tests {
             sink.first_error(),
             Some(&ValidationError::UnclosedClips { depth: 1 })
         );
+    }
+
+    #[test]
+    fn finish_returns_first_error_even_if_stacks_are_balanced() {
+        let inner = Scene::new();
+        let mut sink = ValidatingSink::new(inner);
+        let paint = Brush::default();
+        sink.fill(
+            FillRef::new(Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)), &paint)
+                .transform(Affine::translate((f64::NAN, 0.0))),
+        );
+
+        assert!(matches!(
+            sink.finish(),
+            Err(ValidationError::NonFinite { .. })
+        ));
     }
 
     #[test]
