@@ -221,11 +221,12 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
     }
 
     if needs_layer {
-        let bounds = sk::Rect::new(-10_000.0, -10_000.0, 10_000.0, 10_000.0);
-        let mut rec = sk::canvas::SaveLayerRec::default();
-        rec = rec.bounds(&bounds);
-        rec = rec.paint(&paint);
-        canvas.save_layer(&rec);
+        // This is an isolated group layer: draw children into a fresh offscreen layer, then apply
+        // the group's blend/alpha/filter when that layer is restored into the parent canvas.
+        // True backdrop effects would need a separate path that first samples or copies the
+        // existing destination content for the clipped region, applies the effect against that
+        // backdrop, and then composites the group result back.
+        canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&paint));
         restores += 1;
     }
 
