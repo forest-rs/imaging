@@ -131,6 +131,20 @@ where
         self.sink
     }
 
+    /// Reborrow this painter as a trait-object-backed [`Painter`].
+    ///
+    /// This is useful when generic code needs to call helpers that are written against
+    /// `Painter<'_, dyn PaintSink>` without threading the concrete sink type through the
+    /// surrounding API.
+    #[must_use]
+    pub fn as_dyn(&mut self) -> Painter<'_, dyn PaintSink + '_>
+    where
+        S: Sized,
+    {
+        let sink: &mut dyn PaintSink = self.sink_mut();
+        Painter::new(sink)
+    }
+
     /// Replay a recorded scene into the wrapped sink.
     ///
     /// This forwards to [`record::replay`] without requiring callers to peel the sink back out of
@@ -563,6 +577,22 @@ mod tests {
         ));
 
         assert_eq!(sink.commands().len(), 1);
+    }
+
+    #[test]
+    fn as_dyn_reborrows_and_returns_control_to_original_painter() {
+        let mut sink = record::Scene::new();
+        let mut painter = Painter::new(&mut sink);
+
+        painter
+            .as_dyn()
+            .fill(Rect::new(1.0, 2.0, 3.0, 4.0), peniko::Color::BLACK)
+            .draw();
+        painter
+            .fill(Rect::new(5.0, 6.0, 7.0, 8.0), peniko::Color::WHITE)
+            .draw();
+
+        assert_eq!(sink.commands().len(), 2);
     }
 
     #[test]
