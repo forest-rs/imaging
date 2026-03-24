@@ -115,12 +115,15 @@
 
 mod sinks;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use imaging::{
     Filter, GeometryRef, GlyphRunRef,
     record::{Scene, ValidateError, replay},
 };
 use kurbo::{Affine, Shape as _};
-use peniko::color::{ColorSpaceTag, HueDirection};
+use peniko::color::{ColorSpaceTag, HueDirection, Srgb};
 use peniko::{BrushRef, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
 use std::{cell::RefCell, rc::Rc};
@@ -278,16 +281,93 @@ fn affine_to_matrix(xf: Affine) -> sk::Matrix {
     )
 }
 
-fn skia_font_from_glyph_run(glyph_run: &GlyphRunRef<'_>) -> Option<sk::Font> {
-    let typeface = sk::FontMgr::default()
-        .new_from_data(glyph_run.font.data.as_ref(), glyph_run.font.index as usize)?;
+struct FontCache {
+    font_mgr: sk::FontMgr,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    extracted_font_data: HashMap<(u64, u32), peniko::FontData>,
+    typefaces: HashMap<(u64, u32), sk::Typeface>,
+    fonts: HashMap<(u64, u32, u32, bool), sk::Font>,
+}
 
-    let mut font = sk::Font::from_typeface(typeface, glyph_run.font_size);
-    font.set_hinting(if glyph_run.hint {
-        sk::FontHinting::Slight
-    } else {
-        sk::FontHinting::None
-    });
+impl FontCache {
+    fn new() -> Self {
+        Self {
+            font_mgr: sk::FontMgr::new(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            extracted_font_data: HashMap::new(),
+            typefaces: HashMap::new(),
+            fonts: HashMap::new(),
+        }
+    }
+
+    fn get_or_cache_typeface<'a>(
+        &'a mut self,
+        #[allow(unused_mut)] mut font: &'a peniko::FontData,
+    ) -> Option<sk::Typeface> {
+        let cache_key = (font.data.id(), font.index);
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            use peniko::Blob;
+            use std::sync::Arc;
+
+            if let Some(collection) = oaty::Collection::new(font.data.data()) {
+                self.extracted_font_data.entry(cache_key).or_insert_with(|| {
+                    let data = collection
+                        .get_font(font.index)
+                        .and_then(|font| font.copy_data())
+                        .unwrap_or_default();
+                    peniko::FontData::new(Blob::new(Arc::new(data)), 0)
+                });
+                font = self.extracted_font_data.get(&cache_key)?;
+            }
+        }
+
+        if let Some(typeface) = self.typefaces.get(&cache_key) {
+            return Some(typeface.clone());
+        }
+
+        let typeface = self
+            .font_mgr
+            .new_from_data(font.data.data(), font.index as usize)
+            .or_else(|| sk::Typeface::make_deserialize(font.data.data(), None))?;
+        self.typefaces.insert(cache_key, typeface.clone());
+        Some(typeface)
+    }
+
+    fn get_or_cache_font(
+        &mut self,
+        glyph_run: &GlyphRunRef<'_>,
+    ) -> Option<sk::Font> {
+        let cache_key = (
+            glyph_run.font.data.id(),
+            glyph_run.font.index,
+            glyph_run.font_size.to_bits(),
+            glyph_run.hint,
+        );
+
+        if let Some(font) = self.fonts.get(&cache_key) {
+            return Some(font.clone());
+        }
+
+        let typeface = self.get_or_cache_typeface(glyph_run.font)?;
+        let mut font = sk::Font::from_typeface(typeface, glyph_run.font_size);
+        font.set_hinting(if glyph_run.hint {
+            sk::FontHinting::Slight
+        } else {
+            sk::FontHinting::None
+        });
+        self.fonts.insert(cache_key, font.clone());
+        Some(font)
+    }
+}
+
+thread_local! {
+    static FONT_CACHE: RefCell<FontCache> = RefCell::new(FontCache::new());
+}
+
+fn skia_font_from_glyph_run(glyph_run: &GlyphRunRef<'_>) -> Option<sk::Font> {
+    let mut font = FONT_CACHE.with_borrow_mut(|cache| cache.get_or_cache_font(glyph_run))?;
 
     if let Some(transform) = glyph_run.glyph_transform {
         let [a, b, c, d, e, f] = transform.as_coeffs();
@@ -444,9 +524,13 @@ fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option
             let mut pos: Vec<f32> = Vec::with_capacity(stops.len());
 
             for s in stops {
-                let comps = s.color.components;
-                let a = comps[3] * alpha_scale;
-                colors.push(sk::Color4f::new(comps[0], comps[1], comps[2], a));
+                let color = s.color.to_alpha_color::<Srgb>().multiply_alpha(alpha_scale);
+                colors.push(sk::Color4f::new(
+                    color.components[0],
+                    color.components[1],
+                    color.components[2],
+                    color.components[3],
+                ));
                 pos.push(s.offset.clamp(0.0, 1.0));
             }
 

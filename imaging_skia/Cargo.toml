@@ -14,6 +14,7 @@ imaging = { features = ["std"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 skia-safe = { version = "0.90.0" }
+oaty = "0.1"
 
 [lints]
 workspace = true
