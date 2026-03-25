@@ -26,6 +26,7 @@ env:
     --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
+    --exclude xtask
   # List of packages that don't support wasip1
   RUST_NO_WASIP1_PKGS: >-
     --exclude imaging_conformance
@@ -35,6 +36,7 @@ env:
     --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
+    --exclude xtask
   # List of packages that don't support wasm32
   RUST_NO_WASM_PKGS: >-
     --exclude imaging_conformance
@@ -44,6 +46,7 @@ env:
     --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
+    --exclude xtask
   # List of features that depend on the standard library and will be excluded from no_std checks.
   FEATURES_DEPENDING_ON_STD: "std,default"
 
