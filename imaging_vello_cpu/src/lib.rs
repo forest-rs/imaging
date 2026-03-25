@@ -71,7 +71,7 @@ use imaging::{
     MaskMode, PaintSink, StrokeRef,
     record::{Scene, ValidateError, replay, replay_transformed},
 };
-use kurbo::{Affine, Shape as _};
+use kurbo::{Affine, Rect, Shape as _};
 use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::glyph::Glyph as VelloGlyph;
@@ -196,6 +196,14 @@ impl VelloCpuRenderer {
         if self.error.is_none() {
             self.error = Some(err);
         }
+    }
+
+    fn rect_fits_viewport_fast_path(&self, rect: &Rect, transform: Affine) -> bool {
+        let transformed = transform.transform_rect_bbox(*rect);
+        transformed.x0 >= 0.0
+            && transformed.y0 >= 0.0
+            && transformed.x1 <= f64::from(self.width)
+            && transformed.y1 <= f64::from(self.height)
     }
 
     fn brush_to_paint(
@@ -512,7 +520,16 @@ impl PaintSink for VelloCpuRenderer {
         self.ctx.set_paint(paint);
 
         match draw.shape {
-            GeometryRef::Rect(r) => self.ctx.fill_rect(&r),
+            GeometryRef::Rect(r) => {
+                if self.rect_fits_viewport_fast_path(&r, draw.transform) {
+                    self.ctx.fill_rect(&r);
+                } else {
+                    // Work around a vello_cpu 0.0.7 rect fast-path panic for strips that land
+                    // outside the viewport. Fall back to path filling until the upstream fix lands.
+                    let path = r.to_path(self.tolerance);
+                    self.ctx.fill_path(&path);
+                }
+            }
             GeometryRef::RoundedRect(rr) => {
                 let path = rr.to_path(self.tolerance);
                 self.ctx.fill_path(&path);
@@ -646,5 +663,24 @@ mod tests {
 
         renderer.set_tolerance(0.25);
         assert!(renderer.mask_cache.is_empty());
+    }
+
+    #[test]
+    fn render_scene_handles_rects_below_viewport_without_panicking() {
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(8.0, 48.0, 56.0, 52.0),
+                    Color::from_rgba8(0x14, 0x50, 0xc8, 0xff),
+                )
+                .transform(Affine::translate((0.0, 24.0)))
+                .draw();
+        }
+
+        let mut renderer = VelloCpuRenderer::new(64, 64);
+        let bytes = renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(bytes.len(), 64 * 64 * 4);
     }
 }

@@ -13,8 +13,8 @@ publish = false
 imaging.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
-vello_common = { default-features = false, version = "0.0.6" }
-vello_cpu = { default-features = false, features = ["text", "u8_pipeline"], version = "0.0.6" }
+vello_common = { default-features = false, version = "0.0.7" }
+vello_cpu = { default-features = false, features = ["text", "u8_pipeline"], version = "0.0.7" }
 
 [lints]
 workspace = true
