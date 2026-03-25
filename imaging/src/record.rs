@@ -6,14 +6,14 @@
 //! This module contains the retained representation for imaging command streams. Use [`Scene`] when
 //! you need an owned semantic recording you can retain, validate, and replay.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
 use peniko::{Brush, Fill, FontData, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GlyphRunRef, GroupRef, NormalizedCoord,
-    PaintSink, StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GlyphRunRef, GroupRef, MaskMode,
+    NormalizedCoord, PaintSink, StrokeRef,
 };
 
 /// A geometry payload stored in a recording.
@@ -80,10 +80,52 @@ pub struct ClipId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GroupId(pub(crate) u32);
 
+/// Identifier for a mask payload stored in a [`Scene`].
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MaskId(pub(crate) u32);
+
 /// Identifier for a draw payload stored in a [`Scene`].
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DrawId(pub(crate) u32);
+
+/// A retained mask definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mask {
+    /// How this mask scene modulates masked content.
+    pub mode: MaskMode,
+    /// Scene that produces mask coverage values.
+    pub scene: Scene,
+}
+
+impl Mask {
+    /// Create a mask definition from a retained scene and interpretation mode.
+    #[must_use]
+    pub fn new(mode: MaskMode, scene: Scene) -> Self {
+        Self { mode, scene }
+    }
+}
+
+/// A use of a retained mask within an isolated group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppliedMask {
+    /// Referenced mask definition.
+    pub mask: MaskId,
+    /// Transform applied when realizing the mask scene.
+    pub transform: Affine,
+}
+
+impl AppliedMask {
+    /// Create a mask use with an identity transform.
+    #[must_use]
+    pub fn new(mask: MaskId) -> Self {
+        Self {
+            mask,
+            transform: Affine::IDENTITY,
+        }
+    }
+}
 
 /// Parameters for an isolated group.
 ///
@@ -94,6 +136,8 @@ pub struct DrawId(pub(crate) u32);
 pub struct Group {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<Clip>,
+    /// Optional retained mask applied to the group result before compositing.
+    pub mask: Option<AppliedMask>,
     /// Optional filter chain applied to the group result before compositing.
     pub filters: Vec<crate::Filter>,
     /// Compositing parameters used when merging the group into its parent.
@@ -105,6 +149,7 @@ impl Default for Group {
     fn default() -> Self {
         Self {
             clip: None,
+            mask: None,
             filters: Vec::new(),
             composite: Composite::default(),
         }
@@ -237,6 +282,7 @@ pub enum Command {
 pub struct Scene {
     commands: Vec<Command>,
     clips: Vec<Clip>,
+    masks: Vec<Mask>,
     groups: Vec<Group>,
     draws: Vec<Draw>,
 }
@@ -253,6 +299,7 @@ impl Scene {
     pub fn clear(&mut self) {
         self.commands.clear();
         self.clips.clear();
+        self.masks.clear();
         self.groups.clear();
         self.draws.clear();
     }
@@ -267,9 +314,11 @@ impl Scene {
         clips: usize,
         groups: usize,
         draws: usize,
+        masks: usize,
     ) {
         self.commands.reserve(commands);
         self.clips.reserve(clips);
+        self.masks.reserve(masks);
         self.groups.reserve(groups);
         self.draws.reserve(draws);
     }
@@ -280,6 +329,7 @@ impl Scene {
         self.reserve_additional(
             other.commands.len(),
             other.clips.len(),
+            other.masks.len(),
             other.groups.len(),
             other.draws.len(),
         );
@@ -295,6 +345,12 @@ impl Scene {
     #[inline]
     pub fn clip(&self, id: ClipId) -> &Clip {
         &self.clips[id.0 as usize]
+    }
+
+    /// Resolve a mask payload by ID.
+    #[inline]
+    pub fn mask(&self, id: MaskId) -> &Mask {
+        &self.masks[id.0 as usize]
     }
 
     /// Resolve a group payload by ID.
@@ -351,10 +407,28 @@ impl Scene {
         id
     }
 
+    /// Define a reusable retained mask.
+    #[inline]
+    pub fn define_mask(&mut self, mask: Mask) -> MaskId {
+        if let Some(idx) = self.masks.iter().position(|existing| existing == &mask) {
+            return MaskId(u32::try_from(idx).expect("scene mask table overflow"));
+        }
+        let idx = u32::try_from(self.masks.len()).expect("scene mask table overflow");
+        let id = MaskId(idx);
+        self.masks.push(mask);
+        id
+    }
+
     /// Validate well-nested stacks.
     pub fn validate(&self) -> Result<(), ValidateError> {
         let mut clip_depth = 0_u32;
         let mut group_depth = 0_u32;
+
+        for mask in &self.masks {
+            mask.scene
+                .validate()
+                .map_err(|err| ValidateError::InvalidMask(Box::new(err)))?;
+        }
 
         for cmd in &self.commands {
             match cmd {
@@ -406,7 +480,8 @@ impl PaintSink for Scene {
 
     #[inline]
     fn push_group(&mut self, group: GroupRef<'_>) {
-        let _ = Self::push_group(self, group.to_owned());
+        let group = group.into_owned_with(&mut |mask| self.define_mask(mask.to_owned()));
+        let _ = Self::push_group(self, group);
     }
 
     #[inline]
@@ -455,7 +530,7 @@ where
 }
 
 /// Errors returned by [`Scene::validate`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidateError {
     /// A `PopClip` occurred without a matching prior `PushClip`.
     UnbalancedPopClip,
@@ -465,11 +540,14 @@ pub enum ValidateError {
     UnclosedClips,
     /// The command stream ended with open groups.
     UnclosedGroups,
+    /// A retained mask definition was invalid.
+    InvalidMask(Box<Self>),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MaskRef;
     use alloc::sync::Arc;
     use alloc::vec;
 
@@ -573,5 +651,100 @@ mod tests {
                 composite: Composite::default(),
             }
         );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_nested_mask_scene() {
+        let mut invalid_mask = Scene::new();
+        invalid_mask.pop_clip();
+
+        let mut scene = Scene::new();
+        scene.define_mask(Mask::new(MaskMode::Alpha, invalid_mask));
+
+        assert_eq!(
+            scene.validate(),
+            Err(ValidateError::InvalidMask(Box::new(
+                ValidateError::UnbalancedPopClip
+            )))
+        );
+    }
+
+    #[test]
+    fn recording_groups_with_same_mask_ref_shares_one_mask_definition() {
+        let mut mask_scene = Scene::new();
+        mask_scene.draw(Draw::Fill {
+            transform: Affine::IDENTITY,
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 4.0, 4.0)),
+            composite: Composite::default(),
+        });
+
+        let mut scene = Scene::new();
+        let mask = MaskRef::new(MaskMode::Alpha, &mask_scene);
+        let group = GroupRef::new().with_mask(mask);
+
+        PaintSink::push_group(&mut scene, group.clone());
+        scene.pop_group();
+        PaintSink::push_group(&mut scene, group);
+        scene.pop_group();
+
+        assert_eq!(scene.masks.len(), 1);
+        let first = scene
+            .group(GroupId(0))
+            .mask
+            .as_ref()
+            .expect("expected mask")
+            .mask;
+        let second = scene
+            .group(GroupId(1))
+            .mask
+            .as_ref()
+            .expect("expected mask")
+            .mask;
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn append_transformed_prefixes_group_mask_transform() {
+        let mut mask = Scene::new();
+        mask.draw(Draw::Fill {
+            transform: Affine::IDENTITY,
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 4.0, 4.0)),
+            composite: Composite::default(),
+        });
+        let mut source = Scene::new();
+        let mask_id = source.define_mask(Mask::new(MaskMode::Luminance, mask));
+        let group = Group {
+            mask: Some(AppliedMask {
+                mask: mask_id,
+                transform: Affine::translate((1.0, 2.0)),
+            }),
+            ..Group::default()
+        };
+        source.push_group(group);
+        source.draw(Draw::Fill {
+            transform: Affine::IDENTITY,
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::BLACK),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(1.0, 1.0, 3.0, 3.0)),
+            composite: Composite::default(),
+        });
+        source.pop_group();
+
+        let mut dest = Scene::new();
+        dest.reserve_like(&source);
+        dest.append_transformed(&source, Affine::translate((5.0, 6.0)));
+
+        let group = dest.group(GroupId(0));
+        let mask = group.mask.as_ref().expect("expected group mask");
+        assert_eq!(mask.transform, Affine::translate((6.0, 8.0)));
+        assert_eq!(dest.masks.len(), 1);
+        assert_eq!(dest.mask(mask.mask).mode, MaskMode::Luminance);
     }
 }

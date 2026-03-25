@@ -166,6 +166,8 @@ pub enum Error {
     UnsupportedImageBrush,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
+    /// Masks are not supported by this backend yet.
+    UnsupportedMask,
     /// Blurred rounded rect draws are not supported by this backend yet.
     UnsupportedBlurredRoundedRect,
     /// No suitable GPU adapter was found.

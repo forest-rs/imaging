@@ -71,9 +71,9 @@
 //! ```
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef,
-    record::{Geometry, Glyph},
+    AppliedMaskRef, BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef,
+    PaintSink, StrokeRef,
+    record::{self, Geometry, Glyph},
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
 use peniko::BrushRef;
@@ -123,6 +123,11 @@ pub enum ValidationError {
     },
     /// A blurred rounded rect had invalid parameters.
     InvalidBlurredRoundedRect {
+        /// Short label describing what was invalid.
+        what: &'static str,
+    },
+    /// A mask had invalid parameters.
+    InvalidMask {
         /// Short label describing what was invalid.
         what: &'static str,
     },
@@ -540,6 +545,22 @@ where
             }
         }
     }
+
+    fn validate_recorded_scene_stream(&mut self, scene: &record::Scene) -> bool {
+        let mut sink = ValidatingSink::new(record::Scene::new());
+        record::replay(scene, &mut sink);
+        if let Err(err) = sink.finish() {
+            !self.violate(err)
+        } else {
+            true
+        }
+    }
+
+    fn validate_group_mask(&mut self, mask: &AppliedMaskRef<'_>) -> bool {
+        let mut ok = self.validate_affine("Group::mask::transform", &mask.transform);
+        ok &= self.validate_recorded_scene_stream(mask.mask.scene);
+        ok
+    }
 }
 
 impl<S, H> PaintSink for ValidatingSink<S, H>
@@ -580,6 +601,9 @@ where
         let mut ok = self.validate_composite(&group.composite);
         if let Some(clip) = group.clip.clone() {
             ok &= self.validate_clip(clip, "Group::clip::transform");
+        }
+        if let Some(mask) = group.mask.as_ref() {
+            ok &= self.validate_group_mask(mask);
         }
         for filter in group.filters {
             ok &= self.validate_filter(filter);

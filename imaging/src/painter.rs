@@ -9,7 +9,7 @@ use kurbo::{Affine, BezPath, CubicBez, Line, QuadBez, Rect, RoundedRect, Stroke}
 use peniko::{BrushRef, ImageBrushRef, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
     NormalizedCoord, PaintSink, StrokeRef, record,
 };
 
@@ -420,6 +420,39 @@ where
         }
         self.pop_group();
     }
+
+    /// Record a reusable retained mask definition.
+    ///
+    /// Prefer this when the same mask will be applied more than once. The returned
+    /// [`record::Mask`] can be reused through [`GroupRef::with_mask`] or
+    /// [`GroupRef::with_mask_transformed`]. `mode` controls whether the recorded mask scene is
+    /// interpreted as alpha or luminance.
+    #[must_use]
+    pub fn record_mask(
+        mode: MaskMode,
+        mask: impl FnOnce(&mut Painter<'_, record::Scene>),
+    ) -> record::Mask {
+        let mut mask_scene = record::Scene::new();
+        {
+            let mut painter = Painter::new(&mut mask_scene);
+            mask(&mut painter);
+        }
+        record::Mask::new(mode, mask_scene)
+    }
+
+    /// Record a temporary one-off mask definition, then paint content through a masked isolated
+    /// group.
+    ///
+    /// Prefer [`Self::record_mask`] plus [`Self::with_group`] when the same mask will be reused.
+    pub fn with_masked_group(
+        &mut self,
+        mode: MaskMode,
+        mask: impl FnOnce(&mut Painter<'_, record::Scene>),
+        content: impl FnOnce(&mut Painter<'_, S>),
+    ) {
+        let mask = Self::record_mask(mode, mask);
+        self.with_group(GroupRef::new().with_mask(mask.as_ref()), content);
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +675,49 @@ mod tests {
         painter.with_fill_clip(Rect::new(0.0, 0.0, 5.0, 6.0), |_| {});
 
         assert_eq!(sink.pushed_clips.len(), 1);
+    }
+
+    #[test]
+    fn with_masked_group_records_reusable_mask_and_group_content() {
+        let mut scene = record::Scene::new();
+        let mut painter = Painter::new(&mut scene);
+
+        painter.with_masked_group(
+            MaskMode::Alpha,
+            |mask| {
+                mask.fill(Rect::new(0.0, 0.0, 8.0, 8.0), peniko::Color::WHITE)
+                    .draw();
+            },
+            |content| {
+                content
+                    .fill(Rect::new(1.0, 1.0, 7.0, 7.0), peniko::Color::BLACK)
+                    .draw();
+            },
+        );
+
+        assert_eq!(
+            scene.commands(),
+            &[
+                record::Command::PushGroup(record::GroupId(0)),
+                record::Command::Draw(record::DrawId(0)),
+                record::Command::PopGroup,
+            ]
+        );
+        assert_eq!(scene.mask(record::MaskId(0)).scene.commands().len(), 1);
+        let group = scene.group(record::GroupId(0));
+        let mask = group.mask.as_ref().expect("expected group mask");
+        assert_eq!(scene.mask(mask.mask).mode, MaskMode::Alpha);
+    }
+
+    #[test]
+    fn record_mask_returns_reusable_mask_definition() {
+        let mask = Painter::<record::Scene>::record_mask(MaskMode::Luminance, |mask| {
+            mask.fill(Rect::new(0.0, 0.0, 8.0, 8.0), peniko::Color::WHITE)
+                .draw();
+        });
+
+        assert_eq!(mask.scene.commands().len(), 1);
+        assert_eq!(mask.mode, MaskMode::Luminance);
     }
 }
 

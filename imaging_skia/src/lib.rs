@@ -123,7 +123,9 @@ use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
 use peniko::{BrushRef, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
+use std::{cell::RefCell, rc::Rc};
 
+use sinks::MaskCache;
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 
 /// Errors that can occur when rendering via Skia.
@@ -154,6 +156,7 @@ pub struct SkiaRenderer {
     width: i32,
     height: i32,
     tolerance: f64,
+    mask_cache: Rc<RefCell<MaskCache>>,
 }
 
 impl SkiaRenderer {
@@ -178,12 +181,25 @@ impl SkiaRenderer {
             width,
             height,
             tolerance: 0.1,
+            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
         }
     }
 
     /// Set the tolerance used when converting shapes to paths.
     pub fn set_tolerance(&mut self, tolerance: f64) {
+        if self.tolerance != tolerance {
+            self.mask_cache.borrow_mut().clear();
+        }
         self.tolerance = tolerance;
+    }
+
+    /// Drop any realized mask artifacts cached by the renderer.
+    ///
+    /// The cache is renderer-scoped so unchanged masked subscenes can be reused across renders.
+    /// Call this if you need to release memory aggressively or after changing assumptions that
+    /// affect mask realization outside the recorded scene itself.
+    pub fn clear_cached_masks(&mut self) {
+        self.mask_cache.borrow_mut().clear();
     }
 
     fn reset(&mut self) {
@@ -197,7 +213,8 @@ impl SkiaRenderer {
     pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         self.reset();
-        let mut sink = SkCanvasSink::new(self.surface.canvas());
+        let mut sink =
+            SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
         sink.set_tolerance(self.tolerance);
         replay(scene, &mut sink);
         sink.finish()?;
@@ -666,9 +683,34 @@ fn build_filter_chain(filters: &[Filter]) -> Option<sk::ImageFilter> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::Painter;
+    use imaging::{GroupRef, MaskMode, Painter};
     use kurbo::Rect;
     use peniko::{Brush, Color};
+
+    fn masked_scene(mode: MaskMode) -> Scene {
+        let mask = Painter::<Scene>::record_mask(mode, |mask| {
+            mask.fill(
+                Rect::new(8.0, 8.0, 56.0, 56.0),
+                Color::from_rgba8(255, 255, 255, 160),
+            )
+            .draw();
+        });
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.with_group(GroupRef::new().with_mask(mask.as_ref()), |content| {
+                content
+                    .fill(
+                        Rect::new(0.0, 0.0, 64.0, 64.0),
+                        Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                    )
+                    .draw();
+            });
+        }
+
+        scene
+    }
 
     #[test]
     fn render_picture_rgba8_reads_native_picture() {
@@ -685,5 +727,44 @@ mod tests {
 
         assert_eq!(rgba.len(), 32 * 32 * 4);
         assert_eq!(&rgba[..4], &[0x22, 0x66, 0xaa, 0xff]);
+    }
+
+    #[test]
+    fn render_scene_reuses_cached_masks_for_identical_scenes() {
+        let scene = masked_scene(MaskMode::Alpha);
+        let mut renderer = SkiaRenderer::new(64, 64);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+    }
+
+    #[test]
+    fn clear_cached_masks_drops_realized_masks() {
+        let scene = masked_scene(MaskMode::Luminance);
+        let mut renderer = SkiaRenderer::new(64, 64);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+
+        renderer.clear_cached_masks();
+        assert_eq!(renderer.mask_cache.borrow().len(), 0);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+    }
+
+    #[test]
+    fn changing_tolerance_clears_cached_masks() {
+        let scene = masked_scene(MaskMode::Alpha);
+        let mut renderer = SkiaRenderer::new(64, 64);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+
+        renderer.set_tolerance(0.25);
+        assert_eq!(renderer.mask_cache.borrow().len(), 0);
     }
 }

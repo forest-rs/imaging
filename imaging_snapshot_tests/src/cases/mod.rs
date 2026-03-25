@@ -10,6 +10,7 @@ mod clips;
 mod filters;
 mod gradients;
 mod images;
+mod masks;
 mod strokes;
 mod text;
 mod util;
@@ -99,6 +100,8 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &gradients::GmGradientsSweep,
     &gradients::GmGradientsTwoPointRadial,
     &images::GmImageBrushes,
+    &masks::GmMaskAlpha,
+    &masks::GmMaskLuminance,
     &clips::GmClipNonIsolated,
     &clips::GmClipStrokeNested,
     &filters::GmGroupBlurFilter,

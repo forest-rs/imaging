@@ -1,10 +1,11 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use super::{Error, LayerKind};
+use super::Error;
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
+    PaintSink, StrokeRef,
+    record::{Scene, replay_transformed},
 };
 use kurbo::{Affine, Rect};
 use peniko::{Brush, BrushRef, Fill};
@@ -19,7 +20,20 @@ pub struct VelloSceneSink<'a> {
     scene: &'a mut vello::Scene,
     surface_clip: Rect,
     error: Option<Error>,
-    layer_stack: Vec<LayerKind>,
+    layer_stack: Vec<LayerFrame>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMask {
+    scene: Scene,
+    mode: MaskMode,
+    transform: Affine,
+}
+
+#[derive(Clone, Debug)]
+enum LayerFrame {
+    Clip,
+    Group { mask: Option<PendingMask> },
 }
 
 impl core::fmt::Debug for VelloSceneSink<'_> {
@@ -70,16 +84,30 @@ impl<'a> VelloSceneSink<'a> {
         }
     }
 
-    fn push_layer_kind(&mut self, kind: LayerKind) {
-        self.layer_stack.push(kind);
+    fn push_clip_frame(&mut self) {
+        self.layer_stack.push(LayerFrame::Clip);
     }
 
-    fn pop_layer_kind(&mut self, expected: LayerKind) -> bool {
+    fn push_group_frame(&mut self, mask: Option<PendingMask>) {
+        self.layer_stack.push(LayerFrame::Group { mask });
+    }
+
+    fn pop_clip_frame(&mut self) -> bool {
         match self.layer_stack.pop() {
-            Some(kind) if kind == expected => true,
+            Some(LayerFrame::Clip) => true,
             _ => {
                 self.set_error_once(Error::UnbalancedLayerStack);
                 false
+            }
+        }
+    }
+
+    fn pop_group_frame(&mut self) -> Option<Option<PendingMask>> {
+        match self.layer_stack.pop() {
+            Some(LayerFrame::Group { mask }) => Some(mask),
+            _ => {
+                self.set_error_once(Error::UnbalancedLayerStack);
+                None
             }
         }
     }
@@ -129,6 +157,10 @@ impl<'a> VelloSceneSink<'a> {
             draw.std_dev,
         );
     }
+
+    fn replay_masked_subscene(&mut self, scene: &Scene, transform: Affine) {
+        replay_transformed(scene, self, transform);
+    }
 }
 
 impl PaintSink for VelloSceneSink<'_> {
@@ -161,14 +193,14 @@ impl PaintSink for VelloSceneSink<'_> {
                 GeometryRef::OwnedPath(p) => self.scene.push_clip_layer(stroke, transform, &p),
             },
         }
-        self.push_layer_kind(LayerKind::Clip);
+        self.push_clip_frame();
     }
 
     fn pop_clip(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if !self.pop_layer_kind(LayerKind::Clip) {
+        if !self.pop_clip_frame() {
             return;
         }
         self.scene.pop_layer();
@@ -180,6 +212,14 @@ impl PaintSink for VelloSceneSink<'_> {
         }
         if !group.filters.is_empty() {
             self.set_error_once(Error::UnsupportedFilter);
+            return;
+        }
+        if group
+            .mask
+            .as_ref()
+            .is_some_and(|mask| mask.mask.mode != MaskMode::Luminance)
+        {
+            self.set_error_once(Error::UnsupportedMask);
             return;
         }
 
@@ -263,15 +303,34 @@ impl PaintSink for VelloSceneSink<'_> {
                 &self.surface_clip,
             );
         }
-        self.push_layer_kind(LayerKind::Group);
+        self.push_group_frame(group.mask.map(|mask| PendingMask {
+            scene: mask.mask.scene.clone(),
+            mode: mask.mask.mode,
+            transform: mask.transform,
+        }));
     }
 
     fn pop_group(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if !self.pop_layer_kind(LayerKind::Group) {
+        let Some(mask) = self.pop_group_frame() else {
             return;
+        };
+        if let Some(mask) = mask {
+            debug_assert_eq!(
+                mask.mode,
+                MaskMode::Luminance,
+                "only luminance masks should reach Vello group-mask replay"
+            );
+            self.scene.push_luminance_mask_layer(
+                Fill::NonZero,
+                1.0,
+                Affine::IDENTITY,
+                &self.surface_clip,
+            );
+            self.replay_masked_subscene(&mask.scene, mask.transform);
+            self.scene.pop_layer();
         }
         self.scene.pop_layer();
     }
@@ -312,7 +371,7 @@ impl PaintSink for VelloSceneSink<'_> {
                         .push_layer(draw.fill_rule, blend, 1.0, draw.transform, p);
                 }
             }
-            self.push_layer_kind(LayerKind::Group);
+            self.push_group_frame(None);
         }
 
         match draw.shape {
@@ -355,7 +414,7 @@ impl PaintSink for VelloSceneSink<'_> {
         }
 
         if blend != peniko::BlendMode::default() {
-            if !self.pop_layer_kind(LayerKind::Group) {
+            if self.pop_group_frame().is_none() {
                 return;
             }
             self.scene.pop_layer();
@@ -398,7 +457,7 @@ impl PaintSink for VelloSceneSink<'_> {
                         .push_layer(draw.stroke, blend, 1.0, draw.transform, p);
                 }
             }
-            self.push_layer_kind(LayerKind::Group);
+            self.push_group_frame(None);
         }
 
         match draw.shape {
@@ -436,7 +495,7 @@ impl PaintSink for VelloSceneSink<'_> {
         }
 
         if blend != peniko::BlendMode::default() {
-            if !self.pop_layer_kind(LayerKind::Group) {
+            if self.pop_group_frame().is_none() {
                 return;
             }
             self.scene.pop_layer();
@@ -465,7 +524,8 @@ impl PaintSink for VelloSceneSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::Filter;
+    use imaging::{Filter, MaskMode, MaskRef};
+    use peniko::Color;
 
     #[test]
     fn vello_scene_sink_reports_unbalanced_layer_stack() {
@@ -481,5 +541,29 @@ mod tests {
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+    }
+
+    #[test]
+    fn vello_scene_sink_supports_luminance_masks() {
+        let mut mask = Scene::new();
+        mask.fill(FillRef::new(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE));
+
+        let mut scene = vello::Scene::new();
+        let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
+        sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Luminance, &mask)));
+        sink.fill(FillRef::new(Rect::new(4.0, 4.0, 20.0, 20.0), Color::BLACK));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Ok(())));
+    }
+
+    #[test]
+    fn vello_scene_sink_rejects_alpha_masks() {
+        let mut mask = Scene::new();
+        mask.fill(FillRef::new(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE));
+
+        let mut scene = vello::Scene::new();
+        let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
+        sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Alpha, &mask)));
+        assert!(matches!(sink.finish(), Err(Error::UnsupportedMask)));
     }
 }

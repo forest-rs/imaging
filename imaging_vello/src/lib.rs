@@ -113,6 +113,8 @@ pub enum Error {
     UnsupportedImageBrush,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
+    /// A mask mode or masking primitive is not supported by this backend.
+    UnsupportedMask,
     /// Glyph draws with non-default blend modes are not supported by this backend yet.
     UnsupportedGlyphBlend,
     /// Blurred rounded rect draws with non-default blend modes are not supported by this backend yet.
@@ -131,12 +133,6 @@ pub enum Error {
     Render(vello::Error),
     /// An internal invariant was violated.
     Internal(&'static str),
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LayerKind {
-    Clip,
-    Group,
 }
 
 /// Renderer that executes `imaging` commands using `vello` + `wgpu`.

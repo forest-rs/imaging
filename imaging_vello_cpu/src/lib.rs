@@ -63,11 +63,12 @@
 
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
-    PaintSink, StrokeRef,
-    record::{Scene, ValidateError, replay},
+    MaskMode, PaintSink, StrokeRef,
+    record::{Scene, ValidateError, replay, replay_transformed},
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
+use std::collections::VecDeque;
 use std::vec::Vec;
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::glyph::Glyph as VelloGlyph;
@@ -98,6 +99,15 @@ pub struct VelloCpuRenderer {
     error: Option<Error>,
     clip_depth: u32,
     group_depth: u32,
+    mask_cache: VecDeque<CachedMask>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMask {
+    scene: Scene,
+    mode: MaskMode,
+    transform: Affine,
+    mask: vello_cpu::Mask,
 }
 
 impl VelloCpuRenderer {
@@ -118,12 +128,16 @@ impl VelloCpuRenderer {
             error: None,
             clip_depth: 0,
             group_depth: 0,
+            mask_cache: VecDeque::new(),
         }
     }
 
     /// Set the tolerance used when converting shapes to paths.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        self.tolerance = tolerance;
+        if self.tolerance != tolerance {
+            self.tolerance = tolerance;
+            self.clear_cached_masks();
+        }
     }
 
     /// Reset the internal Vello CPU context and local error state.
@@ -132,6 +146,15 @@ impl VelloCpuRenderer {
         self.error = None;
         self.clip_depth = 0;
         self.group_depth = 0;
+    }
+
+    /// Drop any realized mask artifacts cached by the renderer.
+    ///
+    /// The cache is renderer-scoped so unchanged masked subscenes can be reused across renders.
+    /// Call this if you need to release memory aggressively or after changing assumptions that
+    /// affect mask realization outside the recorded scene itself.
+    pub fn clear_cached_masks(&mut self) {
+        self.mask_cache.clear();
     }
 
     /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
@@ -329,6 +352,74 @@ impl VelloCpuRenderer {
             f64_to_f32(draw.std_dev),
         );
     }
+
+    fn render_mask(
+        &mut self,
+        scene: &Scene,
+        mode: MaskMode,
+        transform: Affine,
+    ) -> Option<vello_cpu::Mask> {
+        if let Some(mask) = self.lookup_cached_mask(scene, mode, transform) {
+            return Some(mask);
+        }
+
+        let mut renderer = Self::new(self.width, self.height);
+        renderer.set_tolerance(self.tolerance);
+        replay_transformed(scene, &mut renderer, transform);
+        if let Some(err) = renderer.error.take() {
+            self.set_error_once(err);
+            return None;
+        }
+        if renderer.clip_depth != 0 {
+            self.set_error_once(Error::Internal("unbalanced clip stack in mask scene"));
+            return None;
+        }
+        if renderer.group_depth != 0 {
+            self.set_error_once(Error::Internal("unbalanced group stack in mask scene"));
+            return None;
+        }
+
+        let mut pixmap = Pixmap::new(self.width, self.height);
+        renderer.ctx.flush();
+        renderer.ctx.render_to_pixmap(&mut pixmap);
+        let mask = match mode {
+            MaskMode::Alpha => vello_cpu::Mask::new_alpha(&pixmap),
+            MaskMode::Luminance => vello_cpu::Mask::new_luminance(&pixmap),
+        };
+        self.store_cached_mask(scene, mode, transform, mask.clone());
+        Some(mask)
+    }
+
+    fn lookup_cached_mask(
+        &self,
+        scene: &Scene,
+        mode: MaskMode,
+        transform: Affine,
+    ) -> Option<vello_cpu::Mask> {
+        self.mask_cache
+            .iter()
+            .find(|entry| {
+                entry.mode == mode && entry.transform == transform && entry.scene == *scene
+            })
+            .map(|entry| entry.mask.clone())
+    }
+
+    fn store_cached_mask(
+        &mut self,
+        scene: &Scene,
+        mode: MaskMode,
+        transform: Affine,
+        mask: vello_cpu::Mask,
+    ) {
+        // TODO: If more backends end up wanting realized-mask caches, add a portable scene/cache
+        // key at the imaging layer instead of retaining whole scenes in backend-local caches.
+        self.mask_cache.push_back(CachedMask {
+            scene: scene.clone(),
+            mode,
+            transform,
+            mask,
+        });
+    }
 }
 
 #[inline]
@@ -381,9 +472,12 @@ impl PaintSink for VelloCpuRenderer {
 
         let blend: Option<BlendMode> = Some(group.composite.blend);
         let opacity: Option<f32> = Some(group.composite.alpha);
+        let mask = group
+            .mask
+            .and_then(|mask| self.render_mask(mask.mask.scene, mask.mask.mode, mask.transform));
         let filter = self.filters_to_vello(group.filters);
         self.ctx
-            .push_layer(clip_path.as_ref(), blend, opacity, None, filter);
+            .push_layer(clip_path.as_ref(), blend, opacity, mask, filter);
         self.group_depth += 1;
     }
 
@@ -467,5 +561,87 @@ impl PaintSink for VelloCpuRenderer {
             return;
         }
         self.draw_blurred_rounded_rect(draw);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imaging::Painter;
+    use kurbo::Rect;
+    use peniko::Color;
+
+    fn masked_scene(mode: MaskMode) -> Scene {
+        let mut mask = Scene::new();
+        {
+            let mut painter = Painter::new(&mut mask);
+            painter
+                .fill(
+                    Rect::new(8.0, 8.0, 56.0, 56.0),
+                    Color::from_rgba8(255, 255, 255, 160),
+                )
+                .draw();
+        }
+
+        let mut content = Scene::new();
+        {
+            let mut painter = Painter::new(&mut content);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 64.0, 64.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+
+        let mut scene = Scene::new();
+        let mask_id = scene.define_mask(imaging::record::Mask::new(mode, mask));
+        let group = imaging::record::Group {
+            mask: Some(imaging::record::AppliedMask::new(mask_id)),
+            ..imaging::record::Group::default()
+        };
+        scene.push_group(group);
+        replay(&content, &mut scene);
+        scene.pop_group();
+        scene
+    }
+
+    #[test]
+    fn render_scene_reuses_cached_masks_for_identical_scenes() {
+        let scene = masked_scene(MaskMode::Alpha);
+        let mut renderer = VelloCpuRenderer::new(64, 64);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.len(), 1);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.len(), 1);
+    }
+
+    #[test]
+    fn clear_cached_masks_drops_realized_masks() {
+        let scene = masked_scene(MaskMode::Luminance);
+        let mut renderer = VelloCpuRenderer::new(64, 64);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.len(), 1);
+
+        renderer.clear_cached_masks();
+        assert!(renderer.mask_cache.is_empty());
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.len(), 1);
+    }
+
+    #[test]
+    fn changing_tolerance_clears_cached_masks() {
+        let scene = masked_scene(MaskMode::Alpha);
+        let mut renderer = VelloCpuRenderer::new(64, 64);
+
+        renderer.render_scene_rgba8(&scene).unwrap();
+        assert_eq!(renderer.mask_cache.len(), 1);
+
+        renderer.set_tolerance(0.25);
+        assert!(renderer.mask_cache.is_empty());
     }
 }

@@ -113,12 +113,24 @@ pub mod record;
 pub mod validation;
 
 pub use paint::{
-    ClipRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef,
+    AppliedMaskRef, ClipRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskRef,
+    PaintSink, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
 
 /// Normalized variable-font coordinate value.
 pub type NormalizedCoord = i16;
+
+/// How a mask scene modulates a masked content scene.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MaskMode {
+    /// Use the mask scene's alpha channel.
+    Alpha,
+    /// Use the mask scene's luminance.
+    ///
+    /// This follows SVG/CSS masking behavior where premultiplied RGB contributes to the mask value.
+    Luminance,
+}
 
 /// Description of a filter effect applied to an isolated group.
 #[derive(Copy, Clone, Debug, PartialEq)]

@@ -245,6 +245,10 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         if self.error.is_some() {
             return;
         }
+        if group.mask.is_some() {
+            self.set_error_once(Error::UnsupportedMask);
+            return;
+        }
         if !group.filters.is_empty() {
             self.set_error_once(Error::UnsupportedFilter);
             return;
@@ -367,7 +371,7 @@ impl PaintSink for VelloHybridSceneSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::Filter;
+    use imaging::{Filter, MaskMode, MaskRef, record};
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
     use std::sync::Arc;
 
@@ -406,5 +410,30 @@ mod tests {
         }));
         sink.fill(FillRef::new(kurbo::Rect::new(0.0, 0.0, 8.0, 8.0), &image));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedImageBrush)));
+    }
+
+    #[test]
+    fn hybrid_scene_sink_rejects_masks() {
+        let mut mask = record::Scene::new();
+        mask.fill(FillRef::new(
+            kurbo::Rect::new(0.0, 0.0, 8.0, 8.0),
+            peniko::Color::WHITE,
+        ));
+        let mut content = record::Scene::new();
+        content.fill(FillRef::new(
+            kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
+            peniko::Color::BLACK,
+        ));
+
+        let mut scene = vello_hybrid::Scene::new(32, 32);
+        scene.reset();
+        let mut sink = VelloHybridSceneSink::new(&mut scene);
+        sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Luminance, &mask)));
+        sink.fill(FillRef::new(
+            kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
+            peniko::Color::BLACK,
+        ));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Err(Error::UnsupportedMask)));
     }
 }

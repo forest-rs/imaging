@@ -11,9 +11,10 @@ use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
 use peniko::{BrushRef, Fill, Style};
 
 use crate::{
-    BlurredRoundedRect, Composite, Filter, NormalizedCoord,
+    BlurredRoundedRect, Composite, Filter, MaskMode, NormalizedCoord,
     record::{
-        Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group, GroupId, Scene,
+        AppliedMask, Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group,
+        GroupId, Mask, MaskId, Scene,
     },
 };
 
@@ -232,6 +233,8 @@ impl<'a> ClipRef<'a> {
 pub struct GroupRef<'a> {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<ClipRef<'a>>,
+    /// Optional retained mask applied to the group result before compositing.
+    pub mask: Option<AppliedMaskRef<'a>>,
     /// Optional filter chain applied to the group result before compositing.
     pub filters: &'a [Filter],
     /// Compositing parameters used when merging the group into its parent.
@@ -244,6 +247,7 @@ impl<'a> GroupRef<'a> {
     pub fn new() -> Self {
         Self {
             clip: None,
+            mask: None,
             filters: &[],
             composite: Composite::default(),
         }
@@ -253,6 +257,24 @@ impl<'a> GroupRef<'a> {
     #[must_use]
     pub fn with_clip(mut self, clip: ClipRef<'a>) -> Self {
         self.clip = Some(clip);
+        self
+    }
+
+    /// Set the retained mask applied to the group result.
+    ///
+    /// The mask's interpretation comes from the [`MaskRef`] itself.
+    #[must_use]
+    pub fn with_mask(mut self, mask: MaskRef<'a>) -> Self {
+        self.mask = Some(AppliedMaskRef::new(mask));
+        self
+    }
+
+    /// Set the retained mask applied to the group result with an explicit mask transform.
+    ///
+    /// The mask's interpretation comes from the [`MaskRef`] itself.
+    #[must_use]
+    pub fn with_mask_transformed(mut self, mask: MaskRef<'a>, transform: Affine) -> Self {
+        self.mask = Some(AppliedMaskRef::new(mask).transform(transform));
         self
     }
 
@@ -270,11 +292,13 @@ impl<'a> GroupRef<'a> {
         self
     }
 
-    /// Convert a borrowed group payload into an owned [`Group`].
-    #[must_use]
-    pub fn to_owned(self) -> Group {
+    pub(crate) fn into_owned_with(
+        self,
+        define_mask: &mut impl FnMut(MaskRef<'_>) -> MaskId,
+    ) -> Group {
         Group {
             clip: self.clip.map(ClipRef::to_owned),
+            mask: self.mask.map(|mask| mask.into_owned_with(define_mask)),
             filters: self.filters.to_vec(),
             composite: self.composite,
         }
@@ -284,6 +308,7 @@ impl<'a> GroupRef<'a> {
     pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
         Self {
             clip: self.clip.map(|clip| clip.prepend_transform(prefix)),
+            mask: self.mask.map(|mask| mask.prepend_transform(prefix)),
             ..self
         }
     }
@@ -292,6 +317,77 @@ impl<'a> GroupRef<'a> {
 impl<'a> Default for GroupRef<'a> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Borrowed retained mask definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskRef<'a> {
+    /// How this mask scene modulates masked content.
+    pub mode: MaskMode,
+    /// Scene that produces the mask values.
+    pub scene: &'a Scene,
+}
+
+impl<'a> MaskRef<'a> {
+    /// Create a borrowed mask definition.
+    #[must_use]
+    pub fn new(mode: MaskMode, scene: &'a Scene) -> Self {
+        Self { mode, scene }
+    }
+
+    /// Convert a borrowed mask definition into an owned [`Mask`].
+    #[must_use]
+    pub fn to_owned(self) -> Mask {
+        Mask {
+            mode: self.mode,
+            scene: self.scene.clone(),
+        }
+    }
+}
+
+/// Borrowed use of a retained mask within an isolated group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppliedMaskRef<'a> {
+    /// Referenced mask definition.
+    pub mask: MaskRef<'a>,
+    /// Transform applied when realizing the mask scene.
+    pub transform: Affine,
+}
+
+impl<'a> AppliedMaskRef<'a> {
+    /// Create a mask use with an identity transform.
+    #[must_use]
+    pub fn new(mask: MaskRef<'a>) -> Self {
+        Self {
+            mask,
+            transform: Affine::IDENTITY,
+        }
+    }
+
+    /// Set the transform applied when realizing the mask scene.
+    #[must_use]
+    pub fn transform(mut self, transform: Affine) -> Self {
+        self.transform = transform;
+        self
+    }
+
+    pub(crate) fn into_owned_with(
+        self,
+        define_mask: &mut impl FnMut(MaskRef<'_>) -> MaskId,
+    ) -> AppliedMask {
+        AppliedMask {
+            mask: define_mask(self.mask),
+            transform: self.transform,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            transform: prefix * self.transform,
+            ..self
+        }
     }
 }
 
@@ -634,11 +730,37 @@ impl Clip {
 impl Group {
     /// Borrow this group as a [`GroupRef`].
     #[must_use]
-    pub fn as_ref(&self) -> GroupRef<'_> {
+    pub fn as_ref_with<'a>(&'a self, scene: &'a Scene) -> GroupRef<'a> {
         GroupRef {
             clip: self.clip.as_ref().map(Clip::as_ref),
+            mask: self
+                .mask
+                .as_ref()
+                .map(|mask| mask.as_ref(scene.mask(mask.mask))),
             filters: &self.filters,
             composite: self.composite,
+        }
+    }
+}
+
+impl Mask {
+    /// Borrow this mask as a [`MaskRef`].
+    #[must_use]
+    pub fn as_ref(&self) -> MaskRef<'_> {
+        MaskRef {
+            mode: self.mode,
+            scene: &self.scene,
+        }
+    }
+}
+
+impl AppliedMask {
+    /// Borrow this mask use as an [`AppliedMaskRef`].
+    #[must_use]
+    pub fn as_ref<'a>(&self, mask: &'a Mask) -> AppliedMaskRef<'a> {
+        AppliedMaskRef {
+            mask: mask.as_ref(),
+            transform: self.transform,
         }
     }
 }
@@ -758,7 +880,7 @@ fn replay_group<S>(scene: &Scene, id: GroupId, sink: &mut S)
 where
     S: PaintSink + ?Sized,
 {
-    sink.push_group(scene.group(id).as_ref());
+    sink.push_group(scene.group(id).as_ref_with(scene));
 }
 
 fn replay_draw<S>(scene: &Scene, id: DrawId, sink: &mut S)
@@ -849,10 +971,25 @@ mod tests {
                     shape: GeometryRef::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
                     stroke: &stroke,
                 }),
+                mask: None,
                 filters: &[],
                 composite: Composite::default(),
             }
         );
+    }
+
+    #[test]
+    fn group_ref_mask_helpers_set_transform() {
+        let mask_scene = Scene::new();
+        let group = GroupRef::new().with_mask_transformed(
+            MaskRef::new(MaskMode::Luminance, &mask_scene),
+            Affine::translate((3.0, 4.0)),
+        );
+
+        let mask = group.mask.expect("expected mask");
+        assert_eq!(mask.mask.mode, MaskMode::Luminance);
+        assert_eq!(mask.transform, Affine::translate((3.0, 4.0)));
+        assert_eq!(mask.mask, MaskRef::new(MaskMode::Luminance, &mask_scene));
     }
 
     #[test]
@@ -925,6 +1062,7 @@ mod tests {
                 shape: Geometry::Rect(Rect::new(0.0, 0.0, 7.0, 8.0)),
                 stroke: Stroke::new(2.0),
             }),
+            mask: None,
             filters: vec![],
             composite: Composite::default(),
         });
@@ -993,6 +1131,7 @@ mod tests {
                     shape: Geometry::Rect(Rect::new(0.0, 0.0, 7.0, 8.0)),
                     stroke: Stroke::new(2.0),
                 }),
+                mask: None,
                 filters: vec![],
                 composite: Composite::default(),
             }
