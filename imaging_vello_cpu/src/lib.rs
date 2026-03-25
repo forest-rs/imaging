@@ -60,7 +60,12 @@
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![no_std]
+extern crate alloc;
 
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
     MaskMode, PaintSink, StrokeRef,
@@ -68,8 +73,6 @@ use imaging::{
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
-use std::collections::VecDeque;
-use std::vec::Vec;
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::glyph::Glyph as VelloGlyph;
 use vello_common::paint::{Image as VelloImage, ImageSource};
@@ -281,7 +284,7 @@ impl VelloCpuRenderer {
             return None;
         }
         Some(VelloFilter {
-            graph: std::sync::Arc::new(graph),
+            graph: Arc::new(graph),
         })
     }
 

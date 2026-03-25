@@ -23,7 +23,6 @@ env:
     --exclude imaging_skia
     --exclude imaging_snapshot_tests
     --exclude imaging_vello
-    --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
     --exclude xtask
@@ -33,7 +32,6 @@ env:
     --exclude imaging_skia
     --exclude imaging_snapshot_tests
     --exclude imaging_vello
-    --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
     --exclude xtask
@@ -43,7 +41,6 @@ env:
     --exclude imaging_skia
     --exclude imaging_snapshot_tests
     --exclude imaging_vello
-    --exclude imaging_vello_cpu
     --exclude imaging_vello_hybrid
     --exclude imaging_wind_tunnel
     --exclude xtask
