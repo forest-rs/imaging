@@ -3,6 +3,8 @@
 
 //! Image snapshot tests for `imaging_vello_cpu` using `kompari`.
 
+#![cfg(feature = "vello_cpu")]
+
 use kompari::Image;
 
 use imaging_snapshot_tests::cases::{DEFAULT_HEIGHT, DEFAULT_WIDTH, build_scene};
