@@ -5,7 +5,7 @@
 
 #![cfg(feature = "skia")]
 
-use imaging_skia::SkiaRenderer;
+use imaging_skia::SkiaCpuRenderer;
 use imaging_snapshot_tests::cases::{DEFAULT_HEIGHT, DEFAULT_WIDTH, build_scene};
 
 mod common;
@@ -17,11 +17,7 @@ fn snapshots() {
     let w = f64::from(width);
     let h = f64::from(height);
 
-    let Some(mut renderer) =
-        common::try_init_or_skip("skia", || SkiaRenderer::try_new(width, height))
-    else {
-        return;
-    };
+    let mut renderer = SkiaCpuRenderer::new(width, height);
 
     let mut errors = Vec::new();
     common::run_cases_with(

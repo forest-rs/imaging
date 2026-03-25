@@ -249,6 +249,41 @@ pub struct SkiaRenderer {
     backend: GaneshBackend,
     surface: sk::Surface,
     tolerance: f64,
+    mask_cache: Rc<RefCell<MaskCache>>,
+    #[cfg(feature = "wgpu")]
+    wgpu_backend_keepalive: Option<WgpuDeviceQueueKeepalive>,
+    #[cfg(feature = "wgpu")]
+    wgpu_target_keepalive: Option<WgpuTextureHandle>,
+}
+
+#[cfg(feature = "wgpu")]
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "These handles are retained only to extend native backend lifetimes."
+)]
+struct WgpuTextureHandle {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+#[cfg(feature = "wgpu")]
+impl WgpuTextureHandle {
+    fn new(texture: wgpu::Texture) -> Self {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { texture, view }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "These handles are retained only to extend native backend lifetimes."
+)]
+struct WgpuDeviceQueueKeepalive {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
 }
 
 impl SkiaRenderer {
@@ -281,6 +316,11 @@ impl SkiaRenderer {
             backend,
             surface,
             tolerance: 0.1,
+            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
+            #[cfg(feature = "wgpu")]
+            wgpu_backend_keepalive: None,
+            #[cfg(feature = "wgpu")]
+            wgpu_target_keepalive: None,
         }
     }
 
@@ -289,7 +329,29 @@ impl SkiaRenderer {
     /// Lower values preserve curve fidelity more aggressively; higher values can reduce path
     /// complexity when rendering highly curved geometry.
     pub fn set_tolerance(&mut self, tolerance: f64) {
+        if self.tolerance != tolerance {
+            self.mask_cache.borrow_mut().clear();
+        }
         self.tolerance = tolerance;
+    }
+
+    /// Drop any realized mask artifacts cached by the renderer.
+    ///
+    /// The cache is renderer-scoped so unchanged masked subscenes can be reused across renders.
+    /// Call this if you need to release memory aggressively or after changing assumptions that
+    /// affect mask realization outside the recorded scene itself.
+    pub fn clear_cached_masks(&mut self) {
+        self.mask_cache.borrow_mut().clear();
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn set_wgpu_backend_keepalive(&mut self, keepalive: WgpuDeviceQueueKeepalive) {
+        self.wgpu_backend_keepalive = Some(keepalive);
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn set_wgpu_target_keepalive(&mut self, keepalive: WgpuTextureHandle) {
+        self.wgpu_target_keepalive = Some(keepalive);
     }
 }
 
@@ -300,13 +362,23 @@ impl SkiaRenderer {
     /// Unlike [`Self::try_new_from_wgpu_texture`], this path does not wrap a caller-owned texture.
     /// It rebuilds the platform backend from `wgpu` and then allocates an internal Skia render
     /// target, so it is the right choice when you care about backend sharing but not about drawing
-    /// into a specific external texture.
+    /// into a specific external texture. The renderer clones and retains the supplied `wgpu`
+    /// handles so the wrapped backend objects stay alive for the renderer.
     pub fn try_new_from_wgpu_device(
         width: u16,
         height: u16,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<Self, Error> {
+        #[allow(
+            unused_variables,
+            reason = "Platform cfgs may compile out all interop branches."
+        )]
+        let keepalive = WgpuDeviceQueueKeepalive {
+            device: device.clone(),
+            queue: queue.clone(),
+        };
+
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let device = unsafe {
@@ -321,14 +393,16 @@ impl SkiaRenderer {
             };
             let device = device.raw_device().as_ptr() as *mut c_void;
             let command_queue = queue.as_raw().lock().as_ptr() as *mut c_void;
-            return unsafe {
+            let mut renderer = unsafe {
                 Self::try_new_metal_from_raw_pointers_without_texture(
                     width,
                     height,
                     device,
                     command_queue,
                 )
-            };
+            }?;
+            renderer.set_wgpu_backend_keepalive(keepalive);
+            return Ok(renderer);
         }
 
         #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
@@ -350,7 +424,7 @@ impl SkiaRenderer {
             let raw_device = device.raw_device().handle();
             let raw_queue = queue.as_raw();
             let queue_family_index = device.queue_family_index();
-            return unsafe {
+            let mut renderer = unsafe {
                 Self::try_new_vulkan_from_raw_handles(
                     width,
                     height,
@@ -360,7 +434,9 @@ impl SkiaRenderer {
                     raw_queue,
                     queue_family_index,
                 )
-            };
+            }?;
+            renderer.set_wgpu_backend_keepalive(keepalive);
+            return Ok(renderer);
         }
 
         #[allow(
@@ -374,15 +450,23 @@ impl SkiaRenderer {
     /// Create a renderer that targets an owned `wgpu` texture.
     ///
     /// This is the high-level interop entry point when the caller already works in `wgpu` terms and
-    /// wants `imaging_skia` to attach to that device/queue/texture tuple. Use
-    /// [`Self::try_new_from_wgpu_device`] instead when you only want to share the backend and let
-    /// `imaging_skia` allocate its own offscreen target surface.
+    /// wants `imaging_skia` to attach to that device/queue/texture tuple while taking ownership of
+    /// the render target handle. Use [`Self::try_new_from_wgpu_device`] instead when you only want
+    /// to share the backend and let `imaging_skia` allocate its own offscreen target surface.
     pub fn try_new_from_wgpu_texture(
         texture_format: wgpu::TextureFormat,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: wgpu::Texture,
     ) -> Result<Self, Error> {
+        initialize_texture_for_wgpu(device, queue, &texture);
+        let texture_keepalive = WgpuTextureHandle::new(texture);
+        let texture_size = texture_keepalive.texture.size();
+        let width = u16::try_from(texture_size.width)
+            .map_err(|_| Error::Internal("texture width exceeds skia limit"))?;
+        let height = u16::try_from(texture_size.height)
+            .map_err(|_| Error::Internal("texture height exceeds skia limit"))?;
+
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let hal_device = unsafe {
@@ -404,7 +488,7 @@ impl SkiaRenderer {
             let raw_device = hal_device.raw_device().as_ptr() as *mut c_void;
             let raw_command_queue = hal_queue.as_raw().lock().as_ptr() as *mut c_void;
             let texture = unsafe { texture.raw_handle() }.as_ptr() as *mut c_void;
-            return unsafe {
+            let mut renderer = unsafe {
                 Self::try_new_metal_from_raw_pointers(
                     width,
                     height,
@@ -413,7 +497,13 @@ impl SkiaRenderer {
                     raw_command_queue,
                     texture,
                 )
-            };
+            }?;
+            renderer.set_wgpu_backend_keepalive(WgpuDeviceQueueKeepalive {
+                device: device.clone(),
+                queue: queue.clone(),
+            });
+            renderer.set_wgpu_target_keepalive(texture_keepalive);
+            return Ok(renderer);
         }
 
         #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
@@ -444,7 +534,7 @@ impl SkiaRenderer {
             let raw_image = unsafe { texture.raw_handle() };
             let image_layout = ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
             let image_usage_flags = ash::vk::ImageUsageFlags::COLOR_ATTACHMENT;
-            return unsafe {
+            let mut renderer = unsafe {
                 Self::try_new_vulkan_from_raw_handles_and_texture(
                     width,
                     height,
@@ -459,7 +549,13 @@ impl SkiaRenderer {
                     image_usage_flags,
                     1,
                 )
-            };
+            }?;
+            renderer.set_wgpu_backend_keepalive(WgpuDeviceQueueKeepalive {
+                device: device.clone(),
+                queue: queue.clone(),
+            });
+            renderer.set_wgpu_target_keepalive(texture_keepalive);
+            return Ok(renderer);
         }
 
         #[allow(
@@ -484,6 +580,14 @@ impl SkiaRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<(), Error> {
+        initialize_texture_for_wgpu(device, queue, &texture);
+        let texture_keepalive = WgpuTextureHandle::new(texture);
+        let texture_size = texture_keepalive.texture.size();
+        let width = u16::try_from(texture_size.width)
+            .map_err(|_| Error::Internal("texture width exceeds skia limit"))?;
+        let height = u16::try_from(texture_size.height)
+            .map_err(|_| Error::Internal("texture height exceeds skia limit"))?;
+
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let texture = unsafe {
@@ -493,9 +597,9 @@ impl SkiaRenderer {
                     .ok_or(Error::CreateGpuSurface)?
             };
             let texture = unsafe { texture.raw_handle() }.as_ptr() as *mut c_void;
-            return unsafe {
-                self.replace_metal_texture_raw(width, height, texture_format, texture)
-            };
+            unsafe { self.replace_metal_texture_raw(width, height, texture_format, texture) }?;
+            self.set_wgpu_target_keepalive(texture_keepalive);
+            return Ok(());
         }
 
         #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
@@ -511,7 +615,7 @@ impl SkiaRenderer {
                 GaneshBackend::Vulkan(backend) => backend.queue_family_index(),
                 _ => sk::gpu::vk::QUEUE_FAMILY_IGNORED,
             };
-            return unsafe {
+            unsafe {
                 self.replace_vulkan_texture(
                     width,
                     height,
@@ -522,7 +626,9 @@ impl SkiaRenderer {
                     1,
                     queue_family_index,
                 )
-            };
+            }?;
+            self.set_wgpu_target_keepalive(texture_keepalive);
+            return Ok(());
         }
 
         #[allow(
@@ -531,6 +637,20 @@ impl SkiaRenderer {
             reason = "Platform and feature cfgs intentionally leave unsupported backend paths empty."
         )]
         Err(Error::UnsupportedGpuBackend)
+    }
+
+    /// Borrow the live owned `wgpu` texture when the renderer is targeting one.
+    pub fn wgpu_texture(&self) -> Option<&wgpu::Texture> {
+        self.wgpu_target_keepalive
+            .as_ref()
+            .map(|target| &target.texture)
+    }
+
+    /// Borrow the live `wgpu::TextureView` for the currently owned texture.
+    pub fn wgpu_texture_view(&self) -> Option<&wgpu::TextureView> {
+        self.wgpu_target_keepalive
+            .as_ref()
+            .map(|target| &target.view)
     }
 }
 
@@ -554,7 +674,8 @@ impl SkiaRenderer {
         scene.validate().map_err(Error::InvalidScene)?;
         self.backend.ensure_current()?;
         self.reset();
-        let mut sink = SkCanvasSink::new(self.surface.canvas());
+        let mut sink =
+            SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
         sink.set_tolerance(self.tolerance);
         replay(scene, &mut sink);
         sink.finish()?;
@@ -699,7 +820,6 @@ impl SkiaCpuRenderer {
     pub fn clear_cached_masks(&mut self) {
         self.mask_cache.borrow_mut().clear();
     }
-
 
     /// Reset canvas state before rendering a new frame into the raster surface.
     ///

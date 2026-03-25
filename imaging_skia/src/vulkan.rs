@@ -28,12 +28,27 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct VulkanBackend {
     context: sk::gpu::DirectContext,
-    _entry: Entry,
-    instance: Instance,
-    _physical_device: PhysicalDevice,
-    _queue_family_index: u32,
-    device: Arc<Device>,
-    _queue: Queue,
+    handles: VulkanHandles,
+}
+
+#[derive(Debug)]
+enum VulkanHandles {
+    Owned {
+        _entry: Entry,
+        instance: Instance,
+        _physical_device: PhysicalDevice,
+        queue_family_index: u32,
+        device: Arc<Device>,
+        _queue: Queue,
+    },
+    Borrowed {
+        _entry: Entry,
+        instance: Instance,
+        _physical_device: PhysicalDevice,
+        queue_family_index: u32,
+        device: Arc<Device>,
+        _queue: Queue,
+    },
 }
 
 impl VulkanBackend {
@@ -61,12 +76,14 @@ impl VulkanBackend {
 
         Ok(Self {
             context,
-            _entry: entry,
-            instance,
-            _physical_device: physical_device,
-            _queue_family_index: queue_family_index,
-            device,
-            _queue: queue,
+            handles: VulkanHandles::Owned {
+                _entry: entry,
+                instance,
+                _physical_device: physical_device,
+                queue_family_index,
+                device,
+                _queue: queue,
+            },
         })
     }
 
@@ -97,12 +114,14 @@ impl VulkanBackend {
 
         Ok(Self {
             context,
-            _entry: entry,
-            instance,
-            _physical_device: physical_device,
-            _queue_family_index: queue_family_index,
-            device,
-            _queue: queue,
+            handles: VulkanHandles::Borrowed {
+                _entry: entry,
+                instance,
+                _physical_device: physical_device,
+                queue_family_index,
+                device,
+                _queue: queue,
+            },
         })
     }
 
@@ -113,13 +132,33 @@ impl VulkanBackend {
 
     /// Return the queue family index associated with the wrapped graphics queue.
     pub(crate) fn queue_family_index(&self) -> u32 {
-        self._queue_family_index
+        match &self.handles {
+            VulkanHandles::Owned {
+                queue_family_index, ..
+            }
+            | VulkanHandles::Borrowed {
+                queue_family_index, ..
+            } => *queue_family_index,
+        }
     }
 }
 
 impl Drop for VulkanBackend {
     fn drop(&mut self) {
-        let _ = unsafe { self.device.device_wait_idle() };
+        match &self.handles {
+            VulkanHandles::Owned {
+                instance, device, ..
+            } => {
+                let _ = unsafe { device.device_wait_idle() };
+                unsafe {
+                    device.destroy_device(None);
+                    instance.destroy_instance(None);
+                }
+            }
+            VulkanHandles::Borrowed { device, .. } => {
+                let _ = unsafe { device.device_wait_idle() };
+            }
+        }
     }
 }
 
