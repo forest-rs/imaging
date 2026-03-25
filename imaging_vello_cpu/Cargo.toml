@@ -10,17 +10,24 @@ readme = "README.md"
 publish = false
 
 [dependencies]
-imaging = { features = ["std"], workspace = true }
-kurbo = { default-features = true, workspace = true }
-peniko = { default-features = true, workspace = true }
-vello_common = { default-features = true, version = "0.0.6" }
-vello_cpu = { default-features = true, version = "0.0.6" }
+imaging.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
+vello_common = { default-features = false, version = "0.0.6" }
+vello_cpu = { default-features = false, features = ["text", "u8_pipeline"], version = "0.0.6" }
 
 [lints]
 workspace = true
 
 [features]
 default = ["std"]
-std = ["imaging/std", "vello_cpu/std", "vello_cpu/u8_pipeline"]
-libm = ["imaging/libm", "vello_cpu/libm", "vello_cpu/u8_pipeline"]
+std = [
+    "imaging/std",
+    "vello_cpu/png",
+    "vello_cpu/std",
+]
+libm = [
+    "imaging/libm",
+    "vello_cpu/libm",
+]
 f32_pipeline = ["vello_cpu/f32_pipeline"]
