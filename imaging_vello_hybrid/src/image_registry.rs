@@ -9,7 +9,7 @@ use vello_common::paint::{Image as VelloImage, ImageId, ImageSource};
 
 #[derive(Debug, Default)]
 pub(crate) struct HybridImageRegistry {
-    live: HashMap<ImageKey, ImageId>,
+    live: HashMap<ImageKey, RegisteredImage>,
 }
 
 impl HybridImageRegistry {
@@ -41,8 +41,8 @@ impl HybridImageRegistry {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        for image_id in self.live.drain().map(|(_, image_id)| image_id) {
-            renderer.destroy_image(device, queue, encoder, image_id);
+        for image in self.live.drain().map(|(_, image)| image) {
+            renderer.destroy_image(device, queue, encoder, image.id);
         }
     }
 }
@@ -53,16 +53,16 @@ pub(crate) struct HybridImageUploadSession<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     encoder: Option<wgpu::CommandEncoder>,
-    pending: HashMap<ImageKey, ImageId>,
+    pending: HashMap<ImageKey, RegisteredImage>,
 }
 
 impl HybridImageUploadSession<'_> {
     pub(crate) fn resolve_image_brush(&mut self, brush: &ImageBrush) -> Result<VelloImage, Error> {
         let key = ImageKey::derive(&brush.image);
-        let image_id = if let Some(image_id) = self.pending.get(&key).copied() {
-            image_id
-        } else if let Some(image_id) = self.registry.live.get(&key).copied() {
-            image_id
+        let image = if let Some(image) = self.pending.get(&key).copied() {
+            image
+        } else if let Some(image) = self.registry.live.get(&key).copied() {
+            image
         } else {
             let image_source = ImageSource::from_peniko_image_data(&brush.image);
             let ImageSource::Pixmap(pixmap) = image_source else {
@@ -70,7 +70,7 @@ impl HybridImageUploadSession<'_> {
                     "peniko image conversion did not produce a pixmap",
                 ));
             };
-            let image_id = self.renderer.upload_image(
+            let id = self.renderer.upload_image(
                 self.device,
                 self.queue,
                 self.encoder
@@ -78,12 +78,16 @@ impl HybridImageUploadSession<'_> {
                     .expect("hybrid image upload session should own an encoder"),
                 &pixmap,
             );
-            self.pending.insert(key, image_id);
-            image_id
+            let image = RegisteredImage {
+                id,
+                may_have_opacities: pixmap.may_have_opacities(),
+            };
+            self.pending.insert(key, image);
+            image
         };
 
         Ok(VelloImage {
-            image: ImageSource::OpaqueId(image_id),
+            image: ImageSource::opaque_id_with_opacity_hint(image.id, image.may_have_opacities),
             sampler: brush.sampler,
         })
     }
@@ -92,14 +96,14 @@ impl HybridImageUploadSession<'_> {
         if success {
             self.registry.live.extend(self.pending.drain());
         } else {
-            for image_id in self.pending.drain().map(|(_, image_id)| image_id) {
+            for image in self.pending.drain().map(|(_, image)| image) {
                 self.renderer.destroy_image(
                     self.device,
                     self.queue,
                     self.encoder
                         .as_mut()
                         .expect("hybrid image upload session should own an encoder"),
-                    image_id,
+                    image.id,
                 );
             }
         }
@@ -108,6 +112,12 @@ impl HybridImageUploadSession<'_> {
             self.queue.submit([encoder.finish()]);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RegisteredImage {
+    id: ImageId,
+    may_have_opacities: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -14,12 +14,12 @@ imaging = { features = ["std"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 pollster = "0.4.0"
-vello_common = { default-features = true, version = "0.0.6" }
-vello_hybrid = { default-features = true, version = "0.0.6" }
+vello_common = { default-features = true, version = "0.0.7" }
+vello_hybrid = { default-features = true, version = "0.0.7" }
 wgpu = { default-features = false, features = [
     "std",
     "wgsl",
-], version = "27.0.1" }
+], version = "28.0.0" }
 
 [lints]
 workspace = true
