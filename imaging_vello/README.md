@@ -4,6 +4,15 @@ Vello (GPU) backend for the `imaging` command stream.
 
 This backend is intended for headless/offscreen rendering into an RGBA8 buffer.
 
+## Version Selection
+
+`imaging_vello` supports two mutually exclusive Vello compatibility lanes:
+
+- `vello-0-8` (default)
+- `vello-0-7`
+
+To integrate with `wgpu` 27 via Vello 0.7, disable default features and opt into `vello-0-7`.
+
 ## Notes
 
 - This backend requires a working `wgpu` adapter/device. In sandboxed/headless environments it may

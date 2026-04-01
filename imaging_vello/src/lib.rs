@@ -6,6 +6,11 @@
 //! This crate provides a headless CPU/GPU renderer that consumes `imaging::record::Scene` or a
 //! native [`vello::Scene`] and produces an RGBA8 image buffer using `vello` + `wgpu`.
 //!
+//! Enable exactly one backend compatibility feature:
+//!
+//! - `vello-0-8` (default)
+//! - `vello-0-7`
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with [`VelloRenderer`].
@@ -39,7 +44,7 @@
 //!
 //! ```no_run
 //! use imaging::Painter;
-//! use imaging_vello::VelloSceneSink;
+//! use imaging_vello::{VelloSceneSink, vello};
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //!
@@ -65,7 +70,7 @@
 //!
 //! ```no_run
 //! use imaging::Painter;
-//! use imaging_vello::{VelloRenderer, VelloSceneSink};
+//! use imaging_vello::{VelloRenderer, VelloSceneSink, vello};
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //!
@@ -96,11 +101,23 @@
 
 mod scene_sink;
 
+#[cfg(all(feature = "vello-0-7", feature = "vello-0-8"))]
+compile_error!("Enable exactly one of `vello-0-7` or `vello-0-8`.");
+
+#[cfg(not(any(feature = "vello-0-7", feature = "vello-0-8")))]
+compile_error!("Enable one of `vello-0-7` or `vello-0-8`.");
+
 use imaging::record::{Scene, ValidateError, replay};
 use kurbo::Rect;
 use std::sync::mpsc;
-use vello::wgpu;
-use vello::{AaConfig, RenderParams};
+
+#[cfg(feature = "vello-0-7")]
+pub use vello_07 as vello;
+#[cfg(feature = "vello-0-8")]
+pub use vello_08 as vello;
+
+use crate::vello::wgpu;
+use crate::vello::{AaConfig, RenderParams};
 
 pub use scene_sink::VelloSceneSink;
 
@@ -199,7 +216,7 @@ impl VelloRenderer {
         self.render_vello_scene_rgba8(&native)
     }
 
-    /// Render a native [`vello::Scene`] and return an RGBA8 buffer (unpremultiplied).
+    /// Render a native [`crate::vello::Scene`] and return an RGBA8 buffer (unpremultiplied).
     pub fn render_vello_scene_rgba8(&mut self, scene: &vello::Scene) -> Result<Vec<u8>, Error> {
         let params = RenderParams {
             base_color: peniko::Color::from_rgba8(0, 0, 0, 0),

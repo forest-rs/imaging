@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::Error;
+use crate::vello::{self, Glyph as VelloGlyph};
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, StrokeRef,
@@ -9,9 +10,8 @@ use imaging::{
 };
 use kurbo::{Affine, Rect};
 use peniko::{Brush, BrushRef, Fill};
-use vello::Glyph as VelloGlyph;
 
-/// Borrowed adapter that streams `imaging` commands into an existing [`vello::Scene`].
+/// Borrowed adapter that streams `imaging` commands into an existing [`crate::vello::Scene`].
 ///
 /// Use this when you want a backend-native retained scene without owning a full
 /// [`crate::VelloRenderer`]. Call [`VelloSceneSink::finish`] after streaming to surface any
@@ -47,7 +47,7 @@ impl core::fmt::Debug for VelloSceneSink<'_> {
 }
 
 impl<'a> VelloSceneSink<'a> {
-    /// Wrap an existing [`vello::Scene`].
+    /// Wrap an existing [`crate::vello::Scene`].
     ///
     /// `surface_clip` is used as the fallback layer bounds for isolated groups that do not
     /// provide an explicit clip.

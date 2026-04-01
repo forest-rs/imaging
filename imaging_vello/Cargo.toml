@@ -14,7 +14,13 @@ imaging = { features = ["std"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 pollster = "0.4.0"
-vello = { default-features = true, version = "0.8.0" }
+vello_07 = { package = "vello", default-features = true, optional = true, version = "0.7.0" }
+vello_08 = { package = "vello", default-features = true, optional = true, version = "0.8.0" }
+
+[features]
+default = ["vello-0-8"]
+vello-0-7 = ["dep:vello_07"]
+vello-0-8 = ["dep:vello_08"]
 
 [lints]
 workspace = true
