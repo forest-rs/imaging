@@ -46,6 +46,8 @@ env:
     --exclude xtask
   # List of features that depend on the standard library and will be excluded from no_std checks.
   FEATURES_DEPENDING_ON_STD: "std,default"
+  RUST_ALL_FEATURES_EXCLUDE_PKGS: >-
+    --exclude imaging_vello
 
 
 # Rationale
@@ -152,13 +154,13 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo clippy (no_std)
-        run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none -- -D warnings
+        run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none -- -D warnings
 
       - name: cargo clippy
-        run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
+        run: cargo hack clippy --workspace --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std -- -D warnings
 
       - name: cargo clippy (auxiliary)
-        run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+        run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
 
   clippy-stable-wasm:
     name: cargo clippy (wasm32)
@@ -184,10 +186,10 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo clippy
-        run: cargo hack clippy ${{ env.RUST_NO_WASM_PKGS }} --workspace --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
+        run: cargo hack clippy ${{ env.RUST_NO_WASM_PKGS }} --workspace --locked --target wasm32-unknown-unknown --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std -- -D warnings
 
       - name: cargo clippy (auxiliary)
-        run: cargo hack clippy ${{ env.RUST_NO_WASM_PKGS }} --workspace --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+        run: cargo hack clippy ${{ env.RUST_NO_WASM_PKGS }} --workspace --locked --target wasm32-unknown-unknown --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
 
   test-stable:
     name: cargo test
@@ -220,10 +222,22 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo nextest
-        run: cargo nextest run --workspace --locked --all-features --no-fail-fast
+        run: cargo nextest run ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} --workspace --locked --all-features --no-fail-fast
+
+      - name: cargo nextest (imaging_vello, vello-0-8)
+        run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-8 --no-fail-fast
+
+      - name: cargo nextest (imaging_vello, vello-0-7)
+        run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-7 --no-fail-fast
 
       - name: cargo test --doc
-        run: cargo test --doc --workspace --locked --all-features --no-fail-fast
+        run: cargo test --doc ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} --workspace --locked --all-features --no-fail-fast
+
+      - name: cargo test --doc (imaging_vello, vello-0-8)
+        run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-8 --no-fail-fast
+
+      - name: cargo test --doc (imaging_vello, vello-0-7)
+        run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-7 --no-fail-fast
 
   test-stable-wasm:
     name: cargo test (wasm32)
@@ -279,10 +293,10 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo check (no_std)
-        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.RUST_STD_ONLY_PKGS }} --locked --optional-deps --each-feature --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.RUST_STD_ONLY_PKGS }} --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none
 
       - name: cargo check
-        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --ignore-unknown-features --features std
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std
 
   check-msrv-wasm:
     name: cargo check (msrv) (wasm32)
@@ -307,7 +321,7 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo check
-        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.RUST_NO_WASM_PKGS }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.RUST_NO_WASM_PKGS }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std
 
   doc:
     name: cargo doc
@@ -327,7 +341,17 @@ jobs:
 
       # We test documentation using nightly to match docs.rs.
       - name: cargo doc
-        run: cargo doc --workspace --locked --all-features --no-deps --document-private-items
+        run: cargo doc ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} --workspace --locked --all-features --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: '--cfg docsrs -D warnings'
+
+      - name: cargo doc (imaging_vello, vello-0-8)
+        run: cargo doc -p imaging_vello --locked --no-default-features --features vello-0-8 --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: '--cfg docsrs -D warnings'
+
+      - name: cargo doc (imaging_vello, vello-0-7)
+        run: cargo doc -p imaging_vello --locked --no-default-features --features vello-0-7 --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: '--cfg docsrs -D warnings'
 

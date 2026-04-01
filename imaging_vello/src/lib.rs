@@ -113,7 +113,7 @@ use std::sync::mpsc;
 
 #[cfg(feature = "vello-0-7")]
 pub use vello_07 as vello;
-#[cfg(feature = "vello-0-8")]
+#[cfg(all(not(feature = "vello-0-7"), feature = "vello-0-8"))]
 pub use vello_08 as vello;
 
 use crate::vello::wgpu;
