@@ -14,6 +14,7 @@ env:
   RUST_MIN_VER_PKGS: >-
     -p imaging
     -p imaging_skia
+    -p velato_imaging
     -p imaging_vello
     -p imaging_vello_cpu
     -p imaging_vello_hybrid
@@ -25,6 +26,7 @@ env:
     --exclude imaging_snapshot_tests
     --exclude imaging_vello
     --exclude imaging_vello_hybrid
+    --exclude velato_imaging
     --exclude imaging_wind_tunnel
     --exclude svg_imaging
     --exclude xtask

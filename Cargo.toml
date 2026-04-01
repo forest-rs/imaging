@@ -10,6 +10,7 @@ members = [
     "imaging_vello_hybrid",
     "imaging_wind_tunnel",
     "svg_imaging",
+    "velato_imaging",
     "xtask",
 ]
 
@@ -29,6 +30,7 @@ imaging_vello = { path = "imaging_vello" }
 imaging_vello_cpu = { path = "imaging_vello_cpu" }
 imaging_vello_hybrid = { path = "imaging_vello_hybrid" }
 svg_imaging = { path = "svg_imaging" }
+velato_imaging = { path = "velato_imaging" }
 
 hashbrown = { default-features = false, features = ["default-hasher"], version = "0.16" }
 image = { default-features = false, version = "0.25" }
