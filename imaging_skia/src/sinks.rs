@@ -13,79 +13,6 @@ use imaging::{
 };
 use kurbo::{Affine, Rect, Shape as _};
 use skia_safe as sk;
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
-
-#[derive(Clone, Debug)]
-struct CachedMask {
-    scene: record::Scene,
-    mode: MaskMode,
-    transform: Affine,
-    width: i32,
-    height: i32,
-    tolerance: f64,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct MaskCache {
-    entries: VecDeque<CachedMask>,
-}
-
-impl MaskCache {
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    fn get(
-        &self,
-        scene: &record::Scene,
-        mode: MaskMode,
-        transform: Affine,
-        width: i32,
-        height: i32,
-        tolerance: f64,
-    ) -> Option<Vec<u8>> {
-        self.entries
-            .iter()
-            .find(|entry| {
-                entry.scene == *scene
-                    && entry.mode == mode
-                    && entry.transform == transform
-                    && entry.width == width
-                    && entry.height == height
-                    && entry.tolerance == tolerance
-            })
-            .map(|entry| entry.bytes.clone())
-    }
-
-    fn insert(
-        &mut self,
-        scene: &record::Scene,
-        mode: MaskMode,
-        transform: Affine,
-        width: i32,
-        height: i32,
-        tolerance: f64,
-        bytes: &[u8],
-    ) {
-        // If more backends end up wanting realized-mask caches, add a portable scene/cache key at
-        // the imaging layer instead of retaining full scenes in backend-local caches.
-        self.entries.push_back(CachedMask {
-            scene: scene.clone(),
-            mode,
-            transform,
-            width,
-            height,
-            tolerance,
-            bytes: bytes.to_vec(),
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
 
 #[derive(Debug)]
 struct StreamState {
@@ -321,171 +248,14 @@ fn draw_blurred_rounded_rect(
     canvas.draw_rrect(rrect, &paint);
 }
 
-fn canvas_dimensions(canvas: &sk::Canvas) -> Option<(i32, i32)> {
-    let dims = canvas.image_info().dimensions();
-    (dims.width > 0 && dims.height > 0).then_some((dims.width, dims.height))
-}
-
-fn raster_surface_for_canvas(canvas: &sk::Canvas) -> Option<sk::Surface> {
-    let (width, height) = canvas_dimensions(canvas)?;
-    sk::surfaces::raster_n32_premul((width, height))
-}
-
-fn read_surface_rgba_premul(surface: &mut sk::Surface) -> Option<Vec<u8>> {
-    let image = surface.image_snapshot();
-    let dims = image.dimensions();
-    let row_bytes = (dims.width as usize) * 4;
-    let info = sk::ImageInfo::new(
-        (dims.width, dims.height),
-        sk::ColorType::RGBA8888,
-        sk::AlphaType::Premul,
-        None,
-    );
-    let mut bytes = vec![0_u8; row_bytes * (dims.height as usize)];
-    image
-        .read_pixels(
-            &info,
-            bytes.as_mut_slice(),
-            row_bytes,
-            (0, 0),
-            sk::image::CachingHint::Disallow,
-        )
-        .then_some(bytes)
-}
-
-fn mask_value(mask: &[u8], mode: MaskMode) -> u8 {
-    match mode {
-        MaskMode::Alpha => mask[3],
-        MaskMode::Luminance => {
-            let value = (54_u32 * u32::from(mask[0])
-                + 183_u32 * u32::from(mask[1])
-                + 19_u32 * u32::from(mask[2])
-                + 128)
-                >> 8;
-            u8::try_from(value).expect("luminance mask value stays within u8 range")
-        }
-    }
-}
-
-fn apply_mask_to_premul_rgba(content: &mut [u8], mask: &[u8], mode: MaskMode) {
-    for (content_px, mask_px) in content.chunks_exact_mut(4).zip(mask.chunks_exact(4)) {
-        let mask = u32::from(mask_value(mask_px, mode));
-        for channel in content_px.iter_mut() {
-            let value = (u32::from(*channel) * mask + 127) / 255;
-            *channel = u8::try_from(value).expect("masked premul channel stays within u8 range");
-        }
-    }
-}
-
-fn draw_masked_group(
-    canvas: &sk::Canvas,
-    state: &mut StreamState,
-    masked: MaskedGroupFrame,
-    mask_cache: Option<&Rc<RefCell<MaskCache>>>,
-) {
-    let Some((width, height)) = canvas_dimensions(canvas) else {
-        state.set_error_once(Error::Internal(
-            "masked layer requires raster canvas dimensions",
-        ));
-        return;
-    };
-
-    let mask_bytes = if let Some(cache) = mask_cache
-        && let Some(bytes) = cache.borrow().get(
-            &masked.mask,
-            masked.mode,
-            masked.transform,
-            width,
-            height,
-            state.tolerance,
-        ) {
-        bytes
-    } else {
-        let Some(mut mask_surface) = raster_surface_for_canvas(canvas) else {
-            state.set_error_once(Error::Internal(
-                "masked layer requires raster canvas dimensions",
-            ));
-            return;
-        };
-        {
-            let mut sink = match mask_cache {
-                Some(cache) => {
-                    SkCanvasSink::new_with_mask_cache(mask_surface.canvas(), cache.clone())
-                }
-                None => SkCanvasSink::new(mask_surface.canvas()),
-            };
-            sink.set_tolerance(state.tolerance);
-            replay_transformed(&masked.mask, &mut sink, masked.transform);
-            if let Err(err) = sink.finish() {
-                state.set_error_once(err);
-                return;
-            }
-        }
-        let Some(bytes) = read_surface_rgba_premul(&mut mask_surface) else {
-            state.set_error_once(Error::Internal("read masked layer surface"));
-            return;
-        };
-        if let Some(cache) = mask_cache {
-            cache.borrow_mut().insert(
-                &masked.mask,
-                masked.mode,
-                masked.transform,
-                width,
-                height,
-                state.tolerance,
-                &bytes,
-            );
-        }
-        bytes
-    };
-
-    let Some(mut content_surface) = raster_surface_for_canvas(canvas) else {
-        state.set_error_once(Error::Internal(
-            "masked layer requires raster canvas dimensions",
-        ));
-        return;
-    };
-
-    {
-        let mut sink = match mask_cache {
-            Some(cache) => {
-                SkCanvasSink::new_with_mask_cache(content_surface.canvas(), cache.clone())
-            }
-            None => SkCanvasSink::new(content_surface.canvas()),
-        };
-        sink.set_tolerance(state.tolerance);
-        replay(&masked.content, &mut sink);
-        if let Err(err) = sink.finish() {
-            state.set_error_once(err);
-            return;
-        }
-    }
-    let Some(mut content_bytes) = read_surface_rgba_premul(&mut content_surface) else {
-        state.set_error_once(Error::Internal("read masked content surface"));
-        return;
-    };
-    apply_mask_to_premul_rgba(&mut content_bytes, &mask_bytes, masked.mode);
-    let info = sk::ImageInfo::new(
-        (width, height),
-        sk::ColorType::RGBA8888,
-        sk::AlphaType::Premul,
-        None,
-    );
-    let row_bytes = (width as usize) * 4;
-    let Some(image) =
-        sk::images::raster_from_data(&info, sk::Data::new_copy(&content_bytes), row_bytes)
-    else {
-        state.set_error_once(Error::Internal("create masked layer image"));
-        return;
-    };
-
-    let mut paint = sk::Paint::default();
-    paint.set_anti_alias(true);
-    paint.set_blend_mode(map_blend_mode(&masked.composite.blend));
-    paint.set_alpha_f(masked.composite.alpha);
+fn draw_masked_group(canvas: &sk::Canvas, state: &mut StreamState, masked: MaskedGroupFrame) {
+    let mut group_paint = sk::Paint::default();
+    group_paint.set_anti_alias(true);
+    group_paint.set_blend_mode(map_blend_mode(&masked.composite.blend));
+    group_paint.set_alpha_f(masked.composite.alpha);
     if !masked.filters.is_empty() {
         if let Some(filter) = build_filter_chain(&masked.filters) {
-            paint.set_image_filter(filter);
+            group_paint.set_image_filter(filter);
         } else {
             state.set_error_once(Error::UnsupportedFilter);
             return;
@@ -502,7 +272,48 @@ fn draw_masked_group(
     }
 
     set_matrix(canvas, Affine::IDENTITY);
-    canvas.draw_image(&image, (0, 0), Some(&paint));
+    canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&group_paint));
+
+    {
+        let mut sink = SkCanvasSink::new(canvas);
+        sink.set_tolerance(state.tolerance);
+        replay(&masked.content, &mut sink);
+        if let Err(err) = sink.finish() {
+            state.set_error_once(err);
+            canvas.restore();
+            if clip_path.is_some() {
+                canvas.restore();
+            }
+            return;
+        }
+    }
+
+    let mut mask_paint = sk::Paint::default();
+    mask_paint.set_anti_alias(true);
+    mask_paint.set_blend_mode(sk::BlendMode::DstIn);
+    if masked.mode == MaskMode::Luminance {
+        mask_paint.set_color_filter(sk::ColorFilter::luma());
+    }
+    canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&mask_paint));
+    set_matrix(canvas, Affine::IDENTITY);
+
+    {
+        let mut sink = SkCanvasSink::new(canvas);
+        sink.set_tolerance(state.tolerance);
+        replay_transformed(&masked.mask, &mut sink, masked.transform);
+        if let Err(err) = sink.finish() {
+            state.set_error_once(err);
+            canvas.restore();
+            canvas.restore();
+            if clip_path.is_some() {
+                canvas.restore();
+            }
+            return;
+        }
+    }
+
+    canvas.restore();
+    canvas.restore();
 
     if clip_path.is_some() {
         canvas.restore();
@@ -569,11 +380,7 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
     state.group_stack.push(GroupFrame::Direct { restores });
 }
 
-fn paint_sink_pop_group(
-    canvas: &sk::Canvas,
-    state: &mut StreamState,
-    mask_cache: Option<&Rc<RefCell<MaskCache>>>,
-) {
+fn paint_sink_pop_group(canvas: &sk::Canvas, state: &mut StreamState) {
     if state.error.is_some() {
         return;
     }
@@ -594,7 +401,7 @@ fn paint_sink_pop_group(
                 state.group_stack.push(GroupFrame::Masked(frame));
                 return;
             }
-            draw_masked_group(canvas, state, *frame, mask_cache);
+            draw_masked_group(canvas, state, *frame);
         }
     }
 }
@@ -699,7 +506,6 @@ fn paint_sink_stroke(canvas: &sk::Canvas, state: &mut StreamState, draw: StrokeR
 /// Borrowed adapter that streams `imaging` commands into an existing [`skia_safe::Canvas`].
 pub struct SkCanvasSink<'a> {
     canvas: &'a sk::Canvas,
-    mask_cache: Option<Rc<RefCell<MaskCache>>>,
     state: StreamState,
 }
 
@@ -719,18 +525,6 @@ impl<'a> SkCanvasSink<'a> {
     pub fn new(canvas: &'a sk::Canvas) -> Self {
         Self {
             canvas,
-            mask_cache: None,
-            state: StreamState::new(),
-        }
-    }
-
-    pub(crate) fn new_with_mask_cache(
-        canvas: &'a sk::Canvas,
-        mask_cache: Rc<RefCell<MaskCache>>,
-    ) -> Self {
-        Self {
-            canvas,
-            mask_cache: Some(mask_cache),
             state: StreamState::new(),
         }
     }
@@ -760,7 +554,7 @@ impl PaintSink for SkCanvasSink<'_> {
     }
 
     fn pop_group(&mut self) {
-        paint_sink_pop_group(self.canvas, &mut self.state, self.mask_cache.as_ref());
+        paint_sink_pop_group(self.canvas, &mut self.state);
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -889,7 +683,7 @@ impl PaintSink for SkPictureRecorderSink {
             state.set_error_once(Error::Internal("picture recorder not recording"));
             return;
         };
-        paint_sink_pop_group(canvas, state, None);
+        paint_sink_pop_group(canvas, state);
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
