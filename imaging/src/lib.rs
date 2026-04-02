@@ -100,8 +100,6 @@
 //!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 
-#![no_std]
-
 extern crate alloc;
 
 use kurbo::{Affine, Rect};
@@ -110,13 +108,24 @@ use peniko::BlendMode;
 mod paint;
 mod painter;
 pub mod record;
+mod renderer;
 pub mod validation;
 
 pub use paint::{
     AppliedMaskRef, ClipRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskRef,
-    PaintSink, StrokeRef,
+    PaintSink, RetainedDrawRef, RetainedRef, StrokeRef,
 };
-pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
+pub use painter::{
+    FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder, record_mask, record_retained,
+};
+pub use record::{
+    ReplaySource, Retained, RetainedCachePolicy, RetainedEvictionPolicy, RetainedMask,
+    RetainedTransformPolicy,
+};
+pub use renderer::{
+    BeginFrame, CpuBufferFormat, CpuBufferTarget, CpuBufferTargetInfo, GlyphIter, GpuTextureTarget,
+    RenderCore, RenderOutput, Renderer, TargetRenderer,
+};
 
 /// Normalized variable-font coordinate value.
 pub type NormalizedCoord = i16;

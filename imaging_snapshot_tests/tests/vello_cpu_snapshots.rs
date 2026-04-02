@@ -20,9 +20,10 @@ fn render_case(case: &dyn imaging_snapshot_tests::cases::SnapshotCase) -> Image 
 
     let scene = build_scene(case, w, h);
     let mut renderer = VelloCpuRenderer::new(width, height);
-    let bytes = renderer
-        .render_scene_rgba8(&scene)
+    renderer
+        .render_scene(&scene)
         .expect("render vello_cpu scene");
+    let bytes = renderer.read_rgba8().expect("read vello_cpu scene");
 
     kompari::image::ImageBuffer::from_raw(u32::from(width), u32::from(height), bytes)
         .expect("RGBA buffer size should match image dimensions")

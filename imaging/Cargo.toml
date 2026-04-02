@@ -13,12 +13,13 @@ categories = ["graphics", "rendering", "no-std"]
 [dependencies]
 kurbo.workspace = true
 peniko.workspace = true
+wgpu = { default-features = false, features = ["std", "wgsl"], version = "28.0.0" }
 
 [lints]
 workspace = true
 
 [features]
-default = []
+default = ["std"]
 std = ["kurbo/std", "peniko/std"]
 libm = ["kurbo/libm", "peniko/libm"]
 

@@ -64,11 +64,14 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
-    MaskMode, PaintSink, StrokeRef,
+    BeginFrame, BlurredRoundedRect, ClipRef, Composite, CpuBufferFormat, CpuBufferTarget, FillRef,
+    Filter, GeometryRef, GlyphRunRef, GroupRef, MaskMode, PaintSink, RenderCore, RenderOutput,
+    Renderer, RetainedDrawRef, StrokeRef, TargetRenderer,
+    Renderer, RetainedDrawRef, StrokeRef, TargetRenderer,
     record::{Scene, ValidateError, replay, replay_transformed},
 };
 use kurbo::{Affine, Rect, Shape as _};
@@ -584,6 +587,102 @@ impl PaintSink for VelloCpuRenderer {
     }
 }
 
+impl RenderCore for VelloCpuRenderer {
+    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
+        f(self);
+    }
+
+    fn finish(&mut self) {}
+
+    fn readback(&mut self) -> Option<RenderOutput> {
+        self.read_rgba8().ok().map(|bytes| {
+            RenderOutput::Image(peniko::ImageData {
+                data: peniko::Blob::new(Arc::new(bytes)),
+                format: peniko::ImageFormat::Rgba8,
+                width: u32::from(self.width),
+                height: u32::from(self.height),
+                alpha_type: peniko::ImageAlphaType::Alpha,
+            })
+        })
+    }
+
+    fn debug_info(&self) -> String {
+        String::from("name: Vello CPU\ninfo: imaging_vello_cpu::VelloCpuRenderer")
+    }
+}
+
+impl Renderer for VelloCpuRenderer {
+    type Target = peniko::ImageData;
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Frame sizes are converted to whole pixels and then checked against `u16`."
+    )]
+    fn set_size(&mut self, frame: BeginFrame) {
+        let width = u16::try_from(frame.size.width as u32).expect("vello cpu width out of range");
+        let height =
+            u16::try_from(frame.size.height as u32).expect("vello cpu height out of range");
+        if self.width != width || self.height != height {
+            *self = Self::new(width, height);
+        }
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self);
+    }
+
+    fn read_target(&mut self) -> Option<Self::Target> {
+        self.readback().and_then(RenderOutput::into_image)
+    }
+}
+
+/// CPU target renderer that writes Vello CPU output into a caller-provided byte buffer.
+#[derive(Debug)]
+pub struct VelloCpuTargetRenderer<'a> {
+    inner: VelloCpuRenderer,
+    target: CpuBufferTarget<'a>,
+}
+
+impl RenderCore for VelloCpuTargetRenderer<'_> {
+    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
+        f(&mut self.inner);
+    }
+
+    fn finish(&mut self) {
+        match self.target.format {
+            CpuBufferFormat::Rgba8Opaque => {
+                let _ = self
+                    .inner
+                    .read_into_rgba8_opaque(self.target.buffer, self.target.bytes_per_row);
+            }
+            CpuBufferFormat::Bgra8Opaque => {
+                let _ = self
+                    .inner
+                    .read_into_bgra8_opaque(self.target.buffer, self.target.bytes_per_row);
+            }
+        }
+    }
+
+    fn readback(&mut self) -> Option<RenderOutput> {
+        self.inner.readback()
+    }
+}
+
+impl<'a> TargetRenderer for VelloCpuTargetRenderer<'a> {
+    type Target = CpuBufferTarget<'a>;
+
+    fn create(_frame: BeginFrame, target: Self::Target) -> Result<Self, String> {
+        let width = u16::try_from(target.width)
+            .map_err(|_| String::from("vello cpu width out of range"))?;
+        let height = u16::try_from(target.height)
+            .map_err(|_| String::from("vello cpu height out of range"))?;
+        Ok(Self {
+            inner: VelloCpuRenderer::new(width, height),
+            target,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,7 +779,8 @@ mod tests {
         }
 
         let mut renderer = VelloCpuRenderer::new(64, 64);
-        let bytes = renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene).unwrap();
+        let bytes = renderer.read_rgba8().unwrap();
         assert_eq!(bytes.len(), 64 * 64 * 4);
     }
 }

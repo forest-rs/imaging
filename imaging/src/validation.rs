@@ -673,7 +673,7 @@ where
         if self.aborted {
             return;
         }
-        let glyphs = glyphs.collect::<alloc::vec::Vec<_>>();
+        let glyphs = glyphs.collect::<Vec<_>>();
         if !self.validate_glyph_run(draw.clone(), &glyphs) {
             return;
         }

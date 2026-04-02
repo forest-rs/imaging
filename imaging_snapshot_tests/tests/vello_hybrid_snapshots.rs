@@ -33,9 +33,10 @@ fn snapshots() {
         "vello_hybrid",
         |case| {
             let scene = build_scene(case, w, h);
-            let bytes = renderer
+            let image = renderer
                 .render_scene_rgba8(&scene)
                 .expect("render vello_hybrid scene");
+            let bytes = image.data.as_ref().to_vec();
 
             kompari::image::ImageBuffer::from_raw(u32::from(width), u32::from(height), bytes)
                 .expect("RGBA buffer size should match image dimensions")
@@ -73,9 +74,10 @@ fn native_scene_sink_supports_image_brushes_with_renderer() {
         sink.finish().expect("finish native scene sink");
     }
 
-    let bytes = renderer
+    let image = renderer
         .render_vello_hybrid_scene_rgba8(&scene)
         .expect("render native hybrid scene");
+    let bytes = image.data.as_ref();
     assert_eq!(bytes.len(), 32 * 32 * 4);
     assert!(bytes.iter().any(|&channel| channel != 0));
 }
