@@ -13,7 +13,6 @@ publish = false
 imaging = { features = ["std"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
-pollster = "0.4.0"
 vello_common = { default-features = true, version = "0.0.7" }
 vello_hybrid = { default-features = true, version = "0.0.7" }
 wgpu = { default-features = false, features = [
@@ -23,3 +22,6 @@ wgpu = { default-features = false, features = [
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+pollster = "0.4.0"

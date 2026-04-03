@@ -2,12 +2,13 @@
 
 Vello hybrid (CPU/GPU via `wgpu`) backend for the `imaging` command stream.
 
-This backend is intended for headless/offscreen rendering into an RGBA8 buffer.
+This backend supports both headless image rendering and host-owned `wgpu` texture integration.
 
 ## Notes
 
-- This backend requires a working `wgpu` adapter/device. In sandboxed/headless environments it may
-  be unavailable; prefer using `VelloHybridRenderer::try_new`.
+- This backend requires a working `wgpu` adapter/device. Hosts should usually own device creation
+  themselves; test code in this repository uses local helper functions rather than a public
+  bootstrap API.
 - Recorded `imaging::record::Scene` values can use inline image brushes; the renderer uploads and
   caches them behind the scenes. Direct native-scene recording can use image brushes too via
   `VelloHybridSceneSink::with_renderer`; the plain `VelloHybridSceneSink::new` constructor stays

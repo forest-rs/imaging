@@ -25,9 +25,9 @@
 //!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
 //!     }
 //!
-//!     let mut renderer = SkiaRenderer::new(128, 128);
-//!     let rgba = renderer.render_scene_rgba8(&scene)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     let mut renderer = SkiaRenderer::new();
+//!     let image = renderer.render_scene(&scene, 128, 128)?;
+//!     assert_eq!(image.data.len(), 128 * 128 * 4);
 //!     Ok(())
 //! }
 //! ```
@@ -103,9 +103,9 @@
 //!     }
 //!
 //!     let picture = sink.finish_picture()?;
-//!     let mut renderer = SkiaRenderer::new(128, 128);
-//!     let rgba = renderer.render_picture_rgba8(&picture)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     let mut renderer = SkiaRenderer::new();
+//!     let image = renderer.render_picture(&picture, 128, 128)?;
+//!     assert_eq!(image.data.len(), 128 * 128 * 4);
 //!     Ok(())
 //! }
 //! ```
@@ -116,12 +116,14 @@
 mod sinks;
 
 use imaging::{
-    Filter, GeometryRef, GlyphRunRef,
+    Filter, GeometryRef, GlyphRunRef, RgbaImage,
     record::{Scene, ValidateError, replay},
 };
 use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
-use peniko::{BrushRef, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
+use peniko::{
+    BrushRef, ImageAlphaType, ImageData, ImageFormat, ImageQuality, InterpolationAlphaSpace,
+};
 use skia_safe as sk;
 use std::{cell::RefCell, rc::Rc};
 
@@ -159,11 +161,14 @@ pub struct SkiaRenderer {
     mask_cache: Rc<RefCell<MaskCache>>,
 }
 
+impl Default for SkiaRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SkiaRenderer {
-    /// Create a renderer for a fixed-size target.
-    pub fn new(width: u16, height: u16) -> Self {
-        let width = i32::from(width);
-        let height = i32::from(height);
+    fn create_surface(width: i32, height: i32) -> sk::Surface {
         // Use an explicit RGBA8888 premultiplied raster surface. Many blend modes are defined in
         // premultiplied space, and it also matches Skia's typical raster backend behavior.
         //
@@ -174,12 +179,16 @@ impl SkiaRenderer {
             sk::AlphaType::Premul,
             None,
         );
-        let surface = sk::surfaces::raster(&info, None, None)
-            .expect("create skia raster RGBA8888/premul surface");
+        sk::surfaces::raster(&info, None, None).expect("create skia raster RGBA8888/premul surface")
+    }
+
+    /// Create a renderer.
+    pub fn new() -> Self {
+        let surface = Self::create_surface(1, 1);
         Self {
             surface,
-            width,
-            height,
+            width: 1,
+            height: 1,
             tolerance: 0.1,
             mask_cache: Rc::new(RefCell::new(MaskCache::default())),
         }
@@ -202,6 +211,17 @@ impl SkiaRenderer {
         self.mask_cache.borrow_mut().clear();
     }
 
+    fn resize(&mut self, width: i32, height: i32) {
+        if self.width == width && self.height == height {
+            return;
+        }
+
+        self.surface = Self::create_surface(width, height);
+        self.width = width;
+        self.height = height;
+        self.clear_cached_masks();
+    }
+
     fn reset(&mut self) {
         let canvas = self.surface.canvas();
         canvas.restore_to_count(1);
@@ -209,37 +229,78 @@ impl SkiaRenderer {
         canvas.clear(sk::Color::TRANSPARENT);
     }
 
-    /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
+    /// Render a recorded scene into an RGBA8 image (unpremultiplied).
+    pub fn render_scene_into(
+        &mut self,
+        scene: &Scene,
+        width: u16,
+        height: u16,
+        image: &mut RgbaImage,
+    ) -> Result<(), Error> {
         scene.validate().map_err(Error::InvalidScene)?;
+        self.resize(i32::from(width), i32::from(height));
         self.reset();
         let mut sink =
             SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
         sink.set_tolerance(self.tolerance);
         replay(scene, &mut sink);
         sink.finish()?;
-        self.read_rgba8()
+        self.read_into(image)
     }
 
-    /// Render a native [`skia_safe::Picture`] and return an RGBA8 buffer (unpremultiplied).
-    pub fn render_picture_rgba8(&mut self, picture: &sk::Picture) -> Result<Vec<u8>, Error> {
+    /// Render a recorded scene and return an RGBA8 image (unpremultiplied).
+    pub fn render_scene(
+        &mut self,
+        scene: &Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+        self.render_scene_into(scene, width, height, &mut image)?;
+        Ok(image)
+    }
+
+    /// Render a native [`skia_safe::Picture`] into an RGBA8 image (unpremultiplied).
+    pub fn render_picture_into(
+        &mut self,
+        picture: &sk::Picture,
+        width: u16,
+        height: u16,
+        image: &mut RgbaImage,
+    ) -> Result<(), Error> {
+        self.resize(i32::from(width), i32::from(height));
         self.reset();
         self.surface.canvas().draw_picture(picture, None, None);
-        self.read_rgba8()
+        self.read_into(image)
     }
 
-    fn read_rgba8(&mut self) -> Result<Vec<u8>, Error> {
-        let image = self.surface.image_snapshot();
+    /// Render a native [`skia_safe::Picture`] and return an RGBA8 image (unpremultiplied).
+    pub fn render_picture(
+        &mut self,
+        picture: &sk::Picture,
+        width: u16,
+        height: u16,
+    ) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+        self.render_picture_into(picture, width, height, &mut image)?;
+        Ok(image)
+    }
+
+    fn read_into(&mut self, image: &mut RgbaImage) -> Result<(), Error> {
+        let snapshot = self.surface.image_snapshot();
         let info = sk::ImageInfo::new(
             (self.width, self.height),
             sk::ColorType::RGBA8888,
             sk::AlphaType::Unpremul,
             None,
         );
-        let mut bytes = vec![0_u8; (self.width as usize) * (self.height as usize) * 4];
-        let ok = image.read_pixels(
+        image.resize(
+            u32::try_from(self.width).expect("positive skia width should fit in u32"),
+            u32::try_from(self.height).expect("positive skia height should fit in u32"),
+        );
+        let ok = snapshot.read_pixels(
             &info,
-            bytes.as_mut_slice(),
+            image.data.as_mut_slice(),
             (4 * self.width) as usize,
             (0, 0),
             sk::image::CachingHint::Disallow,
@@ -247,7 +308,7 @@ impl SkiaRenderer {
         if !ok {
             return Err(Error::Internal("read_pixels failed"));
         }
-        Ok(bytes)
+        Ok(())
     }
 }
 
@@ -551,7 +612,7 @@ fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option
     Some(paint)
 }
 
-fn skia_image_from_peniko(image: &peniko::ImageData) -> Option<sk::Image> {
+fn skia_image_from_peniko(image: &ImageData) -> Option<sk::Image> {
     let color_type = match image.format {
         ImageFormat::Rgba8 => sk::ColorType::RGBA8888,
         ImageFormat::Bgra8 => sk::ColorType::BGRA8888,
@@ -713,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn render_picture_rgba8_reads_native_picture() {
+    fn render_picture_renders_native_picture() {
         let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 32.0, 32.0));
         let paint = Brush::Solid(Color::from_rgb8(0x22, 0x66, 0xaa));
         {
@@ -722,49 +783,67 @@ mod tests {
         }
 
         let picture = sink.finish_picture().unwrap();
-        let mut renderer = SkiaRenderer::new(32, 32);
-        let rgba = renderer.render_picture_rgba8(&picture).unwrap();
+        let mut renderer = SkiaRenderer::new();
+        let image = renderer.render_picture(&picture, 32, 32).unwrap();
 
-        assert_eq!(rgba.len(), 32 * 32 * 4);
-        assert_eq!(&rgba[..4], &[0x22, 0x66, 0xaa, 0xff]);
+        assert_eq!(image.data.len(), 32 * 32 * 4);
+        assert_eq!(&image.data[..4], &[0x22, 0x66, 0xaa, 0xff]);
     }
 
     #[test]
     fn render_scene_reuses_cached_masks_for_identical_scenes() {
         let scene = masked_scene(MaskMode::Alpha);
-        let mut renderer = SkiaRenderer::new(64, 64);
+        let mut renderer = SkiaRenderer::new();
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.borrow().len(), 1);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.borrow().len(), 1);
     }
 
     #[test]
     fn clear_cached_masks_drops_realized_masks() {
         let scene = masked_scene(MaskMode::Luminance);
-        let mut renderer = SkiaRenderer::new(64, 64);
+        let mut renderer = SkiaRenderer::new();
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.borrow().len(), 1);
 
         renderer.clear_cached_masks();
         assert_eq!(renderer.mask_cache.borrow().len(), 0);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.borrow().len(), 1);
     }
 
     #[test]
     fn changing_tolerance_clears_cached_masks() {
         let scene = masked_scene(MaskMode::Alpha);
-        let mut renderer = SkiaRenderer::new(64, 64);
+        let mut renderer = SkiaRenderer::new();
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.borrow().len(), 1);
 
         renderer.set_tolerance(0.25);
         assert_eq!(renderer.mask_cache.borrow().len(), 0);
+    }
+
+    #[test]
+    fn render_scene_renders_image() {
+        let mut renderer = SkiaRenderer::new();
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 64.0, 64.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+        let image = renderer.render_scene(&scene, 64, 64).unwrap();
+        assert_eq!(image.width, 64);
+        assert_eq!(image.height, 64);
     }
 }
