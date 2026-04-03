@@ -12,8 +12,37 @@ use imaging_snapshot_tests::cases::{DEFAULT_HEIGHT, DEFAULT_WIDTH, build_scene};
 use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridSceneSink};
 use kurbo::Rect;
 use peniko::{Blob, Brush, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
+use pollster::block_on;
 
 mod common;
+
+fn try_init_device_and_queue() -> Result<
+    (
+        imaging_vello_hybrid::wgpu::Device,
+        imaging_vello_hybrid::wgpu::Queue,
+    ),
+    (),
+> {
+    block_on(async {
+        let instance = imaging_vello_hybrid::wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&imaging_vello_hybrid::wgpu::RequestAdapterOptions {
+                power_preference: imaging_vello_hybrid::wgpu::PowerPreference::default(),
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .map_err(|_| ())?;
+        adapter
+            .request_device(&imaging_vello_hybrid::wgpu::DeviceDescriptor {
+                label: Some("imaging_snapshot_tests vello_hybrid device"),
+                required_features: imaging_vello_hybrid::wgpu::Features::empty(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|_| ())
+    })
+}
 
 #[test]
 fn snapshots() {
@@ -22,9 +51,14 @@ fn snapshots() {
     let w = f64::from(width);
     let h = f64::from(height);
 
-    let Some(mut renderer) = common::try_init_or_skip("vello_hybrid", || {
-        VelloHybridRenderer::try_new(width, height)
-    }) else {
+    let Some(mut renderer) = common::try_init_or_skip(
+        "vello_hybrid",
+        || -> Result<_, imaging_vello_hybrid::Error> {
+            let (device, queue) = try_init_device_and_queue()
+                .map_err(|_| imaging_vello_hybrid::Error::Internal("initialize wgpu"))?;
+            Ok(VelloHybridRenderer::new(device, queue))
+        },
+    ) else {
         return;
     };
 
@@ -33,12 +67,12 @@ fn snapshots() {
         "vello_hybrid",
         |case| {
             let scene = build_scene(case, w, h);
-            let bytes = renderer
-                .render_scene_rgba8(&scene)
-                .expect("render vello_hybrid scene");
-
-            kompari::image::ImageBuffer::from_raw(u32::from(width), u32::from(height), bytes)
-                .expect("RGBA buffer size should match image dimensions")
+            let native = renderer
+                .encode_scene(&scene, width, height)
+                .expect("encode scene");
+            renderer
+                .render(&native, width, height)
+                .expect("render image")
         },
         |case| case.vello_hybrid_max_diff_pixels(),
         &mut errors,
@@ -48,9 +82,14 @@ fn snapshots() {
 
 #[test]
 fn native_scene_sink_supports_image_brushes_with_renderer() {
-    let Some(mut renderer) =
-        common::try_init_or_skip("vello_hybrid", || VelloHybridRenderer::try_new(32, 32))
-    else {
+    let Some(mut renderer) = common::try_init_or_skip(
+        "vello_hybrid",
+        || -> Result<_, imaging_vello_hybrid::Error> {
+            let (device, queue) = try_init_device_and_queue()
+                .map_err(|_| imaging_vello_hybrid::Error::Internal("initialize wgpu"))?;
+            Ok(VelloHybridRenderer::new(device, queue))
+        },
+    ) else {
         return;
     };
 
@@ -73,9 +112,10 @@ fn native_scene_sink_supports_image_brushes_with_renderer() {
         sink.finish().expect("finish native scene sink");
     }
 
-    let bytes = renderer
-        .render_vello_hybrid_scene_rgba8(&scene)
+    let image = renderer
+        .render(&scene, 32, 32)
         .expect("render native hybrid scene");
+    let bytes = image.data.as_slice();
     assert_eq!(bytes.len(), 32 * 32 * 4);
     assert!(bytes.iter().any(|&channel| channel != 0));
 }

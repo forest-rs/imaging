@@ -19,11 +19,12 @@ use kompari::{
     Image, ImageDifference, SizeOptimizationLevel, compare_images, image_to_png, load_image,
 };
 
+use imaging::RgbaImage;
 use imaging_snapshot_tests::cases::{SnapshotCase, selected_cases_for_backend};
 
 pub(crate) fn run_cases(
     backend: &str,
-    render: impl FnMut(&dyn SnapshotCase) -> Image,
+    render: impl FnMut(&dyn SnapshotCase) -> RgbaImage,
     errors: &mut Vec<String>,
 ) {
     run_cases_with(backend, render, |_case| 0, errors);
@@ -47,7 +48,7 @@ where
 
 pub(crate) fn run_cases_with(
     backend: &str,
-    mut render: impl FnMut(&dyn SnapshotCase) -> Image,
+    mut render: impl FnMut(&dyn SnapshotCase) -> RgbaImage,
     mut max_allowed_different_pixels: impl FnMut(&dyn SnapshotCase) -> u64,
     errors: &mut Vec<String>,
 ) {
@@ -55,7 +56,7 @@ pub(crate) fn run_cases_with(
         if std::env::var("IMAGING_TEST_VERBOSE").is_ok() {
             eprintln!("[{backend}] running case `{}`", case.name());
         }
-        let image = render(case);
+        let image = kompari_image_from_rgba_image(&render(case));
         check_snapshot_with_tolerance(
             backend,
             case.name(),
@@ -64,6 +65,11 @@ pub(crate) fn run_cases_with(
             errors,
         );
     }
+}
+
+pub(crate) fn kompari_image_from_rgba_image(image: &RgbaImage) -> Image {
+    kompari::image::ImageBuffer::from_raw(image.width, image.height, image.data.clone())
+        .expect("RGBA buffer size should match image dimensions")
 }
 
 pub(crate) fn tests_dir() -> PathBuf {

@@ -2,7 +2,8 @@
 
 Vello (GPU) backend for the `imaging` command stream.
 
-This backend is intended for headless/offscreen rendering into an RGBA8 buffer.
+This backend supports both headless image rendering and host-owned `wgpu` texture/surface
+integration.
 
 ## Version Selection
 
@@ -12,11 +13,14 @@ This backend is intended for headless/offscreen rendering into an RGBA8 buffer.
 - `vello-0-7`
 
 To integrate with `wgpu` 27 via Vello 0.7, disable default features and opt into `vello-0-7`.
+Host code should use the `wgpu` re-export from `imaging_vello`, which always matches the selected
+Vello compatibility lane.
 
 ## Notes
 
-- This backend requires a working `wgpu` adapter/device. In sandboxed/headless environments it may
-  be unavailable; prefer using `VelloRenderer::try_new`.
+- This backend requires a working `wgpu` adapter/device. Hosts should usually own device creation
+  themselves; test code in this repository uses local helper functions rather than a public
+  bootstrap API.
 - `vello` 0.7.0 does not correctly support blend layers nested under `push_clip_layer`
   (see vello#1198), so “non-isolated blend” semantics can differ inside non-isolated clips.
 - `vello` does not expose per-draw blend modes; `imaging_vello` emulates them by wrapping the draw

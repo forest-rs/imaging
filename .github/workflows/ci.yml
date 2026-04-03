@@ -26,9 +26,9 @@ env:
     --exclude imaging_snapshot_tests
     --exclude imaging_vello
     --exclude imaging_vello_hybrid
-    --exclude velato_imaging
     --exclude imaging_wind_tunnel
     --exclude svg_imaging
+    --exclude velato_imaging
     --exclude xtask
   # List of packages that don't support wasip1
   RUST_NO_WASIP1_PKGS: >-

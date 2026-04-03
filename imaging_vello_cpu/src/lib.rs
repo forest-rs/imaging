@@ -26,8 +26,8 @@
 //!     }
 //!
 //!     let mut renderer = VelloCpuRenderer::new(128, 128);
-//!     let rgba = renderer.render_scene_rgba8(&scene)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     let image = renderer.render_scene(&scene, 128, 128)?;
+//!     assert_eq!(image.data.len(), 128 * 128 * 4);
 //!     Ok(())
 //! }
 //! ```
@@ -35,7 +35,7 @@
 //! # Stream Commands Directly
 //!
 //! [`VelloCpuRenderer`] also implements [`imaging::PaintSink`], so you can stream commands
-//! directly and call [`VelloCpuRenderer::finish_rgba8`] when the frame is complete.
+//! directly and call [`VelloCpuRenderer::finish`] when the frame is complete.
 //!
 //! ```no_run
 //! use imaging::Painter;
@@ -52,8 +52,8 @@
 //!         painter.fill_rect(Rect::new(16.0, 16.0, 112.0, 112.0), &paint);
 //!     }
 //!
-//!     let rgba = renderer.finish_rgba8()?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     let image = renderer.finish()?;
+//!     assert_eq!(image.data.len(), 128 * 128 * 4);
 //!     Ok(())
 //! }
 //! ```
@@ -65,10 +65,9 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
-    MaskMode, PaintSink, StrokeRef,
+    MaskMode, PaintSink, RgbaImage, StrokeRef,
     record::{Scene, ValidateError, replay, replay_transformed},
 };
 use kurbo::{Affine, Rect, Shape as _};
@@ -114,15 +113,19 @@ struct CachedMask {
 }
 
 impl VelloCpuRenderer {
-    /// Create a renderer for a fixed-size target.
-    ///
-    /// The renderer uses Vello CPU's `OptimizeSpeed` mode by default to keep snapshots stable.
-    pub fn new(width: u16, height: u16) -> Self {
-        let settings = RenderSettings {
+    fn render_settings() -> RenderSettings {
+        RenderSettings {
             render_mode: RenderMode::OptimizeSpeed,
             ..RenderSettings::default()
-        };
-        let ctx = RenderContext::new_with(width, height, settings);
+        }
+    }
+
+    /// Create a renderer with an initial target size.
+    ///
+    /// Scene rendering methods resize this target on demand. The renderer uses Vello CPU's
+    /// `OptimizeSpeed` mode by default to keep snapshots stable.
+    pub fn new(width: u16, height: u16) -> Self {
+        let ctx = RenderContext::new_with(width, height, Self::render_settings());
         Self {
             ctx,
             width,
@@ -160,16 +163,49 @@ impl VelloCpuRenderer {
         self.mask_cache.clear();
     }
 
-    /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
-        scene.validate().map_err(Error::InvalidScene)?;
-        self.reset();
-        replay(scene, self);
-        self.finish_rgba8()
+    fn resize(&mut self, width: u16, height: u16) {
+        if self.width == width && self.height == height {
+            return;
+        }
+
+        self.ctx = RenderContext::new_with(width, height, Self::render_settings());
+        self.width = width;
+        self.height = height;
+        self.clear_cached_masks();
+        self.error = None;
+        self.clip_depth = 0;
+        self.group_depth = 0;
     }
 
-    /// Finish rendering the current command stream and return an RGBA8 buffer (unpremultiplied).
-    pub fn finish_rgba8(&mut self) -> Result<Vec<u8>, Error> {
+    /// Render a recorded scene into an RGBA8 image (unpremultiplied).
+    pub fn render_scene_into(
+        &mut self,
+        scene: &Scene,
+        width: u16,
+        height: u16,
+        image: &mut RgbaImage,
+    ) -> Result<(), Error> {
+        scene.validate().map_err(Error::InvalidScene)?;
+        self.resize(width, height);
+        self.reset();
+        replay(scene, self);
+        self.finish_into(image)
+    }
+
+    /// Render a recorded scene and return an RGBA8 image (unpremultiplied).
+    pub fn render_scene(
+        &mut self,
+        scene: &Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+        self.render_scene_into(scene, width, height, &mut image)?;
+        Ok(image)
+    }
+
+    /// Finish rendering the current command stream into an RGBA8 image (unpremultiplied).
+    pub fn finish_into(&mut self, image: &mut RgbaImage) -> Result<(), Error> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
@@ -184,12 +220,19 @@ impl VelloCpuRenderer {
         self.ctx.flush();
         self.ctx.render_to_pixmap(&mut pixmap);
 
+        image.resize(u32::from(self.width), u32::from(self.height));
         let unpremul = pixmap.take_unpremultiplied();
-        let mut bytes = Vec::with_capacity(unpremul.len() * 4);
-        for p in unpremul {
-            bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+        for (pixel, rgba) in unpremul.iter().zip(image.data.chunks_exact_mut(4)) {
+            rgba.copy_from_slice(&[pixel.r, pixel.g, pixel.b, pixel.a]);
         }
-        Ok(bytes)
+        Ok(())
+    }
+
+    /// Finish rendering the current command stream and return an RGBA8 image (unpremultiplied).
+    pub fn finish(&mut self) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(u32::from(self.width), u32::from(self.height));
+        self.finish_into(&mut image)?;
+        Ok(image)
     }
 
     fn set_error_once(&mut self, err: Error) {
@@ -631,10 +674,10 @@ mod tests {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = VelloCpuRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
     }
 
@@ -643,13 +686,13 @@ mod tests {
         let scene = masked_scene(MaskMode::Luminance);
         let mut renderer = VelloCpuRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
 
         renderer.clear_cached_masks();
         assert!(renderer.mask_cache.is_empty());
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
     }
 
@@ -658,7 +701,7 @@ mod tests {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = VelloCpuRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
 
         renderer.set_tolerance(0.25);
@@ -680,7 +723,25 @@ mod tests {
         }
 
         let mut renderer = VelloCpuRenderer::new(64, 64);
-        let bytes = renderer.render_scene_rgba8(&scene).unwrap();
-        assert_eq!(bytes.len(), 64 * 64 * 4);
+        let image = renderer.render_scene(&scene, 64, 64).unwrap();
+        assert_eq!(image.data.len(), 64 * 64 * 4);
+    }
+
+    #[test]
+    fn render_scene_renders_image() {
+        let mut renderer = VelloCpuRenderer::new(64, 64);
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 64.0, 64.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+        let image = renderer.render_scene(&scene, 64, 64).unwrap();
+        assert_eq!(image.width, 64);
+        assert_eq!(image.height, 64);
     }
 }

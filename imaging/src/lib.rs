@@ -104,6 +104,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use kurbo::{Affine, Rect};
 use peniko::BlendMode;
 
@@ -117,6 +118,48 @@ pub use paint::{
     PaintSink, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
+
+/// Owned unpremultiplied RGBA8 image data returned by renderers.
+///
+/// This is an output type for readback and headless rendering results. It is not the shared image
+/// asset type used for image brushes or other `imaging` inputs; those continue to use
+/// [`peniko::ImageData`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RgbaImage {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Tightly packed RGBA8 pixels in row-major order.
+    pub data: Vec<u8>,
+}
+
+impl RgbaImage {
+    /// Create a zero-initialized RGBA8 image with the given dimensions.
+    #[must_use]
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            data: alloc::vec![0; rgba_image_len(width, height)],
+        }
+    }
+
+    /// Resize the image, preserving existing bytes where possible.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        self.data.resize(rgba_image_len(width, height), 0);
+    }
+}
+
+fn rgba_image_len(width: u32, height: u32) -> usize {
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .expect("RGBA image dimensions should fit in memory")
+}
 
 /// Normalized variable-font coordinate value.
 pub type NormalizedCoord = i16;

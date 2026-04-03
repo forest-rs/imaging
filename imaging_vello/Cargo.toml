@@ -13,7 +13,6 @@ publish = false
 imaging = { features = ["std"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
-pollster = "0.4.0"
 vello_07 = { default-features = true, optional = true, package = "vello", version = "0.7.0" }
 vello_08 = { default-features = true, optional = true, package = "vello", version = "0.8.0" }
 
@@ -21,6 +20,9 @@ vello_08 = { default-features = true, optional = true, package = "vello", versio
 default = ["vello-0-8"]
 vello-0-7 = ["dep:vello_07"]
 vello-0-8 = ["dep:vello_08"]
+
+[dev-dependencies]
+pollster = "0.4.0"
 
 [lints]
 workspace = true

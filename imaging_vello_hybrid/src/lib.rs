@@ -3,9 +3,15 @@
 
 //! Vello hybrid backend for `imaging`.
 //!
-//! This crate provides a headless CPU/GPU renderer that consumes `imaging::record::Scene` or a
-//! native [`vello_hybrid::Scene`] and produces an RGBA8 image buffer using `vello_hybrid` +
-//! `wgpu`.
+//! This crate provides a headless CPU/GPU renderer that consumes native
+//! [`vello_hybrid::Scene`] values and renders them to GPU targets or RGBA8 image data using
+//! `vello_hybrid` + `wgpu`.
+//!
+//! Semantic [`imaging::record::Scene`] values can be lowered to native hybrid scenes through
+//! [`VelloHybridRenderer::encode_scene`].
+//!
+//! In UI integrations, the host application should usually own the `wgpu` device, queue, and
+//! presentation targets, then pass those handles into [`VelloHybridRenderer`].
 //!
 //! Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
 //! and translated to backend-managed opaque image ids. Use [`VelloHybridSceneSink::with_renderer`]
@@ -32,9 +38,12 @@
 //!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
 //!     }
 //!
-//!     let mut renderer = VelloHybridRenderer::try_new(128, 128)?;
-//!     let rgba = renderer.render_scene_rgba8(&scene)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     # let device: imaging_vello_hybrid::wgpu::Device = todo!();
+//!     # let queue: imaging_vello_hybrid::wgpu::Queue = todo!();
+//!     let mut renderer = VelloHybridRenderer::new(device, queue);
+//!     let native = renderer.encode_scene(&scene, 128, 128)?;
+//!     let image = renderer.render(&native, 128, 128)?;
+//!     assert_eq!(image.width, 128);
 //!     Ok(())
 //! }
 //! ```
@@ -95,7 +104,9 @@
 //!     };
 //!     let brush = Brush::Image(ImageBrush::new(image));
 //!
-//!     let mut renderer = VelloHybridRenderer::try_new(128, 128)?;
+//!     # let device: imaging_vello_hybrid::wgpu::Device = todo!();
+//!     # let queue: imaging_vello_hybrid::wgpu::Queue = todo!();
+//!     let mut renderer = VelloHybridRenderer::new(device, queue);
 //!     let mut scene = vello_hybrid::Scene::new(128, 128);
 //!     scene.reset();
 //!
@@ -106,8 +117,8 @@
 //!         sink.finish()?;
 //!     }
 //!
-//!     let rgba = renderer.render_vello_hybrid_scene_rgba8(&scene)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     let image = renderer.render(&scene, 128, 128)?;
+//!     assert_eq!(image.width, 128);
 //!     Ok(())
 //! }
 //! ```
@@ -134,9 +145,11 @@
 //!         sink.finish()?;
 //!     }
 //!
-//!     let mut renderer = VelloHybridRenderer::try_new(128, 128)?;
-//!     let rgba = renderer.render_vello_hybrid_scene_rgba8(&scene)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     # let device: imaging_vello_hybrid::wgpu::Device = todo!();
+//!     # let queue: imaging_vello_hybrid::wgpu::Queue = todo!();
+//!     let mut renderer = VelloHybridRenderer::new(device, queue);
+//!     let image = renderer.render(&scene, 128, 128)?;
+//!     assert_eq!(image.width, 128);
 //!     Ok(())
 //! }
 //! ```
@@ -146,13 +159,17 @@
 
 mod image_registry;
 mod scene_sink;
+mod wgpu_support;
 
 use image_registry::{HybridImageRegistry, HybridImageUploadSession};
+use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
-use std::sync::mpsc;
 use vello_hybrid::{RenderError, RenderSize, RenderTargetConfig};
-use wgpu::{
-    CommandEncoderDescriptor, Extent3d, TextureDescriptor, TextureDimension, TextureFormat,
+pub use wgpu;
+use wgpu::{CommandEncoderDescriptor, TextureFormat};
+
+use crate::wgpu_support::{
+    OffscreenTarget, ReadbackError, read_texture_into, unpremultiply_rgba8_in_place,
 };
 
 pub use scene_sink::VelloHybridSceneSink;
@@ -170,10 +187,6 @@ pub enum Error {
     UnsupportedMask,
     /// Blurred rounded rect draws are not supported by this backend yet.
     UnsupportedBlurredRoundedRect,
-    /// No suitable GPU adapter was found.
-    NoAdapter,
-    /// A GPU device could not be created.
-    RequestDevice,
     /// Vello hybrid returned a render error.
     Render(RenderError),
     /// An internal invariant was violated.
@@ -186,10 +199,7 @@ pub struct VelloHybridRenderer {
     renderer: vello_hybrid::Renderer,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    texture: wgpu::Texture,
-    texture_view: wgpu::TextureView,
-    readback: wgpu::Buffer,
-    bytes_per_row: u32,
+    target: OffscreenTarget,
     width: u16,
     height: u16,
     tolerance: f64,
@@ -197,42 +207,30 @@ pub struct VelloHybridRenderer {
 }
 
 impl VelloHybridRenderer {
-    /// Create a renderer for a fixed-size target.
-    pub fn new(width: u16, height: u16) -> Self {
-        Self::try_new(width, height).expect("create imaging_vello_hybrid renderer")
-    }
-
-    /// Create a renderer for a fixed-size target.
-    ///
-    /// This is fallible because `wgpu` may not be able to find a compatible adapter/device
-    /// in some sandboxed or headless environments.
-    pub fn try_new(width: u16, height: u16) -> Result<Self, Error> {
-        let (device, queue) = pollster::block_on(init_device_and_queue())?;
-        let (texture, texture_view, readback, bytes_per_row) =
-            create_targets(&device, width, height);
+    /// Create a renderer bound to an existing `wgpu` device and queue.
+    #[must_use]
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let target = OffscreenTarget::new(&device, 1, 1);
 
         let renderer = vello_hybrid::Renderer::new(
             &device,
             &RenderTargetConfig {
                 format: TextureFormat::Rgba8Unorm,
-                width: u32::from(width),
-                height: u32::from(height),
+                width: 1,
+                height: 1,
             },
         );
 
-        Ok(Self {
+        Self {
             renderer,
             device,
             queue,
-            texture,
-            texture_view,
-            readback,
-            bytes_per_row,
-            width,
-            height,
+            target,
+            width: 1,
+            height: 1,
             tolerance: 0.1,
             image_registry: HybridImageRegistry::new(),
-        })
+        }
     }
 
     /// Set the tolerance used when converting shapes to paths.
@@ -267,13 +265,16 @@ impl VelloHybridRenderer {
         self.queue.submit([encoder.finish()]);
     }
 
-    /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
-    ///
-    /// Inline image brushes are uploaded on demand and cached for the lifetime of this renderer
-    /// (or until [`Self::clear_cached_images`] is called).
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`vello_hybrid::Scene`].
+    pub fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<vello_hybrid::Scene, Error> {
         scene.validate().map_err(Error::InvalidScene)?;
-        let mut native = vello_hybrid::Scene::new(self.width, self.height);
+        self.resize_target(width, height);
+        let mut native = vello_hybrid::Scene::new(width, height);
         native.reset();
         let tolerance = self.tolerance;
         {
@@ -282,18 +283,74 @@ impl VelloHybridRenderer {
             replay(scene, &mut sink);
             sink.finish()?;
         }
-        self.render_vello_hybrid_scene_rgba8(&native)
+        Ok(native)
     }
 
-    /// Render a native [`vello_hybrid::Scene`] and return an RGBA8 buffer (unpremultiplied).
-    pub fn render_vello_hybrid_scene_rgba8(
+    /// Render a native [`vello_hybrid::Scene`] into an RGBA8 image (unpremultiplied).
+    pub fn render_into(
         &mut self,
         scene: &vello_hybrid::Scene,
-    ) -> Result<Vec<u8>, Error> {
-        let render_size = RenderSize {
-            width: u32::from(self.width),
-            height: u32::from(self.height),
-        };
+        width: u16,
+        height: u16,
+        image: &mut RgbaImage,
+    ) -> Result<(), Error> {
+        self.resize_target(width, height);
+        let texture_view = self.target.texture_view().clone();
+        let target_width = self.target.width();
+        let target_height = self.target.height();
+        self.render_to_view(scene, &texture_view, target_width, target_height)?;
+        readback_into(
+            &self.device,
+            &self.queue,
+            self.target.texture(),
+            target_width,
+            target_height,
+            image,
+        )
+    }
+
+    /// Render a native [`vello_hybrid::Scene`] and return an RGBA8 image (unpremultiplied).
+    pub fn render(
+        &mut self,
+        scene: &vello_hybrid::Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+        self.render_into(scene, width, height, &mut image)?;
+        Ok(image)
+    }
+
+    /// Render a native [`vello_hybrid::Scene`] into a caller-provided texture view.
+    pub fn render_to_texture_view(
+        &mut self,
+        scene: &vello_hybrid::Scene,
+        texture_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        self.render_to_view(scene, texture_view, width, height)
+    }
+
+    fn resize_target(&mut self, width: u16, height: u16) {
+        if self.width == width && self.height == height {
+            return;
+        }
+
+        self.target
+            .resize(&self.device, u32::from(width), u32::from(height));
+        self.width = width;
+        self.height = height;
+    }
+
+    fn render_to_view(
+        &mut self,
+        scene: &vello_hybrid::Scene,
+        texture_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        let render_size = RenderSize { width, height };
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
@@ -307,118 +364,186 @@ impl VelloHybridRenderer {
                 &self.queue,
                 &mut encoder,
                 &render_size,
-                &self.texture_view,
+                texture_view,
             )
             .map_err(Error::Render)?;
 
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.bytes_per_row),
-                    rows_per_image: None,
-                },
-            },
-            Extent3d {
-                width: u32::from(self.width),
-                height: u32::from(self.height),
-                depth_or_array_layers: 1,
-            },
-        );
-
         self.queue.submit([encoder.finish()]);
-
-        let slice = self.readback.slice(..);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|_| Error::Internal("device poll failed"))?;
-        rx.recv()
-            .map_err(|_| Error::Internal("map_async callback dropped"))?
-            .map_err(|_| Error::Internal("buffer map failed"))?;
-
-        let mapped = slice.get_mapped_range();
-        let width_bytes = usize::from(self.width) * 4;
-        let mut pixels = Vec::with_capacity(usize::from(self.width) * usize::from(self.height));
-        for row in mapped.chunks_exact(self.bytes_per_row as usize) {
-            for px in row[..width_bytes].chunks_exact(4) {
-                pixels.push(peniko::color::PremulRgba8::from_u8_array([
-                    px[0], px[1], px[2], px[3],
-                ]));
-            }
-        }
-        drop(mapped);
-        self.readback.unmap();
-
-        let pixmap = vello_common::pixmap::Pixmap::from_parts(pixels, self.width, self.height);
-        let unpremul = pixmap.take_unpremultiplied();
-
-        let mut bytes = Vec::with_capacity(unpremul.len() * 4);
-        for p in unpremul {
-            bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
-        }
-        Ok(bytes)
+        Ok(())
     }
 }
 
-async fn init_device_and_queue() -> Result<(wgpu::Device, wgpu::Queue), Error> {
-    let instance = wgpu::Instance::default();
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })
-        .await
-        .map_err(|_| Error::NoAdapter)?;
-
-    adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("imaging_vello_hybrid device"),
-            required_features: wgpu::Features::empty(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| Error::RequestDevice)
+fn readback_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    image: &mut RgbaImage,
+) -> Result<(), Error> {
+    read_texture_into(device, queue, texture, width, height, image).map_err(map_readback_error)?;
+    unpremultiply_rgba8_in_place(&mut image.data);
+    Ok(())
 }
 
-fn create_targets(
-    device: &wgpu::Device,
-    width: u16,
-    height: u16,
-) -> (wgpu::Texture, wgpu::TextureView, wgpu::Buffer, u32) {
-    let texture = device.create_texture(&TextureDescriptor {
-        label: Some("imaging_vello_hybrid render target"),
-        size: Extent3d {
-            width: u32::from(width),
-            height: u32::from(height),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+fn map_readback_error(err: ReadbackError) -> Error {
+    match err {
+        ReadbackError::DevicePoll => Error::Internal("device poll failed"),
+        ReadbackError::CallbackDropped => Error::Internal("map_async callback dropped"),
+        ReadbackError::BufferMap => Error::Internal("buffer map failed"),
+    }
+}
 
-    let bytes_per_row = (u32::from(width) * 4).next_multiple_of(256);
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("imaging_vello_hybrid readback buffer"),
-        size: u64::from(bytes_per_row) * u64::from(height),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    (texture, texture_view, readback, bytes_per_row)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imaging::{Painter, record::Scene};
+    use kurbo::Rect;
+    use peniko::{Blob, Brush, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
+    use pollster::block_on;
+    use std::sync::Arc;
+    use wgpu::Extent3d;
+
+    fn try_init_device_and_queue() -> Result<(wgpu::Device, wgpu::Queue), ()> {
+        block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::default(),
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .map_err(|_| ())?;
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("imaging_vello_hybrid test device"),
+                    required_features: wgpu::Features::empty(),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|_| ())
+        })
+    }
+
+    #[test]
+    fn render_renders_encoded_scene() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 48.0, 48.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+
+        let native = renderer.encode_scene(&scene, 48, 48).unwrap();
+        let image = renderer.render(&native, 48, 48).unwrap();
+        assert_eq!(image.width, 48);
+        assert_eq!(image.height, 48);
+    }
+
+    #[test]
+    fn texture_view_render_smoke() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device.clone(), queue);
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 24.0, 24.0),
+                    Color::from_rgb8(0xd9, 0x77, 0x06),
+                )
+                .draw();
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_vello_hybrid target"),
+            size: Extent3d {
+                width: 24,
+                height: 24,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let native = renderer.encode_scene(&scene, 24, 24).unwrap();
+        renderer
+            .render_to_texture_view(&native, &texture_view, 24, 24)
+            .unwrap();
+    }
+
+    #[test]
+    fn app_owned_wgpu_renders() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 20.0, 20.0),
+                    Color::from_rgb8(0xd9, 0x77, 0x06),
+                )
+                .draw();
+        }
+
+        let native = renderer.encode_scene(&scene, 20, 20).unwrap();
+        let image = renderer.render(&native, 20, 20).unwrap();
+        assert_eq!(image.width, 20);
+        assert_eq!(image.height, 20);
+    }
+
+    #[test]
+    fn native_scene_with_image_brush_survives_resize() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let image = ImageData {
+            data: Blob::new(Arc::new([
+                0xff, 0x20, 0x20, 0xff, 0x20, 0xff, 0x20, 0xff, 0x20, 0x20, 0xff, 0xff, 0xff, 0xff,
+                0x20, 0xff,
+            ])),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 2,
+            height: 2,
+        };
+        let brush = Brush::Image(ImageBrush::new(image));
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 20.0, 20.0), &brush).draw();
+        }
+
+        let native = renderer.encode_scene(&scene, 20, 20).unwrap();
+        let resize_scene = Scene::new();
+        let _ = renderer.encode_scene(&resize_scene, 24, 24).unwrap();
+
+        let image = renderer.render(&native, 20, 20).unwrap();
+        assert_eq!(image.width, 20);
+        assert_eq!(image.height, 20);
+    }
 }

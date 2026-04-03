@@ -1066,6 +1066,7 @@ dependencies = [
  "kompari",
  "kurbo",
  "peniko",
+ "pollster",
  "skrifa",
  "svg_imaging",
  "vello_hybrid",
