@@ -164,6 +164,7 @@ mod wgpu_support;
 use image_registry::{HybridImageRegistry, HybridImageUploadSession};
 use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
+use imaging::render::{ImageRenderer, RenderSource, TextureRenderer};
 use vello_hybrid::{RenderError, RenderSize, RenderTargetConfig};
 pub use wgpu;
 use wgpu::{CommandEncoderDescriptor, TextureFormat};
@@ -206,7 +207,35 @@ pub struct VelloHybridRenderer {
     image_registry: HybridImageRegistry,
 }
 
+/// Caller-owned texture target used with [`imaging::TextureRenderer`] on
+/// [`VelloHybridRenderer`].
+#[derive(Copy, Clone, Debug)]
+pub struct TextureTarget<'a> {
+    view: &'a wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> TextureTarget<'a> {
+    /// Create a texture target wrapper for a caller-owned texture view and dimensions.
+    #[must_use]
+    pub fn new(view: &'a wgpu::TextureView, width: u32, height: u32) -> Self {
+        Self {
+            view,
+            width,
+            height,
+        }
+    }
+}
+
 impl VelloHybridRenderer {
+    fn checked_size(width: u32, height: u32) -> Result<(u16, u16), Error> {
+        let width = u16::try_from(width).map_err(|_| Error::Internal("render width too large"))?;
+        let height =
+            u16::try_from(height).map_err(|_| Error::Internal("render height too large"))?;
+        Ok((width, height))
+    }
+
     /// Create a renderer bound to an existing `wgpu` device and queue.
     #[must_use]
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -281,6 +310,27 @@ impl VelloHybridRenderer {
             let mut sink = VelloHybridSceneSink::with_renderer(&mut native, self);
             sink.set_tolerance(tolerance);
             replay(scene, &mut sink);
+            sink.finish()?;
+        }
+        Ok(native)
+    }
+
+    fn encode_source<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        width: u32,
+        height: u32,
+    ) -> Result<vello_hybrid::Scene, Error> {
+        source.validate().map_err(Error::InvalidScene)?;
+        let (width, height) = Self::checked_size(width, height)?;
+        self.resize_target(width, height);
+        let mut native = vello_hybrid::Scene::new(width, height);
+        native.reset();
+        let tolerance = self.tolerance;
+        {
+            let mut sink = VelloHybridSceneSink::with_renderer(&mut native, self);
+            sink.set_tolerance(tolerance);
+            source.paint_into(&mut sink);
             sink.finish()?;
         }
         Ok(native)
@@ -373,6 +423,36 @@ impl VelloHybridRenderer {
     }
 }
 
+impl ImageRenderer for VelloHybridRenderer {
+    type Error = Error;
+
+    fn render_source_into<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        width: u32,
+        height: u32,
+        image: &mut RgbaImage,
+    ) -> Result<(), Self::Error> {
+        let native = self.encode_source(source, width, height)?;
+        let (width, height) = Self::checked_size(width, height)?;
+        self.render_into(&native, width, height, image)
+    }
+}
+
+impl TextureRenderer for VelloHybridRenderer {
+    type Error = Error;
+    type TextureTarget<'a> = TextureTarget<'a>;
+
+    fn render_source_to_texture<'a, S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        let native = self.encode_source(source, target.width, target.height)?;
+        self.render_to_texture_view(&native, target.view, target.width, target.height)
+    }
+}
+
 fn readback_into(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -451,6 +531,30 @@ mod tests {
     }
 
     #[test]
+    fn render_source_renders_scene() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 40.0, 40.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+
+        let mut source = &scene;
+        let image = renderer.render_source(&mut source, 40, 40).unwrap();
+        assert_eq!(image.width, 40);
+        assert_eq!(image.height, 40);
+    }
+
+    #[test]
     fn texture_view_render_smoke() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -486,6 +590,45 @@ mod tests {
         let native = renderer.encode_scene(&scene, 24, 24).unwrap();
         renderer
             .render_to_texture_view(&native, &texture_view, 24, 24)
+            .unwrap();
+    }
+
+    #[test]
+    fn render_source_to_texture_smoke() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device.clone(), queue);
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 24.0, 24.0),
+                    Color::from_rgb8(0x1d, 0x4e, 0x89),
+                )
+                .draw();
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_vello_hybrid target"),
+            size: Extent3d {
+                width: 24,
+                height: 24,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut source = &scene;
+        renderer
+            .render_source_to_texture(&mut source, TextureTarget::new(&texture_view, 24, 24))
             .unwrap();
     }
 

@@ -69,6 +69,7 @@ use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
     MaskMode, PaintSink, RgbaImage, StrokeRef,
     record::{Scene, ValidateError, replay, replay_transformed},
+    render::{ImageRenderer, RenderSource},
 };
 use kurbo::{Affine, Rect, Shape as _};
 use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
@@ -113,6 +114,13 @@ struct CachedMask {
 }
 
 impl VelloCpuRenderer {
+    fn checked_size(width: u32, height: u32) -> Result<(u16, u16), Error> {
+        let width = u16::try_from(width).map_err(|_| Error::Internal("render width too large"))?;
+        let height =
+            u16::try_from(height).map_err(|_| Error::Internal("render height too large"))?;
+        Ok((width, height))
+    }
+
     fn render_settings() -> RenderSettings {
         RenderSettings {
             render_mode: RenderMode::OptimizeSpeed,
@@ -476,6 +484,25 @@ impl VelloCpuRenderer {
     }
 }
 
+impl ImageRenderer for VelloCpuRenderer {
+    type Error = Error;
+
+    fn render_source_into<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        width: u32,
+        height: u32,
+        image: &mut RgbaImage,
+    ) -> Result<(), Self::Error> {
+        let (width, height) = Self::checked_size(width, height)?;
+        source.validate().map_err(Error::InvalidScene)?;
+        self.resize(width, height);
+        self.reset();
+        source.paint_into(self);
+        self.finish_into(image)
+    }
+}
+
 #[inline]
 #[allow(
     clippy::cast_possible_truncation,
@@ -743,5 +770,25 @@ mod tests {
         let image = renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(image.width, 64);
         assert_eq!(image.height, 64);
+    }
+
+    #[test]
+    fn render_source_renders_image() {
+        let mut renderer = VelloCpuRenderer::new(48, 48);
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 48.0, 48.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+
+        let mut source = &scene;
+        let image = renderer.render_source(&mut source, 48, 48).unwrap();
+        assert_eq!(image.width, 48);
+        assert_eq!(image.height, 48);
     }
 }

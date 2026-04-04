@@ -118,6 +118,7 @@ mod sinks;
 use imaging::{
     Filter, GeometryRef, GlyphRunRef, RgbaImage,
     record::{Scene, ValidateError, replay},
+    render::{ImageRenderer, RenderSource},
 };
 use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
@@ -168,6 +169,13 @@ impl Default for SkiaRenderer {
 }
 
 impl SkiaRenderer {
+    fn checked_size(width: u32, height: u32) -> Result<(i32, i32), Error> {
+        let width = i32::try_from(width).map_err(|_| Error::Internal("render width too large"))?;
+        let height =
+            i32::try_from(height).map_err(|_| Error::Internal("render height too large"))?;
+        Ok((width, height))
+    }
+
     fn create_surface(width: i32, height: i32) -> sk::Surface {
         // Use an explicit RGBA8888 premultiplied raster surface. Many blend modes are defined in
         // premultiplied space, and it also matches Skia's typical raster backend behavior.
@@ -309,6 +317,29 @@ impl SkiaRenderer {
             return Err(Error::Internal("read_pixels failed"));
         }
         Ok(())
+    }
+}
+
+impl ImageRenderer for SkiaRenderer {
+    type Error = Error;
+
+    fn render_source_into<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        width: u32,
+        height: u32,
+        image: &mut RgbaImage,
+    ) -> Result<(), Self::Error> {
+        let (width, height) = Self::checked_size(width, height)?;
+        source.validate().map_err(Error::InvalidScene)?;
+        self.resize(width, height);
+        self.reset();
+        let mut sink =
+            SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
+        sink.set_tolerance(self.tolerance);
+        source.paint_into(&mut sink);
+        sink.finish()?;
+        self.read_into(image)
     }
 }
 
@@ -845,5 +876,25 @@ mod tests {
         let image = renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(image.width, 64);
         assert_eq!(image.height, 64);
+    }
+
+    #[test]
+    fn render_source_renders_image() {
+        let mut renderer = SkiaRenderer::new();
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 48.0, 48.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+
+        let mut source = &scene;
+        let image = renderer.render_source(&mut source, 48, 48).unwrap();
+        assert_eq!(image.width, 48);
+        assert_eq!(image.height, 48);
     }
 }

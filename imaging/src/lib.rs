@@ -111,6 +111,7 @@ use peniko::BlendMode;
 mod paint;
 mod painter;
 pub mod record;
+pub mod render;
 pub mod validation;
 
 pub use paint::{
@@ -118,6 +119,7 @@ pub use paint::{
     PaintSink, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
+pub use render::{ImageRenderer, RenderSource, TextureRenderer};
 
 /// Owned unpremultiplied RGBA8 image data returned by renderers.
 ///
