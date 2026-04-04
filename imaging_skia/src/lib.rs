@@ -1,6 +1,11 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+#![allow(
+    unsafe_code,
+    reason = "Skia Ganesh interop needs raw wgpu-hal handle access in the gpu modules"
+)]
+
 //! Skia backend for `imaging`.
 //!
 //! This crate provides a CPU raster renderer that consumes `imaging::record::Scene` or native
@@ -109,12 +114,58 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # GPU Rendering
+//!
+//! Enable the `gpu` feature when you want Skia Ganesh rendering through app-owned `wgpu`
+//! handles. [`SkiaGpuRenderer`] reuses the current backend selected by `wgpu` and renders native
+//! [`skia_safe::Picture`] values into caller-owned `wgpu::Texture` targets.
+//!
+//! ```no_run
+//! # #[cfg(feature = "gpu")]
+//! # {
+//! use imaging::{Painter, record};
+//! use imaging_skia::SkiaGpuRenderer;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//!
+//! # let adapter: imaging_skia::wgpu::Adapter = todo!();
+//! # let device: imaging_skia::wgpu::Device = todo!();
+//! # let queue: imaging_skia::wgpu::Queue = todo!();
+//! # let texture: imaging_skia::wgpu::Texture = todo!();
+//! let mut scene = record::Scene::new();
+//! {
+//!     let mut painter = Painter::new(&mut scene);
+//!     painter.fill_rect(
+//!         Rect::new(0.0, 0.0, 128.0, 128.0),
+//!         &Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb)),
+//!     );
+//! }
+//!
+//! let mut renderer = SkiaGpuRenderer::new(adapter, device, queue)?;
+//! let picture = renderer.encode_scene(&scene, 128, 128)?;
+//! renderer.render_picture_to_texture(&picture, &texture)?;
+//! # }
+//! # Ok::<(), imaging_skia::Error>(())
+//! ```
 
-#![deny(unsafe_code)]
+#![cfg_attr(not(feature = "gpu"), deny(unsafe_code))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+#[cfg(all(feature = "gpu", windows))]
+mod d3d;
+#[cfg(feature = "gpu")]
+mod ganesh;
+#[cfg(feature = "gpu")]
+mod gpu_readback;
+#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios")))]
+mod metal;
 mod sinks;
+#[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios"))))]
+mod vulkan;
 
+#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios")))]
+use foreign_types_shared as _;
 use imaging::{
     Filter, GeometryRef, GlyphRunRef, RgbaImage,
     record::{Scene, ValidateError, replay},
@@ -128,14 +179,34 @@ use peniko::{
 use skia_safe as sk;
 use std::{cell::RefCell, rc::Rc};
 
+#[cfg(feature = "gpu")]
+use crate::ganesh::GaneshBackend;
+#[cfg(feature = "gpu")]
+use crate::gpu_readback::{ReadbackError, ScratchTexture, read_texture_into};
+#[cfg(feature = "gpu")]
+use imaging::render::TextureRenderer;
 use sinks::MaskCache;
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
+#[cfg(feature = "gpu")]
+pub use wgpu;
 
 /// Errors that can occur when rendering via Skia.
 #[derive(Debug)]
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
+    /// No supported Ganesh backend was available for the active platform or `wgpu` backend.
+    #[cfg(feature = "gpu")]
+    UnsupportedGpuBackend,
+    /// A Ganesh backend context could not be created from the supplied `wgpu` handles.
+    #[cfg(feature = "gpu")]
+    CreateGpuContext(&'static str),
+    /// A caller-owned GPU texture could not be wrapped as a Skia surface.
+    #[cfg(feature = "gpu")]
+    CreateGpuSurface,
+    /// The target texture format cannot be represented through Skia Ganesh.
+    #[cfg(feature = "gpu")]
+    UnsupportedGpuTextureFormat,
     /// An image brush was encountered; this backend does not support it.
     UnsupportedImageBrush,
     /// A filter configuration could not be translated.
@@ -343,6 +414,199 @@ impl ImageRenderer for SkiaRenderer {
     }
 }
 
+#[cfg(feature = "gpu")]
+fn encode_source_to_picture<S: RenderSource + ?Sized>(
+    source: &mut S,
+    width: u32,
+    height: u32,
+    tolerance: f64,
+) -> Result<sk::Picture, Error> {
+    source.validate().map_err(Error::InvalidScene)?;
+    let bounds = kurbo::Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+    let mut sink = SkPictureRecorderSink::new(bounds);
+    sink.set_tolerance(tolerance);
+    source.paint_into(&mut sink);
+    sink.finish_picture()
+}
+
+#[cfg(feature = "gpu")]
+/// Caller-owned texture target used with [`imaging::TextureRenderer`] on [`SkiaGpuRenderer`].
+#[derive(Copy, Clone, Debug)]
+pub struct TextureTarget<'a> {
+    texture: &'a wgpu::Texture,
+}
+
+#[cfg(feature = "gpu")]
+impl<'a> TextureTarget<'a> {
+    /// Create a texture target wrapper for a caller-owned `wgpu::Texture`.
+    #[must_use]
+    pub fn new(texture: &'a wgpu::Texture) -> Self {
+        Self { texture }
+    }
+}
+
+#[cfg(feature = "gpu")]
+/// GPU Skia renderer that shares an app-owned `wgpu` device and queue.
+///
+/// This renderer uses Skia Ganesh for drawing and treats caller-owned `wgpu::Texture` values as
+/// the primary GPU target API. Hosts are expected to own surface acquisition and presentation.
+#[derive(Debug)]
+pub struct SkiaGpuRenderer {
+    backend: GaneshBackend,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    scratch: ScratchTexture,
+    tolerance: f64,
+    mask_cache: Rc<RefCell<MaskCache>>,
+}
+
+#[cfg(feature = "gpu")]
+impl SkiaGpuRenderer {
+    fn checked_texture_size(texture: &wgpu::Texture) -> Result<(u32, u32), Error> {
+        if texture.dimension() != wgpu::TextureDimension::D2 {
+            return Err(Error::Internal(
+                "Skia GPU renderer only supports 2D textures",
+            ));
+        }
+        if texture.sample_count() != 1 {
+            return Err(Error::Internal(
+                "Skia GPU renderer only supports single-sampled textures",
+            ));
+        }
+        Ok((texture.width(), texture.height()))
+    }
+
+    /// Create a GPU renderer bound to an existing `wgpu` adapter, device, and queue.
+    ///
+    /// The adapter is used to select the active Ganesh interop backend at runtime. This matters
+    /// on platforms like Windows where `wgpu` may run over either D3D12 or Vulkan.
+    pub fn new(
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Result<Self, Error> {
+        let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
+        let scratch = ScratchTexture::new(
+            &device,
+            1,
+            1,
+            wgpu::TextureFormat::Rgba8Unorm,
+            "imaging_skia gpu scratch target",
+        );
+        Ok(Self {
+            backend,
+            device,
+            queue,
+            scratch,
+            tolerance: 0.1,
+            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
+        })
+    }
+
+    /// Set the tolerance used when converting shapes to paths during scene encoding.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        if self.tolerance != tolerance {
+            self.mask_cache.borrow_mut().clear();
+        }
+        self.tolerance = tolerance;
+    }
+
+    /// Drop any realized mask artifacts cached by the renderer.
+    pub fn clear_cached_masks(&mut self) {
+        self.mask_cache.borrow_mut().clear();
+    }
+
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`skia_safe::Picture`].
+    pub fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<sk::Picture, Error> {
+        let mut source = scene;
+        encode_source_to_picture(&mut source, width, height, self.tolerance)
+    }
+
+    /// Render a native [`skia_safe::Picture`] into a caller-owned `wgpu::Texture`.
+    pub fn render_picture_to_texture(
+        &mut self,
+        picture: &sk::Picture,
+        texture: &wgpu::Texture,
+    ) -> Result<(), Error> {
+        let _ = Self::checked_texture_size(texture)?;
+        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        let mut surface = self.backend.wrap_texture(texture)?;
+        surface.canvas().clear(sk::Color::TRANSPARENT);
+        surface.canvas().draw_picture(picture, None, None);
+        self.backend.flush_surface(&mut surface);
+        Ok(())
+    }
+
+    /// Render a native [`skia_safe::Picture`] into an RGBA8 image (unpremultiplied).
+    pub fn render_picture_into(
+        &mut self,
+        picture: &sk::Picture,
+        width: u32,
+        height: u32,
+        image: &mut RgbaImage,
+    ) -> Result<(), Error> {
+        self.scratch.resize(&self.device, width, height);
+        let scratch = self.scratch.texture().clone();
+        self.render_picture_to_texture(picture, &scratch)?;
+        read_texture_into(&self.device, &self.queue, &scratch, width, height, image).map_err(
+            |err| match err {
+                ReadbackError::DevicePoll => Error::Internal("wgpu device poll failed"),
+                ReadbackError::CallbackDropped => Error::Internal("wgpu readback callback dropped"),
+                ReadbackError::BufferMap => Error::Internal("wgpu readback buffer map failed"),
+            },
+        )
+    }
+
+    /// Render a native [`skia_safe::Picture`] and return an RGBA8 image (unpremultiplied).
+    pub fn render_picture(
+        &mut self,
+        picture: &sk::Picture,
+        width: u32,
+        height: u32,
+    ) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(width, height);
+        self.render_picture_into(picture, width, height, &mut image)?;
+        Ok(image)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl ImageRenderer for SkiaGpuRenderer {
+    type Error = Error;
+
+    fn render_source_into<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        width: u32,
+        height: u32,
+        image: &mut RgbaImage,
+    ) -> Result<(), Self::Error> {
+        let picture = encode_source_to_picture(source, width, height, self.tolerance)?;
+        self.render_picture_into(&picture, width, height, image)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl TextureRenderer for SkiaGpuRenderer {
+    type Error = Error;
+    type TextureTarget<'a> = TextureTarget<'a>;
+
+    fn render_source_to_texture<'a, S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        let (width, height) = Self::checked_texture_size(target.texture)?;
+        let picture = encode_source_to_picture(source, width, height, self.tolerance)?;
+        self.render_picture_to_texture(&picture, target.texture)
+    }
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     reason = "Skia APIs consume f32; truncation from f64 geometry is acceptable"
@@ -353,6 +617,65 @@ fn f64_to_f32(v: f64) -> f32 {
 
 fn rad_to_deg(rad: f32) -> f32 {
     rad * (180.0 / core::f32::consts::PI)
+}
+
+#[cfg(feature = "gpu")]
+fn color_type_for_wgpu_texture_format(
+    texture_format: wgpu::TextureFormat,
+) -> Result<sk::ColorType, Error> {
+    match texture_format {
+        wgpu::TextureFormat::Rgba8Unorm => Ok(sk::ColorType::RGBA8888),
+        wgpu::TextureFormat::Rgba8UnormSrgb => Ok(sk::ColorType::SRGBA8888),
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            Ok(sk::ColorType::BGRA8888)
+        }
+        wgpu::TextureFormat::Rgb10a2Unorm => Ok(sk::ColorType::RGBA1010102),
+        wgpu::TextureFormat::Rgba16Unorm => Ok(sk::ColorType::R16G16B16A16UNorm),
+        wgpu::TextureFormat::Rgba16Float => Ok(sk::ColorType::RGBAF16),
+        _ => Err(Error::UnsupportedGpuTextureFormat),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn color_space_for_wgpu_texture_format(
+    texture_format: wgpu::TextureFormat,
+) -> Option<sk::ColorSpace> {
+    match texture_format {
+        wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            Some(sk::ColorSpace::new_srgb())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn initialize_texture_for_wgpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+) {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("imaging_skia texture init"),
+    });
+    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("imaging_skia texture init"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    drop(_pass);
+    queue.submit([encoder.finish()]);
 }
 
 fn affine_to_matrix(xf: Affine) -> sk::Matrix {
@@ -778,6 +1101,12 @@ mod tests {
     use imaging::{GroupRef, MaskMode, Painter};
     use kurbo::Rect;
     use peniko::{Brush, Color};
+    #[cfg(feature = "gpu")]
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
 
     fn masked_scene(mode: MaskMode) -> Scene {
         let mask = Painter::<Scene>::record_mask(mode, |mask| {
@@ -896,5 +1225,90 @@ mod tests {
         let image = renderer.render_source(&mut source, 48, 48).unwrap();
         assert_eq!(image.width, 48);
         assert_eq!(image.height, 48);
+    }
+
+    #[cfg(feature = "gpu")]
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut future = pin!(future);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn try_init_gpu_renderer() -> Option<SkiaGpuRenderer> {
+        let instance = wgpu::Instance::default();
+        let adapter =
+            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let desc = wgpu::DeviceDescriptor::default();
+        let (device, queue) = block_on(adapter.request_device(&desc)).ok()?;
+        SkiaGpuRenderer::new(adapter, device, queue).ok()
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_renderer_renders_picture_to_image() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+
+        let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 16.0, 16.0));
+        {
+            let mut painter = Painter::new(&mut sink);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 16.0, 16.0),
+                &Brush::Solid(Color::from_rgb8(0x11, 0x22, 0x33)),
+            );
+        }
+
+        let picture = sink.finish_picture().unwrap();
+        let image = renderer.render_picture(&picture, 16, 16).unwrap();
+
+        assert_eq!(image.width, 16);
+        assert_eq!(image.height, 16);
+        assert_eq!(&image.data[..4], &[0x11, 0x22, 0x33, 0xff]);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_renderer_renders_source_to_texture() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+
+        let device = renderer.device.clone();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_skia gpu target"),
+            size: wgpu::Extent3d {
+                width: 24,
+                height: 24,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 24.0, 24.0),
+                &Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb)),
+            );
+        }
+
+        let mut source = &scene;
+        renderer
+            .render_source_to_texture(&mut source, TextureTarget::new(&texture))
+            .unwrap();
     }
 }

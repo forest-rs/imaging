@@ -9,11 +9,40 @@ description = "Skia backend for the imaging command stream."
 readme = "README.md"
 publish = false
 
+[features]
+default = []
+gpu = [
+    "dep:foreign-types-shared",
+    "dep:wgpu",
+    "dep:ash",
+    "dep:windows",
+]
+
 [dependencies]
 imaging = { features = ["std"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 skia-safe = { version = "0.90.0" }
+wgpu = { optional = true, version = "28.0.0" }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+foreign-types-shared = { version = "0.3", optional = true }
+skia-safe = { version = "0.90.0", features = ["metal"] }
+
+[target.'cfg(windows)'.dependencies]
+ash = { version = "0.38.0", optional = true }
+skia-safe = { version = "0.90.0", features = ["d3d", "vulkan"] }
+windows = { version = "0.62.0", optional = true, features = [
+    "Win32",
+    "Win32_Graphics",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "ios", windows)))'.dependencies]
+ash = { version = "0.38.0", optional = true }
+skia-safe = { version = "0.90.0", features = ["vulkan"] }
 
 [lints]
 workspace = true

@@ -1048,10 +1048,14 @@ dependencies = [
 name = "imaging_skia"
 version = "0.0.1"
 dependencies = [
+ "ash",
+ "foreign-types-shared",
  "imaging",
  "kurbo",
  "peniko",
  "skia-safe",
+ "wgpu 28.0.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2068,6 +2072,7 @@ checksum = "6a71c01d325d40b1031dee67d251a5e0132e79e2a9ec272149a4f4a0d4b8b3be"
 dependencies = [
  "bitflags 2.10.0",
  "skia-bindings",
+ "windows 0.62.2",
 ]
 
 [[package]]
