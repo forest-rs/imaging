@@ -723,6 +723,7 @@ mod tests {
 
 /// Builder for configuring a fill draw before emission.
 #[derive(Debug)]
+#[must_use = "fill builders do nothing until you call .draw()"]
 pub struct FillBuilder<'a, S: ?Sized> {
     sink: &'a mut S,
     draw: FillRef<'a>,
@@ -733,28 +734,24 @@ where
     S: PaintSink + ?Sized,
 {
     /// Set the geometry transform.
-    #[must_use]
     pub fn transform(mut self, transform: Affine) -> Self {
         self.draw.transform = transform;
         self
     }
 
     /// Set the fill rule.
-    #[must_use]
     pub fn fill_rule(mut self, fill_rule: peniko::Fill) -> Self {
         self.draw.fill_rule = fill_rule;
         self
     }
 
     /// Set the optional brush-space transform.
-    #[must_use]
     pub fn brush_transform(mut self, brush_transform: Option<Affine>) -> Self {
         self.draw.brush_transform = brush_transform;
         self
     }
 
     /// Set the per-draw compositing state.
-    #[must_use]
     pub fn composite(mut self, composite: Composite) -> Self {
         self.draw.composite = composite;
         self
@@ -768,6 +765,7 @@ where
 
 /// Builder for configuring a stroke draw before emission.
 #[derive(Debug)]
+#[must_use = "stroke builders do nothing until you call .draw()"]
 pub struct StrokeBuilder<'a, S: ?Sized> {
     sink: &'a mut S,
     draw: StrokeRef<'a>,
@@ -778,21 +776,18 @@ where
     S: PaintSink + ?Sized,
 {
     /// Set the geometry transform.
-    #[must_use]
     pub fn transform(mut self, transform: Affine) -> Self {
         self.draw.transform = transform;
         self
     }
 
     /// Set the optional brush-space transform.
-    #[must_use]
     pub fn brush_transform(mut self, brush_transform: Option<Affine>) -> Self {
         self.draw.brush_transform = brush_transform;
         self
     }
 
     /// Set the per-draw compositing state.
-    #[must_use]
     pub fn composite(mut self, composite: Composite) -> Self {
         self.draw.composite = composite;
         self
@@ -806,6 +801,7 @@ where
 
 /// Builder for configuring a glyph run before emission.
 #[derive(Debug)]
+#[must_use = "glyph builders do nothing until you call .draw(...)"]
 pub struct GlyphRunBuilder<'a, S: ?Sized> {
     sink: &'a mut S,
     font: &'a peniko::FontData,
@@ -823,42 +819,36 @@ where
     S: PaintSink + ?Sized,
 {
     /// Set the global run transform.
-    #[must_use]
     pub fn transform(mut self, transform: Affine) -> Self {
         self.transform = transform;
         self
     }
 
     /// Set the per-glyph transform.
-    #[must_use]
     pub fn glyph_transform(mut self, glyph_transform: Option<Affine>) -> Self {
         self.glyph_transform = glyph_transform;
         self
     }
 
     /// Set the font size in pixels per em.
-    #[must_use]
     pub fn font_size(mut self, font_size: f32) -> Self {
         self.font_size = font_size;
         self
     }
 
     /// Set whether hinting is enabled.
-    #[must_use]
     pub fn hint(mut self, hint: bool) -> Self {
         self.hint = hint;
         self
     }
 
     /// Set normalized variable-font coordinates.
-    #[must_use]
     pub fn normalized_coords(mut self, normalized_coords: &'a [NormalizedCoord]) -> Self {
         self.normalized_coords = normalized_coords;
         self
     }
 
     /// Set the per-draw compositing state.
-    #[must_use]
     pub fn composite(mut self, composite: Composite) -> Self {
         self.composite = composite;
         self
