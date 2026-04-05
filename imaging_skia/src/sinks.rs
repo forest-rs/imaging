@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::{
-    Error, affine_to_matrix, apply_stroke_style, bez_to_sk_path, brush_to_paint,
+    Error, SkiaFontCache, affine_to_matrix, apply_stroke_style, bez_to_sk_path, brush_to_paint,
     build_filter_chain, f64_to_f32, geometry_to_bez_path, geometry_to_sk_path, map_blend_mode,
     path_with_fill_rule, skia_font_from_glyph_run,
 };
@@ -235,15 +235,11 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
 fn draw_glyph_run(
     canvas: &sk::Canvas,
     state: &mut StreamState,
+    font_cache: Option<&SkiaFontCache>,
     glyph_run: GlyphRunRef<'_>,
     glyphs: &mut dyn Iterator<Item = record::Glyph>,
 ) {
-    if !glyph_run.normalized_coords.is_empty() {
-        state.set_error_once(Error::UnsupportedGlyphVariations);
-        return;
-    }
-
-    let Some(mut font) = skia_font_from_glyph_run(&glyph_run) else {
+    let Some(mut font) = skia_font_from_glyph_run(font_cache, &glyph_run) else {
         state.set_error_once(Error::InvalidFontData);
         return;
     };
@@ -382,6 +378,7 @@ fn draw_masked_group(
     state: &mut StreamState,
     masked: MaskedGroupFrame,
     mask_cache: Option<&Rc<RefCell<MaskCache>>>,
+    font_cache: Option<&SkiaFontCache>,
 ) {
     let Some((width, height)) = canvas_dimensions(canvas) else {
         state.set_error_once(Error::Internal(
@@ -408,11 +405,17 @@ fn draw_masked_group(
             return;
         };
         {
-            let mut sink = match mask_cache {
-                Some(cache) => {
-                    SkCanvasSink::new_with_mask_cache(mask_surface.canvas(), cache.clone())
+            let mut sink = match (mask_cache, font_cache) {
+                (Some(cache), Some(font_cache)) => SkCanvasSink::new_with_caches(
+                    mask_surface.canvas(),
+                    cache.clone(),
+                    font_cache.clone(),
+                ),
+                (Some(_), None) => {
+                    state.set_error_once(Error::Internal("mask cache missing paired font cache"));
+                    return;
                 }
-                None => SkCanvasSink::new(mask_surface.canvas()),
+                (None, _) => SkCanvasSink::new(mask_surface.canvas()),
             };
             sink.set_tolerance(state.tolerance);
             replay_transformed(&masked.mask, &mut sink, masked.transform);
@@ -447,11 +450,17 @@ fn draw_masked_group(
     };
 
     {
-        let mut sink = match mask_cache {
-            Some(cache) => {
-                SkCanvasSink::new_with_mask_cache(content_surface.canvas(), cache.clone())
+        let mut sink = match (mask_cache, font_cache) {
+            (Some(cache), Some(font_cache)) => SkCanvasSink::new_with_caches(
+                content_surface.canvas(),
+                cache.clone(),
+                font_cache.clone(),
+            ),
+            (Some(_), None) => {
+                state.set_error_once(Error::Internal("mask cache missing paired font cache"));
+                return;
             }
-            None => SkCanvasSink::new(content_surface.canvas()),
+            (None, _) => SkCanvasSink::new(content_surface.canvas()),
         };
         sink.set_tolerance(state.tolerance);
         replay(&masked.content, &mut sink);
@@ -573,6 +582,7 @@ fn paint_sink_pop_group(
     canvas: &sk::Canvas,
     state: &mut StreamState,
     mask_cache: Option<&Rc<RefCell<MaskCache>>>,
+    font_cache: Option<&SkiaFontCache>,
 ) {
     if state.error.is_some() {
         return;
@@ -594,7 +604,7 @@ fn paint_sink_pop_group(
                 state.group_stack.push(GroupFrame::Masked(frame));
                 return;
             }
-            draw_masked_group(canvas, state, *frame, mask_cache);
+            draw_masked_group(canvas, state, *frame, mask_cache, font_cache);
         }
     }
 }
@@ -700,6 +710,7 @@ fn paint_sink_stroke(canvas: &sk::Canvas, state: &mut StreamState, draw: StrokeR
 pub struct SkCanvasSink<'a> {
     canvas: &'a sk::Canvas,
     mask_cache: Option<Rc<RefCell<MaskCache>>>,
+    font_cache: Option<SkiaFontCache>,
     state: StreamState,
 }
 
@@ -720,17 +731,20 @@ impl<'a> SkCanvasSink<'a> {
         Self {
             canvas,
             mask_cache: None,
+            font_cache: None,
             state: StreamState::new(),
         }
     }
 
-    pub(crate) fn new_with_mask_cache(
+    pub(crate) fn new_with_caches(
         canvas: &'a sk::Canvas,
         mask_cache: Rc<RefCell<MaskCache>>,
+        font_cache: SkiaFontCache,
     ) -> Self {
         Self {
             canvas,
             mask_cache: Some(mask_cache),
+            font_cache: Some(font_cache),
             state: StreamState::new(),
         }
     }
@@ -760,7 +774,12 @@ impl PaintSink for SkCanvasSink<'_> {
     }
 
     fn pop_group(&mut self) {
-        paint_sink_pop_group(self.canvas, &mut self.state, self.mask_cache.as_ref());
+        paint_sink_pop_group(
+            self.canvas,
+            &mut self.state,
+            self.mask_cache.as_ref(),
+            self.font_cache.as_ref(),
+        );
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -783,7 +802,13 @@ impl PaintSink for SkCanvasSink<'_> {
             frame.content.glyph_run(draw, glyphs);
             return;
         }
-        draw_glyph_run(self.canvas, &mut self.state, draw, glyphs);
+        draw_glyph_run(
+            self.canvas,
+            &mut self.state,
+            self.font_cache.as_ref(),
+            draw,
+            glyphs,
+        );
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
@@ -801,6 +826,7 @@ impl PaintSink for SkCanvasSink<'_> {
 /// Owned sink that records `imaging` commands into a native [`skia_safe::Picture`].
 pub struct SkPictureRecorderSink {
     recorder: sk::PictureRecorder,
+    font_cache: Option<SkiaFontCache>,
     state: StreamState,
 }
 
@@ -821,8 +847,17 @@ impl SkPictureRecorderSink {
         Self::new_with_bbh(bounds, false)
     }
 
+    #[cfg(feature = "gpu")]
+    pub(crate) fn new_with_font_cache(bounds: Rect, font_cache: SkiaFontCache) -> Self {
+        Self::new_with_options(bounds, false, Some(font_cache))
+    }
+
     /// Start recording a Skia picture with optional bounding-box hierarchy acceleration.
     pub fn new_with_bbh(bounds: Rect, use_bbh: bool) -> Self {
+        Self::new_with_options(bounds, use_bbh, None)
+    }
+
+    fn new_with_options(bounds: Rect, use_bbh: bool, font_cache: Option<SkiaFontCache>) -> Self {
         let mut recorder = sk::PictureRecorder::new();
         let bounds = sk::Rect::new(
             f64_to_f32(bounds.x0),
@@ -833,6 +868,7 @@ impl SkPictureRecorderSink {
         let _ = recorder.begin_recording(bounds, use_bbh);
         Self {
             recorder,
+            font_cache,
             state: StreamState::new(),
         }
     }
@@ -889,7 +925,7 @@ impl PaintSink for SkPictureRecorderSink {
             state.set_error_once(Error::Internal("picture recorder not recording"));
             return;
         };
-        paint_sink_pop_group(canvas, state, None);
+        paint_sink_pop_group(canvas, state, None, self.font_cache.as_ref());
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -930,7 +966,7 @@ impl PaintSink for SkPictureRecorderSink {
             frame.content.glyph_run(draw, glyphs);
             return;
         }
-        draw_glyph_run(canvas, state, draw, glyphs);
+        draw_glyph_run(canvas, state, self.font_cache.as_ref(), draw, glyphs);
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {

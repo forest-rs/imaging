@@ -177,7 +177,11 @@ use peniko::{
     BrushRef, ImageAlphaType, ImageData, ImageFormat, ImageQuality, InterpolationAlphaSpace,
 };
 use skia_safe as sk;
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{RefCell, RefMut},
+    collections::HashMap,
+    rc::Rc,
+};
 
 #[cfg(feature = "gpu")]
 use crate::ganesh::GaneshBackend;
@@ -211,8 +215,6 @@ pub enum Error {
     UnsupportedImageBrush,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
-    /// A glyph run used variable-font coordinates unsupported by this backend.
-    UnsupportedGlyphVariations,
     /// A glyph run used a per-glyph transform unsupported by this backend.
     UnsupportedGlyphTransform,
     /// Font bytes could not be loaded by Skia.
@@ -223,6 +225,68 @@ pub enum Error {
     Internal(&'static str),
 }
 
+/// Share Skia font and typeface caches across renderer instances.
+///
+/// This is useful when multiple raster or GPU renderers draw text from the same font set and you
+/// want them to reuse the same resolved Skia font state.
+#[derive(Clone, Debug)]
+pub struct SkiaFontCache {
+    inner: Rc<RefCell<FontCache>>,
+}
+
+impl Default for SkiaFontCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SkiaFontCache {
+    /// Create an empty shared font cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(FontCache::new())),
+        }
+    }
+
+    fn borrow_mut(&self) -> RefMut<'_, FontCache> {
+        self.inner.borrow_mut()
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize) {
+        self.inner.borrow().counts()
+    }
+}
+
+/// Shared cache bundle for Skia renderers.
+///
+/// This exists so renderer construction does not grow a new constructor every time more shareable
+/// Skia state is introduced.
+#[derive(Clone, Debug, Default)]
+pub struct SkiaCaches {
+    font_cache: SkiaFontCache,
+}
+
+impl SkiaCaches {
+    /// Create a cache bundle with fresh default caches.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the shared font cache in this bundle.
+    #[must_use]
+    pub fn with_font_cache(mut self, font_cache: SkiaFontCache) -> Self {
+        self.font_cache = font_cache;
+        self
+    }
+
+    fn font_cache(&self) -> SkiaFontCache {
+        self.font_cache.clone()
+    }
+}
+
 /// Renderer that executes `imaging` commands using a Skia raster surface.
 #[derive(Debug)]
 pub struct SkiaRenderer {
@@ -231,6 +295,7 @@ pub struct SkiaRenderer {
     height: i32,
     tolerance: f64,
     mask_cache: Rc<RefCell<MaskCache>>,
+    caches: SkiaCaches,
 }
 
 impl Default for SkiaRenderer {
@@ -263,6 +328,11 @@ impl SkiaRenderer {
 
     /// Create a renderer.
     pub fn new() -> Self {
+        Self::new_with_caches(SkiaCaches::new())
+    }
+
+    /// Create a renderer that shares the provided caches with other Skia renderers.
+    pub fn new_with_caches(caches: SkiaCaches) -> Self {
         let surface = Self::create_surface(1, 1);
         Self {
             surface,
@@ -270,6 +340,7 @@ impl SkiaRenderer {
             height: 1,
             tolerance: 0.1,
             mask_cache: Rc::new(RefCell::new(MaskCache::default())),
+            caches,
         }
     }
 
@@ -319,8 +390,11 @@ impl SkiaRenderer {
         scene.validate().map_err(Error::InvalidScene)?;
         self.resize(i32::from(width), i32::from(height));
         self.reset();
-        let mut sink =
-            SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
+        let mut sink = SkCanvasSink::new_with_caches(
+            self.surface.canvas(),
+            Rc::clone(&self.mask_cache),
+            self.caches.font_cache(),
+        );
         sink.set_tolerance(self.tolerance);
         replay(scene, &mut sink);
         sink.finish()?;
@@ -405,8 +479,11 @@ impl ImageRenderer for SkiaRenderer {
         source.validate().map_err(Error::InvalidScene)?;
         self.resize(width, height);
         self.reset();
-        let mut sink =
-            SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
+        let mut sink = SkCanvasSink::new_with_caches(
+            self.surface.canvas(),
+            Rc::clone(&self.mask_cache),
+            self.caches.font_cache(),
+        );
         sink.set_tolerance(self.tolerance);
         source.paint_into(&mut sink);
         sink.finish()?;
@@ -420,10 +497,11 @@ fn encode_source_to_picture<S: RenderSource + ?Sized>(
     width: u32,
     height: u32,
     tolerance: f64,
+    font_cache: SkiaFontCache,
 ) -> Result<sk::Picture, Error> {
     source.validate().map_err(Error::InvalidScene)?;
     let bounds = kurbo::Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
-    let mut sink = SkPictureRecorderSink::new(bounds);
+    let mut sink = SkPictureRecorderSink::new_with_font_cache(bounds, font_cache);
     sink.set_tolerance(tolerance);
     source.paint_into(&mut sink);
     sink.finish_picture()
@@ -458,6 +536,7 @@ pub struct SkiaGpuRenderer {
     scratch: ScratchTexture,
     tolerance: f64,
     mask_cache: Rc<RefCell<MaskCache>>,
+    caches: SkiaCaches,
 }
 
 #[cfg(feature = "gpu")]
@@ -485,6 +564,16 @@ impl SkiaGpuRenderer {
         device: wgpu::Device,
         queue: wgpu::Queue,
     ) -> Result<Self, Error> {
+        Self::new_with_caches(adapter, device, queue, SkiaCaches::new())
+    }
+
+    /// Create a GPU renderer that shares the provided caches with other Skia renderers.
+    pub fn new_with_caches(
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        caches: SkiaCaches,
+    ) -> Result<Self, Error> {
         let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
         let scratch = ScratchTexture::new(
             &device,
@@ -500,6 +589,7 @@ impl SkiaGpuRenderer {
             scratch,
             tolerance: 0.1,
             mask_cache: Rc::new(RefCell::new(MaskCache::default())),
+            caches,
         })
     }
 
@@ -524,7 +614,13 @@ impl SkiaGpuRenderer {
         height: u32,
     ) -> Result<sk::Picture, Error> {
         let mut source = scene;
-        encode_source_to_picture(&mut source, width, height, self.tolerance)
+        encode_source_to_picture(
+            &mut source,
+            width,
+            height,
+            self.tolerance,
+            self.caches.font_cache(),
+        )
     }
 
     /// Render a native [`skia_safe::Picture`] into a caller-owned `wgpu::Texture`.
@@ -586,7 +682,13 @@ impl ImageRenderer for SkiaGpuRenderer {
         height: u32,
         image: &mut RgbaImage,
     ) -> Result<(), Self::Error> {
-        let picture = encode_source_to_picture(source, width, height, self.tolerance)?;
+        let picture = encode_source_to_picture(
+            source,
+            width,
+            height,
+            self.tolerance,
+            self.caches.font_cache(),
+        )?;
         self.render_picture_into(&picture, width, height, image)
     }
 }
@@ -602,7 +704,13 @@ impl TextureRenderer for SkiaGpuRenderer {
         target: Self::TextureTarget<'a>,
     ) -> Result<(), Self::Error> {
         let (width, height) = Self::checked_texture_size(target.texture)?;
-        let picture = encode_source_to_picture(source, width, height, self.tolerance)?;
+        let picture = encode_source_to_picture(
+            source,
+            width,
+            height,
+            self.tolerance,
+            self.caches.font_cache(),
+        )?;
         self.render_picture_to_texture(&picture, target.texture)
     }
 }
@@ -693,32 +801,187 @@ fn affine_to_matrix(xf: Affine) -> sk::Matrix {
     )
 }
 
-fn skia_font_from_glyph_run(glyph_run: &GlyphRunRef<'_>) -> Option<sk::Font> {
-    let typeface = sk::FontMgr::default()
-        .new_from_data(glyph_run.font.data.as_ref(), glyph_run.font.index as usize)?;
-
-    let mut font = sk::Font::from_typeface(typeface, glyph_run.font_size);
-    font.set_hinting(if glyph_run.hint {
-        sk::FontHinting::Slight
+fn denormalize_variation_coord(
+    normalized_coord: imaging::NormalizedCoord,
+    axis: &sk::font_parameters::VariationAxis,
+) -> f32 {
+    let normalized = (f32::from(normalized_coord) / 16_384.0).clamp(-1.0, 1.0);
+    if normalized <= 0.0 {
+        axis.def + (axis.def - axis.min) * normalized
     } else {
-        sk::FontHinting::None
-    });
+        axis.def + (axis.max - axis.def) * normalized
+    }
+}
 
-    if let Some(transform) = glyph_run.glyph_transform {
-        let [a, b, c, d, e, f] = transform.as_coeffs();
-        if b != 0.0 || e != 0.0 || f != 0.0 || d <= 0.0 {
-            return None;
-        }
-        let y_scale = f64_to_f32(d);
-        font.set_size(f64_to_f32(glyph_run.font_size as f64 * d));
-        font.set_scale_x(f64_to_f32(a / d));
-        font.set_skew_x(f64_to_f32(c / d));
-        if y_scale <= 0.0 {
-            return None;
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BaseTypefaceKey {
+    font_data_id: u64,
+    font_index: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TypefaceKey {
+    base: BaseTypefaceKey,
+    normalized_coords: Vec<imaging::NormalizedCoord>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FontKey {
+    typeface: TypefaceKey,
+    font_size_bits: u32,
+    hint: bool,
+}
+
+#[derive(Debug)]
+struct FontCache {
+    font_mgr: sk::FontMgr,
+    base_typefaces: HashMap<BaseTypefaceKey, sk::Typeface>,
+    typefaces: HashMap<TypefaceKey, sk::Typeface>,
+    fonts: HashMap<FontKey, sk::Font>,
+}
+
+impl FontCache {
+    fn new() -> Self {
+        Self {
+            font_mgr: sk::FontMgr::default(),
+            base_typefaces: HashMap::new(),
+            typefaces: HashMap::new(),
+            fonts: HashMap::new(),
         }
     }
 
-    Some(font)
+    fn font_from_glyph_run(&mut self, glyph_run: &GlyphRunRef<'_>) -> Option<sk::Font> {
+        let typeface_key = TypefaceKey {
+            base: BaseTypefaceKey {
+                font_data_id: glyph_run.font.data.id(),
+                font_index: glyph_run.font.index,
+            },
+            normalized_coords: glyph_run.normalized_coords.to_vec(),
+        };
+        let font_key = FontKey {
+            typeface: typeface_key.clone(),
+            font_size_bits: glyph_run.font_size.to_bits(),
+            hint: glyph_run.hint,
+        };
+
+        let mut font = if let Some(font) = self.fonts.get(&font_key) {
+            font.clone()
+        } else {
+            let typeface = self.typeface_for_key(&typeface_key, glyph_run.font)?;
+            let mut font = sk::Font::from_typeface(typeface, glyph_run.font_size);
+            font.set_hinting(if glyph_run.hint {
+                sk::FontHinting::Slight
+            } else {
+                sk::FontHinting::None
+            });
+            self.fonts.insert(font_key, font.clone());
+            font
+        };
+
+        apply_glyph_transform(&mut font, glyph_run.glyph_transform, glyph_run.font_size)?;
+        Some(font)
+    }
+
+    fn typeface_for_key(
+        &mut self,
+        key: &TypefaceKey,
+        font: &peniko::FontData,
+    ) -> Option<sk::Typeface> {
+        if key.normalized_coords.is_empty() {
+            return self.base_typeface(&key.base, font);
+        }
+        if let Some(typeface) = self.typefaces.get(key) {
+            return Some(typeface.clone());
+        }
+
+        let typeface = self.base_typeface(&key.base, font)?;
+        let axes = typeface.variation_design_parameters().unwrap_or_default();
+        if axes.is_empty() {
+            self.typefaces.insert(key.clone(), typeface.clone());
+            return Some(typeface);
+        }
+
+        let coordinates: Vec<sk::font_arguments::variation_position::Coordinate> = axes
+            .iter()
+            .zip(key.normalized_coords.iter())
+            .map(
+                |(axis, &normalized_coord)| sk::font_arguments::variation_position::Coordinate {
+                    axis: axis.tag,
+                    value: denormalize_variation_coord(normalized_coord, axis),
+                },
+            )
+            .filter(|coord| coord.value != 0.0)
+            .collect();
+
+        if coordinates.is_empty() {
+            self.typefaces.insert(key.clone(), typeface.clone());
+            return Some(typeface);
+        }
+
+        let arguments = sk::FontArguments::new().set_variation_design_position(
+            sk::font_arguments::VariationPosition {
+                coordinates: &coordinates,
+            },
+        );
+        let typeface = typeface.clone_with_arguments(&arguments)?;
+        self.typefaces.insert(key.clone(), typeface.clone());
+        Some(typeface)
+    }
+
+    fn base_typeface(
+        &mut self,
+        key: &BaseTypefaceKey,
+        font: &peniko::FontData,
+    ) -> Option<sk::Typeface> {
+        if let Some(typeface) = self.base_typefaces.get(key) {
+            return Some(typeface.clone());
+        }
+
+        let typeface = self
+            .font_mgr
+            .new_from_data(font.data.as_ref(), font.index as usize)?;
+        self.base_typefaces.insert(key.clone(), typeface.clone());
+        Some(typeface)
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.base_typefaces.len(),
+            self.typefaces.len(),
+            self.fonts.len(),
+        )
+    }
+}
+
+fn skia_font_from_glyph_run(
+    font_cache: Option<&SkiaFontCache>,
+    glyph_run: &GlyphRunRef<'_>,
+) -> Option<sk::Font> {
+    match font_cache {
+        Some(font_cache) => font_cache.borrow_mut().font_from_glyph_run(glyph_run),
+        None => FontCache::new().font_from_glyph_run(glyph_run),
+    }
+}
+
+fn apply_glyph_transform(
+    font: &mut sk::Font,
+    glyph_transform: Option<Affine>,
+    font_size: f32,
+) -> Option<()> {
+    let Some(transform) = glyph_transform else {
+        return Some(());
+    };
+
+    let [a, b, c, d, e, f] = transform.as_coeffs();
+    if b != 0.0 || e != 0.0 || f != 0.0 || d <= 0.0 {
+        return None;
+    }
+
+    font.set_size(f64_to_f32(font_size as f64 * d));
+    font.set_scale_x(f64_to_f32(a / d));
+    font.set_skew_x(f64_to_f32(c / d));
+    Some(())
 }
 
 fn sk_path_fill_type_from_fill_rule(rule: peniko::Fill) -> sk::PathFillType {
@@ -1098,15 +1361,27 @@ fn build_filter_chain(filters: &[Filter]) -> Option<sk::ImageFilter> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::{GroupRef, MaskMode, Painter};
+    use imaging::{GroupRef, MaskMode, Painter, record::Glyph};
     use kurbo::Rect;
-    use peniko::{Brush, Color};
+    use peniko::{Blob, Brush, Color, Fill, FontData, Style};
+    use std::sync::{Arc, OnceLock};
     #[cfg(feature = "gpu")]
     use std::{
         future::Future,
         pin::pin,
         task::{Context, Poll, Waker},
     };
+
+    const TEST_FONT_BYTES: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_assets/fonts/NotoSans-Regular.ttf"
+    ));
+
+    fn test_font() -> FontData {
+        static FONT: OnceLock<FontData> = OnceLock::new();
+        FONT.get_or_init(|| FontData::new(Blob::new(Arc::new(TEST_FONT_BYTES)), 0))
+            .clone()
+    }
 
     fn masked_scene(mode: MaskMode) -> Scene {
         let mask = Painter::<Scene>::record_mask(mode, |mask| {
@@ -1225,6 +1500,38 @@ mod tests {
         let image = renderer.render_source(&mut source, 48, 48).unwrap();
         assert_eq!(image.width, 48);
         assert_eq!(image.height, 48);
+    }
+
+    #[test]
+    fn normalized_coords_on_non_variable_font_render_and_cache() {
+        let font = test_font();
+        let fill_style = Style::Fill(Fill::NonZero);
+        let glyphs = [Glyph {
+            id: 0,
+            x: 8.0,
+            y: 24.0,
+        }];
+        let normalized_coords = [2048_i16];
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .glyphs(&font, &Brush::Solid(Color::from_rgb8(0x22, 0x66, 0xaa)))
+                .font_size(18.0)
+                .normalized_coords(&normalized_coords)
+                .draw(&fill_style, glyphs);
+        }
+
+        let caches = SkiaCaches::new().with_font_cache(SkiaFontCache::new());
+        let mut renderer = SkiaRenderer::new_with_caches(caches.clone());
+        renderer.render_scene(&scene, 48, 48).unwrap();
+        let counts = caches.font_cache().counts();
+        assert_eq!(counts, (1, 1, 1));
+
+        let mut second_renderer = SkiaRenderer::new_with_caches(caches.clone());
+        second_renderer.render_scene(&scene, 48, 48).unwrap();
+        assert_eq!(caches.font_cache().counts(), counts);
     }
 
     #[cfg(feature = "gpu")]
