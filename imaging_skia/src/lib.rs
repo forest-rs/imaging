@@ -179,7 +179,7 @@ use peniko::{
 use skia_safe as sk;
 use std::{
     cell::{RefCell, RefMut},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     rc::Rc,
 };
 
@@ -253,9 +253,120 @@ impl SkiaFontCache {
         self.inner.borrow_mut()
     }
 
+    fn clear(&self) {
+        self.inner.borrow_mut().clear();
+    }
+
     #[cfg(test)]
     fn counts(&self) -> (usize, usize, usize) {
         self.inner.borrow().counts()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ImageCacheKey {
+    blob_id: u64,
+    format: core::mem::Discriminant<ImageFormat>,
+    alpha_type: core::mem::Discriminant<ImageAlphaType>,
+    width: u32,
+    height: u32,
+}
+
+impl ImageCacheKey {
+    fn new(image: &ImageData) -> Self {
+        Self {
+            blob_id: image.data.id(),
+            format: core::mem::discriminant(&image.format),
+            alpha_type: core::mem::discriminant(&image.alpha_type),
+            width: image.width,
+            height: image.height,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedImage {
+    key: ImageCacheKey,
+    image: sk::Image,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct ImageCache {
+    bytes_used: usize,
+    max_bytes: usize,
+    entries: VecDeque<CachedImage>,
+}
+
+impl ImageCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes_used: 0,
+            max_bytes,
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.bytes_used = 0;
+        self.entries.clear();
+    }
+
+    fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.evict_to_budget();
+    }
+
+    fn touch(&mut self, index: usize) {
+        if index + 1 == self.entries.len() {
+            return;
+        }
+        if let Some(entry) = self.entries.remove(index) {
+            self.entries.push_back(entry);
+        }
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.bytes_used > self.max_bytes {
+            let Some(oldest) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes_used = self.bytes_used.saturating_sub(oldest.bytes);
+        }
+    }
+
+    fn get_or_create(&mut self, image: &ImageData) -> Option<sk::Image> {
+        let key = ImageCacheKey::new(image);
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let cached = self.entries.get(index)?.image.clone();
+            self.touch(index);
+            return Some(cached);
+        }
+
+        let cached = CachedImage {
+            key,
+            image: make_skia_image_from_peniko(image)?,
+            bytes: image
+                .format
+                .size_in_bytes(image.width, image.height)
+                .unwrap_or_else(|| image.data.data().len()),
+        };
+        let image = cached.image.clone();
+        self.bytes_used = self.bytes_used.saturating_add(cached.bytes);
+        self.entries.push_back(cached);
+        self.evict_to_budget();
+        Some(image)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        Self::new(64 * 1024 * 1024)
     }
 }
 
@@ -266,6 +377,7 @@ impl SkiaFontCache {
 #[derive(Clone, Debug, Default)]
 pub struct SkiaCaches {
     font_cache: SkiaFontCache,
+    image_cache: Rc<RefCell<ImageCache>>,
     mask_cache: Rc<RefCell<MaskCache>>,
 }
 
@@ -275,6 +387,7 @@ impl SkiaCaches {
     pub fn new() -> Self {
         Self {
             font_cache: SkiaFontCache::new(),
+            image_cache: Rc::new(RefCell::new(ImageCache::default())),
             mask_cache: Rc::new(RefCell::new(MaskCache::default())),
         }
     }
@@ -290,10 +403,22 @@ impl SkiaCaches {
         self.font_cache.clone()
     }
 
+    fn image_cache(&self) -> Rc<RefCell<ImageCache>> {
+        Rc::clone(&self.image_cache)
+    }
     fn mask_cache(&self) -> Rc<RefCell<MaskCache>> {
         Rc::clone(&self.mask_cache)
     }
 
+    fn clear(&self) {
+        self.font_cache.clear();
+        self.image_cache.borrow_mut().clear();
+        self.mask_cache.borrow_mut().clear();
+    }
+
+    fn set_image_cache_total_bytes_limit(&self, limit: usize) {
+        self.image_cache.borrow_mut().set_max_bytes(limit);
+    }
     fn set_mask_cache_total_bytes_limit(&self, limit: usize) {
         self.mask_cache.borrow_mut().set_max_bytes(limit);
     }
@@ -314,7 +439,9 @@ pub struct SkiaCacheConfig {
     pub resource_cache_total_bytes_limit: usize,
     /// Maximum size of a single entry in Skia's global resource cache.
     pub resource_cache_single_allocation_byte_limit: Option<usize>,
-    /// Maximum number of bytes retained by the renderer-local realized mask cache.
+    /// Maximum number of bytes retained by the shared realized-image cache.
+    pub image_cache_total_bytes_limit: usize,
+    /// Maximum number of bytes retained by the shared realized mask cache.
     pub mask_cache_total_bytes_limit: usize,
 }
 
@@ -325,6 +452,7 @@ impl Default for SkiaCacheConfig {
             typeface_cache_count_limit: 100,
             resource_cache_total_bytes_limit: 10 * 1024 * 1024,
             resource_cache_single_allocation_byte_limit: None,
+            image_cache_total_bytes_limit: 64 * 1024 * 1024,
             mask_cache_total_bytes_limit: 64 * 1024 * 1024,
         }
     }
@@ -368,7 +496,14 @@ impl SkiaCacheConfig {
         self
     }
 
-    /// Override the renderer-local realized-mask cache byte limit.
+    /// Override the shared realized-image cache byte limit.
+    #[must_use]
+    pub fn with_image_cache_total_bytes_limit(mut self, limit: usize) -> Self {
+        self.image_cache_total_bytes_limit = limit;
+        self
+    }
+
+    /// Override the shared realized-mask cache byte limit.
     #[must_use]
     pub fn with_mask_cache_total_bytes_limit(mut self, limit: usize) -> Self {
         self.mask_cache_total_bytes_limit = limit;
@@ -465,6 +600,9 @@ impl SkiaRenderer {
         config.cache_config.apply();
         config
             .caches
+            .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
+        config
+            .caches
             .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let surface = Self::create_surface(1, 1);
         Self {
@@ -491,6 +629,16 @@ impl SkiaRenderer {
     /// changing assumptions that affect mask realization outside the recorded scene itself.
     pub fn clear_cached_masks(&mut self) {
         self.caches.mask_cache().borrow_mut().clear();
+    }
+
+    /// Drop any realized image resources cached by the renderer.
+    pub fn clear_cached_images(&mut self) {
+        self.caches.image_cache().borrow_mut().clear();
+    }
+
+    /// Drop all renderer-local caches, including shared font state.
+    pub fn clear_caches(&mut self) {
+        self.caches.clear();
     }
 
     fn resize(&mut self, width: i32, height: i32) {
@@ -524,6 +672,7 @@ impl SkiaRenderer {
         self.reset();
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
+            Some(self.caches.image_cache()),
             self.caches.mask_cache(),
             self.caches.font_cache(),
         );
@@ -613,6 +762,7 @@ impl ImageRenderer for SkiaRenderer {
         self.reset();
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
+            Some(self.caches.image_cache()),
             self.caches.mask_cache(),
             self.caches.font_cache(),
         );
@@ -629,11 +779,12 @@ fn encode_source_to_picture<S: RenderSource + ?Sized>(
     width: u32,
     height: u32,
     tolerance: f64,
+    image_cache: Rc<RefCell<ImageCache>>,
     font_cache: SkiaFontCache,
 ) -> Result<sk::Picture, Error> {
     source.validate().map_err(Error::InvalidScene)?;
     let bounds = kurbo::Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
-    let mut sink = SkPictureRecorderSink::new_with_font_cache(bounds, font_cache);
+    let mut sink = SkPictureRecorderSink::new_with_caches(bounds, Some(image_cache), font_cache);
     sink.set_tolerance(tolerance);
     source.paint_into(&mut sink);
     sink.finish_picture()
@@ -708,6 +859,9 @@ impl SkiaGpuRenderer {
         config.cache_config.apply();
         config
             .caches
+            .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
+        config
+            .caches
             .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
         let scratch = ScratchTexture::new(
@@ -740,6 +894,16 @@ impl SkiaGpuRenderer {
         self.caches.mask_cache().borrow_mut().clear();
     }
 
+    /// Drop any realized image resources cached by the renderer.
+    pub fn clear_cached_images(&mut self) {
+        self.caches.image_cache().borrow_mut().clear();
+    }
+
+    /// Drop all renderer-local caches, including shared font state.
+    pub fn clear_caches(&mut self) {
+        self.caches.clear();
+    }
+
     /// Lower a semantic [`imaging::record::Scene`] into a native [`skia_safe::Picture`].
     pub fn encode_scene(
         &mut self,
@@ -753,6 +917,7 @@ impl SkiaGpuRenderer {
             width,
             height,
             self.tolerance,
+            self.caches.image_cache(),
             self.caches.font_cache(),
         )
     }
@@ -821,6 +986,7 @@ impl ImageRenderer for SkiaGpuRenderer {
             width,
             height,
             self.tolerance,
+            self.caches.image_cache(),
             self.caches.font_cache(),
         )?;
         self.render_picture_into(&picture, width, height, image)
@@ -843,6 +1009,7 @@ impl TextureRenderer for SkiaGpuRenderer {
             width,
             height,
             self.tolerance,
+            self.caches.image_cache(),
             self.caches.font_cache(),
         )?;
         self.render_picture_to_texture(&picture, target.texture)
@@ -982,6 +1149,12 @@ impl FontCache {
             typefaces: HashMap::new(),
             fonts: HashMap::new(),
         }
+    }
+
+    fn clear(&mut self) {
+        self.base_typefaces.clear();
+        self.typefaces.clear();
+        self.fonts.clear();
     }
 
     fn font_from_glyph_run(&mut self, glyph_run: &GlyphRunRef<'_>) -> Option<sk::Font> {
@@ -1233,7 +1406,12 @@ fn color_to_sk_color4f(color: peniko::Color) -> sk::Color4f {
     sk::Color4f::new(comps[0], comps[1], comps[2], comps[3])
 }
 
-fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option<sk::Paint> {
+fn brush_to_paint(
+    brush: BrushRef<'_>,
+    opacity: f32,
+    paint_xf: Affine,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
+) -> Option<sk::Paint> {
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
     let alpha_scale = opacity.clamp(0.0, 1.0);
@@ -1346,7 +1524,7 @@ fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option
             }
         }
         BrushRef::Image(image_brush) => {
-            let image = skia_image_from_peniko(image_brush.image)?;
+            let image = skia_image_from_peniko(image_brush.image, image_cache)?;
             let shader = image.to_shader(
                 Some((
                     tile_mode_from_extend(image_brush.sampler.x_extend),
@@ -1363,7 +1541,17 @@ fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option
     Some(paint)
 }
 
-fn skia_image_from_peniko(image: &ImageData) -> Option<sk::Image> {
+fn skia_image_from_peniko(
+    image: &ImageData,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
+) -> Option<sk::Image> {
+    match image_cache {
+        Some(image_cache) => image_cache.borrow_mut().get_or_create(image),
+        None => make_skia_image_from_peniko(image),
+    }
+}
+
+fn make_skia_image_from_peniko(image: &ImageData) -> Option<sk::Image> {
     let color_type = match image.format {
         ImageFormat::Rgba8 => sk::ColorType::RGBA8888,
         ImageFormat::Bgra8 => sk::ColorType::BGRA8888,
@@ -1497,7 +1685,9 @@ mod tests {
     use super::*;
     use imaging::{GroupRef, MaskMode, Painter, record::Glyph};
     use kurbo::Rect;
-    use peniko::{Blob, Brush, Color, Fill, FontData, Style};
+    use peniko::{
+        Blob, Brush, Color, Fill, FontData, ImageAlphaType, ImageData, ImageFormat, Style,
+    };
     use std::sync::{Arc, OnceLock};
     #[cfg(feature = "gpu")]
     use std::{
@@ -1539,6 +1729,29 @@ mod tests {
             });
         }
 
+        scene
+    }
+
+    fn test_image() -> ImageData {
+        ImageData {
+            data: Blob::new(Arc::new([
+                0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+                0x00, 0xff,
+            ])),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 2,
+            height: 2,
+        }
+    }
+
+    fn image_scene() -> Scene {
+        let brush = Brush::Image(peniko::ImageBrush::new(test_image()));
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 32.0, 32.0), &brush).draw();
+        }
         scene
     }
 
@@ -1587,6 +1800,30 @@ mod tests {
     }
 
     #[test]
+    fn render_scene_reuses_cached_images_for_identical_scenes() {
+        let scene = image_scene();
+        let mut renderer = SkiaRenderer::new();
+
+        renderer.render_scene(&scene, 32, 32).unwrap();
+        assert_eq!(renderer.caches.image_cache().borrow().len(), 1);
+
+        renderer.render_scene(&scene, 32, 32).unwrap();
+        assert_eq!(renderer.caches.image_cache().borrow().len(), 1);
+    }
+
+    #[test]
+    fn clear_cached_images_drops_realized_images() {
+        let scene = image_scene();
+        let mut renderer = SkiaRenderer::new();
+
+        renderer.render_scene(&scene, 32, 32).unwrap();
+        assert_eq!(renderer.caches.image_cache().borrow().len(), 1);
+
+        renderer.clear_cached_images();
+        assert_eq!(renderer.caches.image_cache().borrow().len(), 0);
+    }
+
+    #[test]
     fn changing_tolerance_clears_cached_masks() {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = SkiaRenderer::new();
@@ -1607,6 +1844,17 @@ mod tests {
 
         renderer.render_scene(&scene, 64, 64).unwrap();
         assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
+    }
+
+    #[test]
+    fn config_can_disable_realized_image_retention() {
+        let scene = image_scene();
+        let config = SkiaConfig::new()
+            .with_cache_config(SkiaCacheConfig::new().with_image_cache_total_bytes_limit(0));
+        let mut renderer = SkiaRenderer::new_with_config(config);
+
+        renderer.render_scene(&scene, 32, 32).unwrap();
+        assert_eq!(renderer.caches.image_cache().borrow().len(), 0);
     }
 
     #[test]
