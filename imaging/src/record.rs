@@ -578,7 +578,7 @@ impl Scene {
         FileId(idx)
     }
 
-    fn context_notes_for_stack(&self, stack: &[ContextId]) -> Vec<ContextNote> {
+    pub(crate) fn context_notes_for_stack(&self, stack: &[ContextId]) -> Vec<ContextNote> {
         stack
             .iter()
             .map(|id| {
