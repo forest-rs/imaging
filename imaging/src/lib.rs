@@ -76,7 +76,7 @@
 //! # Recording
 //!
 //! Use [`record::Scene`] when you want an owned, backend-agnostic recording you can retain,
-//! validate, compare in tests, and replay into another sink later.
+//! validate, diagnose, compare in tests, and replay into another sink later.
 //!
 //! ```rust
 //! use imaging::{record, Painter};
@@ -91,6 +91,7 @@
 //! }
 //!
 //! scene.validate()?;
+//! assert!(scene.diagnose().is_empty());
 //! assert_eq!(scene.commands().len(), 1);
 //!
 //! let mut replayed = record::Scene::new();
@@ -112,6 +113,7 @@ use alloc::vec::Vec;
 use kurbo::{Affine, Rect};
 use peniko::BlendMode;
 
+pub mod diagnostics;
 mod paint;
 mod painter;
 pub mod record;
