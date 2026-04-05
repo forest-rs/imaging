@@ -6,14 +6,14 @@
 //! This module contains the retained representation for imaging command streams. Use [`Scene`] when
 //! you need an owned semantic recording you can retain, validate, and replay.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
 use peniko::{Brush, Fill, FontData, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GlyphRunRef, GroupRef, MaskMode,
-    NormalizedCoord, PaintSink, StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef, MaskMode,
+    NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef,
 };
 
 /// A geometry payload stored in a recording.
@@ -89,6 +89,76 @@ pub struct MaskId(pub(crate) u32);
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DrawId(pub(crate) u32);
+
+/// Identifier for an interned context label stored in a [`Scene`].
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LabelId(pub(crate) u32);
+
+/// Identifier for an interned source file stored in a [`Scene`].
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FileId(pub(crate) u32);
+
+/// Identifier for a context annotation stored in a [`Scene`].
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ContextId(pub(crate) u32);
+
+/// Interned source location stored in a [`Scene`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceLocation {
+    /// Interned file name.
+    pub file: FileId,
+    /// 1-based source line.
+    pub line: u32,
+    /// 1-based source column.
+    pub column: u32,
+}
+
+/// A context annotation stored in a [`Scene`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Context {
+    /// Human-readable label.
+    pub label: LabelId,
+    /// Optional source location associated with the context.
+    pub source: Option<SourceLocation>,
+}
+
+impl Context {
+    /// Borrow this context as a [`crate::ContextRef`].
+    #[must_use]
+    pub fn as_ref<'a>(&'a self, scene: &'a Scene) -> ContextRef<'a> {
+        ContextRef {
+            label: scene.label(self.label),
+            source: self.source.as_ref().map(|source| SourceLocationRef {
+                file: scene.file(source.file),
+                line: source.line,
+                column: source.column,
+            }),
+        }
+    }
+}
+
+/// Human-readable context note attached to validation errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextNote {
+    /// Human-readable label for the enclosing context.
+    pub label: String,
+    /// Optional source location.
+    pub source: Option<ResolvedSourceLocation>,
+}
+
+/// Resolved source location attached to validation errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSourceLocation {
+    /// Source file name.
+    pub file: String,
+    /// 1-based source line.
+    pub line: u32,
+    /// 1-based source column.
+    pub column: u32,
+}
 
 /// A retained mask definition.
 #[derive(Clone, Debug, PartialEq)]
@@ -261,6 +331,10 @@ pub enum Draw {
 /// A single command in a [`Scene`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    /// Push a context annotation onto the context stack.
+    PushContext(ContextId),
+    /// Pop the most recently pushed context annotation.
+    PopContext,
     /// Push a non-isolated clip onto the clip stack.
     PushClip(ClipId),
     /// Pop the most recently pushed non-isolated clip.
@@ -281,6 +355,9 @@ pub enum Command {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
     commands: Vec<Command>,
+    labels: Vec<Box<str>>,
+    files: Vec<Box<str>>,
+    contexts: Vec<Context>,
     clips: Vec<Clip>,
     masks: Vec<Mask>,
     groups: Vec<Group>,
@@ -298,6 +375,9 @@ impl Scene {
     #[inline]
     pub fn clear(&mut self) {
         self.commands.clear();
+        self.labels.clear();
+        self.files.clear();
+        self.contexts.clear();
         self.clips.clear();
         self.masks.clear();
         self.groups.clear();
@@ -311,12 +391,18 @@ impl Scene {
     pub fn reserve_additional(
         &mut self,
         commands: usize,
+        labels: usize,
+        files: usize,
+        contexts: usize,
         clips: usize,
         groups: usize,
         draws: usize,
         masks: usize,
     ) {
         self.commands.reserve(commands);
+        self.labels.reserve(labels);
+        self.files.reserve(files);
+        self.contexts.reserve(contexts);
         self.clips.reserve(clips);
         self.masks.reserve(masks);
         self.groups.reserve(groups);
@@ -328,10 +414,13 @@ impl Scene {
     pub fn reserve_like(&mut self, other: &Self) {
         self.reserve_additional(
             other.commands.len(),
+            other.labels.len(),
+            other.files.len(),
+            other.contexts.len(),
             other.clips.len(),
-            other.masks.len(),
             other.groups.len(),
             other.draws.len(),
+            other.masks.len(),
         );
     }
 
@@ -345,6 +434,24 @@ impl Scene {
     #[inline]
     pub fn clip(&self, id: ClipId) -> &Clip {
         &self.clips[id.0 as usize]
+    }
+
+    /// Resolve a context annotation by ID.
+    #[inline]
+    pub fn context(&self, id: ContextId) -> &Context {
+        &self.contexts[id.0 as usize]
+    }
+
+    /// Resolve an interned label string by ID.
+    #[inline]
+    pub fn label(&self, id: LabelId) -> &str {
+        &self.labels[id.0 as usize]
+    }
+
+    /// Resolve an interned file string by ID.
+    #[inline]
+    pub fn file(&self, id: FileId) -> &str {
+        &self.files[id.0 as usize]
     }
 
     /// Resolve a mask payload by ID.
@@ -379,6 +486,32 @@ impl Scene {
     #[inline]
     pub fn pop_clip(&mut self) {
         self.commands.push(Command::PopClip);
+    }
+
+    /// Push a context annotation.
+    #[inline]
+    pub fn push_context(
+        &mut self,
+        label: &str,
+        source: Option<SourceLocationRef<'_>>,
+    ) -> ContextId {
+        let label = self.define_label(label);
+        let source = source.map(|source| SourceLocation {
+            file: self.define_file(source.file),
+            line: source.line,
+            column: source.column,
+        });
+        let idx = u32::try_from(self.contexts.len()).expect("scene context table overflow");
+        let id = ContextId(idx);
+        self.contexts.push(Context { label, source });
+        self.commands.push(Command::PushContext(id));
+        id
+    }
+
+    /// Pop the most recently pushed context annotation.
+    #[inline]
+    pub fn pop_context(&mut self) {
+        self.commands.push(Command::PopContext);
     }
 
     /// Push an isolated group.
@@ -419,8 +552,56 @@ impl Scene {
         id
     }
 
+    fn define_label(&mut self, label: &str) -> LabelId {
+        if let Some(idx) = self
+            .labels
+            .iter()
+            .position(|existing| existing.as_ref() == label)
+        {
+            return LabelId(u32::try_from(idx).expect("scene label table overflow"));
+        }
+        let idx = u32::try_from(self.labels.len()).expect("scene label table overflow");
+        self.labels.push(label.into());
+        LabelId(idx)
+    }
+
+    fn define_file(&mut self, file: &str) -> FileId {
+        if let Some(idx) = self
+            .files
+            .iter()
+            .position(|existing| existing.as_ref() == file)
+        {
+            return FileId(u32::try_from(idx).expect("scene file table overflow"));
+        }
+        let idx = u32::try_from(self.files.len()).expect("scene file table overflow");
+        self.files.push(file.into());
+        FileId(idx)
+    }
+
+    fn context_notes_for_stack(&self, stack: &[ContextId]) -> Vec<ContextNote> {
+        stack
+            .iter()
+            .map(|id| {
+                let context = self.context(*id);
+                ContextNote {
+                    label: self.label(context.label).into(),
+                    source: context
+                        .source
+                        .as_ref()
+                        .map(|source| ResolvedSourceLocation {
+                            file: self.file(source.file).into(),
+                            line: source.line,
+                            column: source.column,
+                        }),
+                }
+            })
+            .collect()
+    }
+
     /// Validate well-nested stacks.
     pub fn validate(&self) -> Result<(), ValidateError> {
+        let mut context_depth = 0_u32;
+        let mut context_stack = Vec::new();
         let mut clip_depth = 0_u32;
         let mut group_depth = 0_u32;
 
@@ -432,27 +613,52 @@ impl Scene {
 
         for cmd in &self.commands {
             match cmd {
+                Command::PushContext(id) => {
+                    context_depth += 1;
+                    context_stack.push(*id);
+                }
+                Command::PopContext => {
+                    context_depth = context_depth.checked_sub(1).ok_or_else(|| {
+                        ValidateError::UnbalancedPopContext {
+                            contexts: self.context_notes_for_stack(&context_stack),
+                        }
+                    })?;
+                    context_stack.pop();
+                }
                 Command::PushClip(_) => clip_depth += 1,
                 Command::PopClip => {
-                    clip_depth = clip_depth
-                        .checked_sub(1)
-                        .ok_or(ValidateError::UnbalancedPopClip)?;
+                    clip_depth = clip_depth.checked_sub(1).ok_or_else(|| {
+                        ValidateError::UnbalancedPopClip {
+                            contexts: self.context_notes_for_stack(&context_stack),
+                        }
+                    })?;
                 }
                 Command::PushGroup(_) => group_depth += 1,
                 Command::PopGroup => {
-                    group_depth = group_depth
-                        .checked_sub(1)
-                        .ok_or(ValidateError::UnbalancedPopGroup)?;
+                    group_depth = group_depth.checked_sub(1).ok_or_else(|| {
+                        ValidateError::UnbalancedPopGroup {
+                            contexts: self.context_notes_for_stack(&context_stack),
+                        }
+                    })?;
                 }
                 Command::Draw(_) => {}
             }
         }
 
+        if context_depth != 0 {
+            return Err(ValidateError::UnclosedContexts {
+                contexts: self.context_notes_for_stack(&context_stack),
+            });
+        }
         if clip_depth != 0 {
-            return Err(ValidateError::UnclosedClips);
+            return Err(ValidateError::UnclosedClips {
+                contexts: self.context_notes_for_stack(&context_stack),
+            });
         }
         if group_depth != 0 {
-            return Err(ValidateError::UnclosedGroups);
+            return Err(ValidateError::UnclosedGroups {
+                contexts: self.context_notes_for_stack(&context_stack),
+            });
         }
         Ok(())
     }
@@ -468,6 +674,16 @@ impl Scene {
 }
 
 impl PaintSink for Scene {
+    #[inline]
+    fn push_context(&mut self, context: ContextRef<'_>) {
+        let _ = Self::push_context(self, context.label, context.source);
+    }
+
+    #[inline]
+    fn pop_context(&mut self) {
+        Self::pop_context(self);
+    }
+
     #[inline]
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         let _ = Self::push_clip(self, clip.to_owned());
@@ -533,13 +749,35 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidateError {
     /// A `PopClip` occurred without a matching prior `PushClip`.
-    UnbalancedPopClip,
+    UnbalancedPopClip {
+        /// Enclosing context stack active at the point of failure.
+        contexts: Vec<ContextNote>,
+    },
     /// A `PopGroup` occurred without a matching prior `PushGroup`.
-    UnbalancedPopGroup,
+    UnbalancedPopGroup {
+        /// Enclosing context stack active at the point of failure.
+        contexts: Vec<ContextNote>,
+    },
+    /// A `PopContext` occurred without a matching prior `PushContext`.
+    UnbalancedPopContext {
+        /// Enclosing context stack active at the point of failure.
+        contexts: Vec<ContextNote>,
+    },
     /// The command stream ended with open clips.
-    UnclosedClips,
+    UnclosedClips {
+        /// Enclosing context stack still open at the end of validation.
+        contexts: Vec<ContextNote>,
+    },
     /// The command stream ended with open groups.
-    UnclosedGroups,
+    UnclosedGroups {
+        /// Enclosing context stack still open at the end of validation.
+        contexts: Vec<ContextNote>,
+    },
+    /// The command stream ended with open contexts.
+    UnclosedContexts {
+        /// Enclosing context stack still open at the end of validation.
+        contexts: Vec<ContextNote>,
+    },
     /// A retained mask definition was invalid.
     InvalidMask(Box<Self>),
 }
@@ -569,7 +807,12 @@ mod tests {
     fn validate_catches_pop_underflow() {
         let mut s = Scene::new();
         s.pop_clip();
-        assert_eq!(s.validate(), Err(ValidateError::UnbalancedPopClip));
+        assert_eq!(
+            s.validate(),
+            Err(ValidateError::UnbalancedPopClip {
+                contexts: Vec::new()
+            })
+        );
     }
 
     #[test]
@@ -654,6 +897,58 @@ mod tests {
     }
 
     #[test]
+    fn append_transformed_preserves_context_annotations() {
+        let mut source = Scene::new();
+        source.push_context(
+            "toolbar/button",
+            Some(SourceLocationRef::new("widgets.rs", 9, 2)),
+        );
+        source.draw(Draw::Fill {
+            transform: Affine::translate((1.0, 2.0)),
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+            composite: Composite::default(),
+        });
+        source.pop_context();
+
+        let mut dest = Scene::new();
+        dest.reserve_like(&source);
+        dest.append_transformed(&source, Affine::translate((5.0, 6.0)));
+
+        assert_eq!(
+            dest.commands(),
+            &[
+                Command::PushContext(ContextId(0)),
+                Command::Draw(DrawId(0)),
+                Command::PopContext,
+            ]
+        );
+        assert_eq!(
+            dest.label(dest.context(ContextId(0)).label),
+            "toolbar/button"
+        );
+        let source = dest
+            .context(ContextId(0))
+            .source
+            .as_ref()
+            .expect("expected source location");
+        assert_eq!(dest.file(source.file), "widgets.rs");
+        assert_eq!(
+            dest.draw_op(DrawId(0)),
+            &Draw::Fill {
+                transform: Affine::translate((6.0, 8.0)),
+                fill_rule: Fill::NonZero,
+                brush: Brush::Solid(peniko::Color::WHITE),
+                brush_transform: None,
+                shape: Geometry::Rect(Rect::new(0.0, 0.0, 3.0, 4.0)),
+                composite: Composite::default(),
+            }
+        );
+    }
+
+    #[test]
     fn validate_rejects_invalid_nested_mask_scene() {
         let mut invalid_mask = Scene::new();
         invalid_mask.pop_clip();
@@ -664,8 +959,64 @@ mod tests {
         assert_eq!(
             scene.validate(),
             Err(ValidateError::InvalidMask(Box::new(
-                ValidateError::UnbalancedPopClip
+                ValidateError::UnbalancedPopClip {
+                    contexts: Vec::new()
+                }
             )))
+        );
+    }
+
+    #[test]
+    fn replay_round_trip_preserves_context_annotations() {
+        let mut source = Scene::new();
+        source.push_context(
+            "toolbar/button",
+            Some(SourceLocationRef::new("widgets.rs", 12, 8)),
+        );
+        source.draw(Draw::Fill {
+            transform: Affine::IDENTITY,
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
+            composite: Composite::default(),
+        });
+        source.pop_context();
+
+        let mut replayed = Scene::new();
+        replay(&source, &mut replayed);
+
+        assert_eq!(source, replayed);
+    }
+
+    #[test]
+    fn validate_reports_active_context_stack() {
+        let mut scene = Scene::new();
+        scene.push_context("window", None);
+        scene.push_context(
+            "toolbar/button",
+            Some(SourceLocationRef::new("widgets.rs", 42, 9)),
+        );
+        scene.pop_clip();
+
+        assert_eq!(
+            scene.validate(),
+            Err(ValidateError::UnbalancedPopClip {
+                contexts: vec![
+                    ContextNote {
+                        label: "window".into(),
+                        source: None,
+                    },
+                    ContextNote {
+                        label: "toolbar/button".into(),
+                        source: Some(ResolvedSourceLocation {
+                            file: "widgets.rs".into(),
+                            line: 42,
+                            column: 9,
+                        }),
+                    },
+                ],
+            })
         );
     }
 

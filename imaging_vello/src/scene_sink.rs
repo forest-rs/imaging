@@ -10,6 +10,7 @@ use imaging::{
 };
 use kurbo::{Affine, Rect};
 use peniko::{Brush, BrushRef, Fill};
+use std::boxed::Box;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`crate::vello::Scene`].
 ///
@@ -33,7 +34,7 @@ struct PendingMask {
 #[derive(Clone, Debug)]
 enum LayerFrame {
     Clip,
-    Group { mask: Option<PendingMask> },
+    Group { mask: Option<Box<PendingMask>> },
 }
 
 impl core::fmt::Debug for VelloSceneSink<'_> {
@@ -89,7 +90,9 @@ impl<'a> VelloSceneSink<'a> {
     }
 
     fn push_group_frame(&mut self, mask: Option<PendingMask>) {
-        self.layer_stack.push(LayerFrame::Group { mask });
+        self.layer_stack.push(LayerFrame::Group {
+            mask: mask.map(Box::new),
+        });
     }
 
     fn pop_clip_frame(&mut self) -> bool {
@@ -104,7 +107,7 @@ impl<'a> VelloSceneSink<'a> {
 
     fn pop_group_frame(&mut self) -> Option<Option<PendingMask>> {
         match self.layer_stack.pop() {
-            Some(LayerFrame::Group { mask }) => Some(mask),
+            Some(LayerFrame::Group { mask }) => Some(mask.map(|mask| *mask)),
             _ => {
                 self.set_error_once(Error::UnbalancedLayerStack);
                 None

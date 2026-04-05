@@ -9,8 +9,8 @@ use kurbo::{Affine, BezPath, CubicBez, Line, QuadBez, Rect, RoundedRect, Stroke}
 use peniko::{BrushRef, ImageBrushRef, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
-    NormalizedCoord, PaintSink, StrokeRef, record,
+    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GeometryRef, GlyphRunRef,
+    GroupRef, MaskMode, NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef, record,
 };
 
 const DEFAULT_SHAPE_TOLERANCE: f64 = 0.1;
@@ -247,6 +247,35 @@ where
             image.image.height as f64,
         );
         self.fill(rect, image).transform(transform).draw();
+    }
+
+    /// Push a context annotation onto the context stack.
+    ///
+    /// This is recorded by sinks that support retained context metadata and ignored by sinks that
+    /// do not. Pair with [`Self::pop_context`] or prefer [`Self::with_context`] /
+    /// [`crate::with_context!`] when the annotated work fits naturally in a closure.
+    pub fn push_context(&mut self, label: &str, source: Option<SourceLocationRef<'_>>) {
+        self.sink.push_context(ContextRef::new(label, source));
+    }
+
+    /// Pop the most recently pushed context annotation.
+    pub fn pop_context(&mut self) {
+        self.sink.pop_context();
+    }
+
+    /// Push a context annotation, run the provided closure, then pop the context.
+    ///
+    /// Use this when you want retained scenes and validation errors to preserve a human-meaningful
+    /// scope label, optionally with a source location.
+    pub fn with_context(
+        &mut self,
+        label: &str,
+        source: Option<SourceLocationRef<'_>>,
+        f: impl FnOnce(&mut Painter<'_, S>),
+    ) {
+        self.push_context(label, source);
+        f(self);
+        self.pop_context();
     }
 
     /// Push a clip onto the non-isolated clip stack.
@@ -675,6 +704,36 @@ mod tests {
         painter.with_fill_clip(Rect::new(0.0, 0.0, 5.0, 6.0), |_| {});
 
         assert_eq!(sink.pushed_clips.len(), 1);
+    }
+
+    #[test]
+    fn with_context_records_balanced_context_commands() {
+        let mut scene = record::Scene::new();
+        let mut painter = Painter::new(&mut scene);
+
+        painter.with_context(
+            "toolbar/button",
+            Some(SourceLocationRef::new("widgets.rs", 7, 3)),
+            |p| {
+                p.fill(Rect::new(0.0, 0.0, 5.0, 6.0), peniko::Color::BLACK)
+                    .draw();
+            },
+        );
+
+        assert_eq!(
+            scene.commands(),
+            &[
+                record::Command::PushContext(record::ContextId(0)),
+                record::Command::Draw(record::DrawId(0)),
+                record::Command::PopContext,
+            ]
+        );
+        let context = scene.context(record::ContextId(0));
+        assert_eq!(scene.label(context.label), "toolbar/button");
+        let source = context.source.as_ref().expect("expected source location");
+        assert_eq!(scene.file(source.file), "widgets.rs");
+        assert_eq!(source.line, 7);
+        assert_eq!(source.column, 3);
     }
 
     #[test]

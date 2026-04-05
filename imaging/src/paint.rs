@@ -652,6 +652,42 @@ pub enum DrawRef<'a> {
     BlurredRoundedRect(BlurredRoundedRect),
 }
 
+/// Borrowed source location carried by a context annotation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SourceLocationRef<'a> {
+    /// Internable file identifier string.
+    pub file: &'a str,
+    /// 1-based source line.
+    pub line: u32,
+    /// 1-based source column.
+    pub column: u32,
+}
+
+impl<'a> SourceLocationRef<'a> {
+    /// Create a borrowed source location.
+    #[must_use]
+    pub const fn new(file: &'a str, line: u32, column: u32) -> Self {
+        Self { file, line, column }
+    }
+}
+
+/// Borrowed context annotation emitted through [`PaintSink`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ContextRef<'a> {
+    /// Human-readable label for the current scope.
+    pub label: &'a str,
+    /// Optional source location associated with the scope.
+    pub source: Option<SourceLocationRef<'a>>,
+}
+
+impl<'a> ContextRef<'a> {
+    /// Create a context annotation with an optional source location.
+    #[must_use]
+    pub const fn new(label: &'a str, source: Option<SourceLocationRef<'a>>) -> Self {
+        Self { label, source }
+    }
+}
+
 impl<'a> DrawRef<'a> {
     /// Convert a borrowed draw payload into an owned [`Draw`].
     #[must_use]
@@ -670,6 +706,14 @@ impl<'a> DrawRef<'a> {
 /// This trait is intended for streaming authoring APIs and backend/native recorders that can
 /// consume borrowed input directly.
 pub trait PaintSink {
+    /// Push a context annotation onto the context stack.
+    ///
+    /// Default implementation: ignored.
+    fn push_context(&mut self, _context: ContextRef<'_>) {}
+    /// Pop the most recently pushed context annotation.
+    ///
+    /// Default implementation: ignored.
+    fn pop_context(&mut self) {}
     /// Push a non-isolated clip onto the clip stack.
     fn push_clip(&mut self, clip: ClipRef<'_>);
     /// Pop the most recently pushed non-isolated clip.
@@ -833,6 +877,14 @@ impl<S> PaintSink for TransformingSink<'_, S>
 where
     S: PaintSink + ?Sized,
 {
+    fn push_context(&mut self, context: ContextRef<'_>) {
+        self.inner.push_context(context);
+    }
+
+    fn pop_context(&mut self) {
+        self.inner.pop_context();
+    }
+
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         self.inner.push_clip(clip.prepend_transform(self.transform));
     }
@@ -922,6 +974,8 @@ where
     };
     for cmd in scene.commands() {
         match *cmd {
+            Command::PushContext(id) => sink.push_context(scene.context(id).as_ref(scene)),
+            Command::PopContext => sink.pop_context(),
             Command::PushClip(id) => replay_clip(scene, id, &mut sink),
             Command::PopClip => sink.pop_clip(),
             Command::PushGroup(id) => replay_group(scene, id, &mut sink),
