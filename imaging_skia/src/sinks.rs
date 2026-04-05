@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::{
-    Error, SkiaFontCache, affine_to_matrix, apply_stroke_style, bez_to_sk_path, brush_to_paint,
-    build_filter_chain, f64_to_f32, geometry_to_bez_path, geometry_to_sk_path, map_blend_mode,
-    path_with_fill_rule, skia_font_from_glyph_run,
+    Error, ImageCache, SkiaFontCache, affine_to_matrix, apply_stroke_style, bez_to_sk_path,
+    brush_to_paint, build_filter_chain, f64_to_f32, geometry_to_bez_path, geometry_to_sk_path,
+    map_blend_mode, path_with_fill_rule, skia_font_from_glyph_run,
 };
 use imaging::{
     BlurredRoundedRect, ClipRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode, PaintSink,
@@ -302,6 +302,7 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
 fn draw_glyph_run(
     canvas: &sk::Canvas,
     state: &mut StreamState,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
     font_cache: Option<&SkiaFontCache>,
     glyph_run: GlyphRunRef<'_>,
     glyphs: &mut dyn Iterator<Item = record::Glyph>,
@@ -313,9 +314,12 @@ fn draw_glyph_run(
 
     set_matrix(canvas, glyph_run.transform);
 
-    let Some(mut sk_paint) =
-        brush_to_paint(glyph_run.brush, glyph_run.composite.alpha, Affine::IDENTITY)
-    else {
+    let Some(mut sk_paint) = brush_to_paint(
+        glyph_run.brush,
+        glyph_run.composite.alpha,
+        Affine::IDENTITY,
+        image_cache,
+    ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
     };
@@ -444,6 +448,7 @@ fn draw_masked_group(
     canvas: &sk::Canvas,
     state: &mut StreamState,
     masked: MaskedGroupFrame,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
     mask_cache: Option<&Rc<RefCell<MaskCache>>>,
     font_cache: Option<&SkiaFontCache>,
 ) {
@@ -475,6 +480,7 @@ fn draw_masked_group(
             let mut sink = match (mask_cache, font_cache) {
                 (Some(cache), Some(font_cache)) => SkCanvasSink::new_with_caches(
                     mask_surface.canvas(),
+                    image_cache.cloned(),
                     cache.clone(),
                     font_cache.clone(),
                 ),
@@ -520,6 +526,7 @@ fn draw_masked_group(
         let mut sink = match (mask_cache, font_cache) {
             (Some(cache), Some(font_cache)) => SkCanvasSink::new_with_caches(
                 content_surface.canvas(),
+                image_cache.cloned(),
                 cache.clone(),
                 font_cache.clone(),
             ),
@@ -648,6 +655,7 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
 fn paint_sink_pop_group(
     canvas: &sk::Canvas,
     state: &mut StreamState,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
     mask_cache: Option<&Rc<RefCell<MaskCache>>>,
     font_cache: Option<&SkiaFontCache>,
 ) {
@@ -671,12 +679,17 @@ fn paint_sink_pop_group(
                 state.group_stack.push(GroupFrame::Masked(frame));
                 return;
             }
-            draw_masked_group(canvas, state, *frame, mask_cache, font_cache);
+            draw_masked_group(canvas, state, *frame, image_cache, mask_cache, font_cache);
         }
     }
 }
 
-fn paint_sink_fill(canvas: &sk::Canvas, state: &mut StreamState, draw: FillRef<'_>) {
+fn paint_sink_fill(
+    canvas: &sk::Canvas,
+    state: &mut StreamState,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
+    draw: FillRef<'_>,
+) {
     if state.error.is_some() {
         return;
     }
@@ -690,6 +703,7 @@ fn paint_sink_fill(canvas: &sk::Canvas, state: &mut StreamState, draw: FillRef<'
         draw.brush,
         draw.composite.alpha,
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
+        image_cache,
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
@@ -726,7 +740,12 @@ fn paint_sink_fill(canvas: &sk::Canvas, state: &mut StreamState, draw: FillRef<'
     }
 }
 
-fn paint_sink_stroke(canvas: &sk::Canvas, state: &mut StreamState, draw: StrokeRef<'_>) {
+fn paint_sink_stroke(
+    canvas: &sk::Canvas,
+    state: &mut StreamState,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
+    draw: StrokeRef<'_>,
+) {
     if state.error.is_some() {
         return;
     }
@@ -740,6 +759,7 @@ fn paint_sink_stroke(canvas: &sk::Canvas, state: &mut StreamState, draw: StrokeR
         draw.brush,
         draw.composite.alpha,
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
+        image_cache,
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
@@ -776,6 +796,7 @@ fn paint_sink_stroke(canvas: &sk::Canvas, state: &mut StreamState, draw: StrokeR
 /// Borrowed adapter that streams `imaging` commands into an existing [`skia_safe::Canvas`].
 pub struct SkCanvasSink<'a> {
     canvas: &'a sk::Canvas,
+    image_cache: Option<Rc<RefCell<ImageCache>>>,
     mask_cache: Option<Rc<RefCell<MaskCache>>>,
     font_cache: Option<SkiaFontCache>,
     state: StreamState,
@@ -797,6 +818,7 @@ impl<'a> SkCanvasSink<'a> {
     pub fn new(canvas: &'a sk::Canvas) -> Self {
         Self {
             canvas,
+            image_cache: None,
             mask_cache: None,
             font_cache: None,
             state: StreamState::new(),
@@ -805,11 +827,13 @@ impl<'a> SkCanvasSink<'a> {
 
     pub(crate) fn new_with_caches(
         canvas: &'a sk::Canvas,
+        image_cache: Option<Rc<RefCell<ImageCache>>>,
         mask_cache: Rc<RefCell<MaskCache>>,
         font_cache: SkiaFontCache,
     ) -> Self {
         Self {
             canvas,
+            image_cache,
             mask_cache: Some(mask_cache),
             font_cache: Some(font_cache),
             state: StreamState::new(),
@@ -844,17 +868,28 @@ impl PaintSink for SkCanvasSink<'_> {
         paint_sink_pop_group(
             self.canvas,
             &mut self.state,
+            self.image_cache.as_ref(),
             self.mask_cache.as_ref(),
             self.font_cache.as_ref(),
         );
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
-        paint_sink_fill(self.canvas, &mut self.state, draw);
+        paint_sink_fill(
+            self.canvas,
+            &mut self.state,
+            self.image_cache.as_ref(),
+            draw,
+        );
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
-        paint_sink_stroke(self.canvas, &mut self.state, draw);
+        paint_sink_stroke(
+            self.canvas,
+            &mut self.state,
+            self.image_cache.as_ref(),
+            draw,
+        );
     }
 
     fn glyph_run(
@@ -872,6 +907,7 @@ impl PaintSink for SkCanvasSink<'_> {
         draw_glyph_run(
             self.canvas,
             &mut self.state,
+            self.image_cache.as_ref(),
             self.font_cache.as_ref(),
             draw,
             glyphs,
@@ -893,6 +929,7 @@ impl PaintSink for SkCanvasSink<'_> {
 /// Owned sink that records `imaging` commands into a native [`skia_safe::Picture`].
 pub struct SkPictureRecorderSink {
     recorder: sk::PictureRecorder,
+    image_cache: Option<Rc<RefCell<ImageCache>>>,
     font_cache: Option<SkiaFontCache>,
     state: StreamState,
 }
@@ -915,16 +952,25 @@ impl SkPictureRecorderSink {
     }
 
     #[cfg(feature = "gpu")]
-    pub(crate) fn new_with_font_cache(bounds: Rect, font_cache: SkiaFontCache) -> Self {
-        Self::new_with_options(bounds, false, Some(font_cache))
+    pub(crate) fn new_with_caches(
+        bounds: Rect,
+        image_cache: Option<Rc<RefCell<ImageCache>>>,
+        font_cache: SkiaFontCache,
+    ) -> Self {
+        Self::new_with_options(bounds, false, image_cache, Some(font_cache))
     }
 
     /// Start recording a Skia picture with optional bounding-box hierarchy acceleration.
     pub fn new_with_bbh(bounds: Rect, use_bbh: bool) -> Self {
-        Self::new_with_options(bounds, use_bbh, None)
+        Self::new_with_options(bounds, use_bbh, None, None)
     }
 
-    fn new_with_options(bounds: Rect, use_bbh: bool, font_cache: Option<SkiaFontCache>) -> Self {
+    fn new_with_options(
+        bounds: Rect,
+        use_bbh: bool,
+        image_cache: Option<Rc<RefCell<ImageCache>>>,
+        font_cache: Option<SkiaFontCache>,
+    ) -> Self {
         let mut recorder = sk::PictureRecorder::new();
         let bounds = sk::Rect::new(
             f64_to_f32(bounds.x0),
@@ -935,6 +981,7 @@ impl SkPictureRecorderSink {
         let _ = recorder.begin_recording(bounds, use_bbh);
         Self {
             recorder,
+            image_cache,
             font_cache,
             state: StreamState::new(),
         }
@@ -992,7 +1039,13 @@ impl PaintSink for SkPictureRecorderSink {
             state.set_error_once(Error::Internal("picture recorder not recording"));
             return;
         };
-        paint_sink_pop_group(canvas, state, None, self.font_cache.as_ref());
+        paint_sink_pop_group(
+            canvas,
+            state,
+            self.image_cache.as_ref(),
+            None,
+            self.font_cache.as_ref(),
+        );
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -1002,7 +1055,7 @@ impl PaintSink for SkPictureRecorderSink {
             state.set_error_once(Error::Internal("picture recorder not recording"));
             return;
         };
-        paint_sink_fill(canvas, state, draw);
+        paint_sink_fill(canvas, state, self.image_cache.as_ref(), draw);
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
@@ -1012,7 +1065,7 @@ impl PaintSink for SkPictureRecorderSink {
             state.set_error_once(Error::Internal("picture recorder not recording"));
             return;
         };
-        paint_sink_stroke(canvas, state, draw);
+        paint_sink_stroke(canvas, state, self.image_cache.as_ref(), draw);
     }
 
     fn glyph_run(
@@ -1033,7 +1086,14 @@ impl PaintSink for SkPictureRecorderSink {
             frame.content.glyph_run(draw, glyphs);
             return;
         }
-        draw_glyph_run(canvas, state, self.font_cache.as_ref(), draw, glyphs);
+        draw_glyph_run(
+            canvas,
+            state,
+            self.image_cache.as_ref(),
+            self.font_cache.as_ref(),
+            draw,
+            glyphs,
+        );
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
