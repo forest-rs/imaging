@@ -26,17 +26,8 @@ struct CachedMask {
     bytes: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct MaskCache {
-    entries: VecDeque<CachedMask>,
-}
-
-impl MaskCache {
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    fn get(
+impl CachedMask {
+    fn matches(
         &self,
         scene: &record::Scene,
         mode: MaskMode,
@@ -44,18 +35,76 @@ impl MaskCache {
         width: i32,
         height: i32,
         tolerance: f64,
+    ) -> bool {
+        self.scene == *scene
+            && self.mode == mode
+            && self.transform == transform
+            && self.width == width
+            && self.height == height
+            && self.tolerance == tolerance
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MaskCache {
+    bytes_used: usize,
+    max_bytes: usize,
+    entries: VecDeque<CachedMask>,
+}
+
+impl MaskCache {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes_used: 0,
+            max_bytes,
+            entries: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.bytes_used = 0;
+        self.entries.clear();
+    }
+
+    pub(crate) fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.evict_to_budget();
+    }
+
+    fn touch(&mut self, index: usize) {
+        if index + 1 == self.entries.len() {
+            return;
+        }
+        if let Some(entry) = self.entries.remove(index) {
+            self.entries.push_back(entry);
+        }
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.bytes_used > self.max_bytes {
+            let Some(oldest) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes_used = self.bytes_used.saturating_sub(oldest.bytes.len());
+        }
+    }
+
+    fn get(
+        &mut self,
+        scene: &record::Scene,
+        mode: MaskMode,
+        transform: Affine,
+        width: i32,
+        height: i32,
+        tolerance: f64,
     ) -> Option<Vec<u8>> {
-        self.entries
+        let index = self
+            .entries
             .iter()
-            .find(|entry| {
-                entry.scene == *scene
-                    && entry.mode == mode
-                    && entry.transform == transform
-                    && entry.width == width
-                    && entry.height == height
-                    && entry.tolerance == tolerance
-            })
-            .map(|entry| entry.bytes.clone())
+            .position(|entry| entry.matches(scene, mode, transform, width, height, tolerance))?;
+        let bytes = self.entries.get(index)?.bytes.clone();
+        self.touch(index);
+        Some(bytes)
     }
 
     fn insert(
@@ -68,9 +117,18 @@ impl MaskCache {
         tolerance: f64,
         bytes: &[u8],
     ) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.matches(scene, mode, transform, width, height, tolerance))
+            && let Some(existing) = self.entries.remove(index)
+        {
+            self.bytes_used = self.bytes_used.saturating_sub(existing.bytes.len());
+        }
+
         // If more backends end up wanting realized-mask caches, add a portable scene/cache key at
         // the imaging layer instead of retaining full scenes in backend-local caches.
-        self.entries.push_back(CachedMask {
+        let entry = CachedMask {
             scene: scene.clone(),
             mode,
             transform,
@@ -78,12 +136,21 @@ impl MaskCache {
             height,
             tolerance,
             bytes: bytes.to_vec(),
-        });
+        };
+        self.bytes_used = self.bytes_used.saturating_add(entry.bytes.len());
+        self.entries.push_back(entry);
+        self.evict_to_budget();
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+impl Default for MaskCache {
+    fn default() -> Self {
+        Self::new(64 * 1024 * 1024)
     }
 }
 
@@ -388,7 +455,7 @@ fn draw_masked_group(
     };
 
     let mask_bytes = if let Some(cache) = mask_cache
-        && let Some(bytes) = cache.borrow().get(
+        && let Some(bytes) = cache.borrow_mut().get(
             &masked.mask,
             masked.mode,
             masked.transform,
@@ -992,6 +1059,54 @@ mod tests {
     use super::*;
     use imaging::Composite;
     use peniko::{Brush, Color};
+
+    fn scene_with_offset(offset: f64) -> record::Scene {
+        let mut scene = record::Scene::new();
+        scene.fill(FillRef::new(
+            Rect::new(offset, offset, offset + 4.0, offset + 4.0),
+            &Brush::Solid(Color::WHITE),
+        ));
+        scene
+    }
+
+    #[test]
+    fn mask_cache_evicts_oldest_entries_to_stay_within_budget() {
+        let mut cache = MaskCache::new(8);
+        let first = scene_with_offset(0.0);
+        let second = scene_with_offset(8.0);
+
+        cache.insert(
+            &first,
+            MaskMode::Alpha,
+            Affine::IDENTITY,
+            1,
+            1,
+            0.1,
+            &[1, 2, 3, 4],
+        );
+        assert_eq!(cache.len(), 1);
+
+        cache.insert(
+            &second,
+            MaskMode::Alpha,
+            Affine::IDENTITY,
+            1,
+            1,
+            0.1,
+            &[5, 6, 7, 8, 9, 10],
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache
+                .get(&first, MaskMode::Alpha, Affine::IDENTITY, 1, 1, 0.1)
+                .is_none()
+        );
+        assert_eq!(
+            cache.get(&second, MaskMode::Alpha, Affine::IDENTITY, 1, 1, 0.1),
+            Some(vec![5, 6, 7, 8, 9, 10])
+        );
+    }
 
     #[test]
     fn sk_canvas_sink_reports_clip_underflow() {
