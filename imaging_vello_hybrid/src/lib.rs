@@ -8,7 +8,7 @@
 //! `vello_hybrid` + `wgpu`.
 //!
 //! Semantic [`imaging::record::Scene`] values can be lowered to native hybrid scenes through
-//! [`VelloHybridRenderer::encode_scene`].
+//! [`VelloHybridTargetRenderer::encode_scene`] or [`VelloHybridRenderer::encode_scene`].
 //!
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
 //! presentation targets, then pass those handles into [`VelloHybridRenderer`].
@@ -21,7 +21,7 @@
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with
-//! [`VelloHybridRenderer`].
+//! [`VelloHybridRenderer`] or [`VelloHybridTargetRenderer`].
 //!
 //! ```no_run
 //! use imaging::{Painter, record};
@@ -111,7 +111,8 @@
 //!     scene.reset();
 //!
 //!     {
-//!         let mut sink = VelloHybridSceneSink::with_renderer(&mut scene, &mut renderer);
+//!         let mut sink =
+//!             VelloHybridSceneSink::with_renderer(&mut scene, renderer.target_renderer());
 //!         let mut painter = Painter::new(&mut sink);
 //!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &brush);
 //!         sink.finish()?;
@@ -194,21 +195,36 @@ pub enum Error {
     Internal(&'static str),
 }
 
-/// Renderer that executes `imaging` commands using `vello_hybrid` + `wgpu`.
 #[derive(Debug)]
-pub struct VelloHybridRenderer {
+pub(crate) struct VelloHybridRendererState {
     renderer: vello_hybrid::Renderer,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    target: OffscreenTarget,
-    width: u16,
-    height: u16,
     tolerance: f64,
     image_registry: HybridImageRegistry,
 }
 
+/// Target-oriented renderer that executes `imaging` commands using `vello_hybrid` + `wgpu`.
+///
+/// This type owns backend state and uploaded images, but it does not own an offscreen render
+/// target. Use it when the host application owns the destination texture view.
+#[derive(Debug)]
+pub struct VelloHybridTargetRenderer {
+    state: VelloHybridRendererState,
+}
+
+/// Convenience image renderer that owns a lazy offscreen target for readback.
+///
+/// This wraps [`VelloHybridTargetRenderer`] and adds RGBA8 image production. Use
+/// [`VelloHybridTargetRenderer`] when the host application already owns the target texture view.
+#[derive(Debug)]
+pub struct VelloHybridRenderer {
+    target_renderer: VelloHybridTargetRenderer,
+    target: Option<OffscreenTarget>,
+}
+
 /// Caller-owned texture target used with [`imaging::TextureRenderer`] on
-/// [`VelloHybridRenderer`].
+/// [`VelloHybridTargetRenderer`].
 #[derive(Copy, Clone, Debug)]
 pub struct TextureTarget<'a> {
     view: &'a wgpu::TextureView,
@@ -228,7 +244,7 @@ impl<'a> TextureTarget<'a> {
     }
 }
 
-impl VelloHybridRenderer {
+impl VelloHybridRendererState {
     fn checked_size(width: u32, height: u32) -> Result<(u16, u16), Error> {
         let width = u16::try_from(width).map_err(|_| Error::Internal("render width too large"))?;
         let height =
@@ -236,11 +252,7 @@ impl VelloHybridRenderer {
         Ok((width, height))
     }
 
-    /// Create a renderer bound to an existing `wgpu` device and queue.
-    #[must_use]
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
-        let target = OffscreenTarget::new(&device, 1, 1);
-
+    fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let renderer = vello_hybrid::Renderer::new(
             &device,
             &RenderTargetConfig {
@@ -254,17 +266,9 @@ impl VelloHybridRenderer {
             renderer,
             device,
             queue,
-            target,
-            width: 1,
-            height: 1,
             tolerance: 0.1,
             image_registry: HybridImageRegistry::new(),
         }
-    }
-
-    /// Set the tolerance used when converting shapes to paths.
-    pub fn set_tolerance(&mut self, tolerance: f64) {
-        self.tolerance = tolerance;
     }
 
     pub(crate) fn begin_image_upload_session(
@@ -282,8 +286,7 @@ impl VelloHybridRenderer {
         )
     }
 
-    /// Destroy all uploaded hybrid image resources cached by this renderer.
-    pub fn clear_cached_images(&mut self) {
+    fn clear_cached_images(&mut self) {
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
@@ -295,104 +298,6 @@ impl VelloHybridRenderer {
     }
 
     /// Lower a semantic [`imaging::record::Scene`] into a native [`vello_hybrid::Scene`].
-    pub fn encode_scene(
-        &mut self,
-        scene: &Scene,
-        width: u16,
-        height: u16,
-    ) -> Result<vello_hybrid::Scene, Error> {
-        scene.validate().map_err(Error::InvalidScene)?;
-        self.resize_target(width, height);
-        let mut native = vello_hybrid::Scene::new(width, height);
-        native.reset();
-        let tolerance = self.tolerance;
-        {
-            let mut sink = VelloHybridSceneSink::with_renderer(&mut native, self);
-            sink.set_tolerance(tolerance);
-            replay(scene, &mut sink);
-            sink.finish()?;
-        }
-        Ok(native)
-    }
-
-    fn encode_source<S: RenderSource + ?Sized>(
-        &mut self,
-        source: &mut S,
-        width: u32,
-        height: u32,
-    ) -> Result<vello_hybrid::Scene, Error> {
-        source.validate().map_err(Error::InvalidScene)?;
-        let (width, height) = Self::checked_size(width, height)?;
-        self.resize_target(width, height);
-        let mut native = vello_hybrid::Scene::new(width, height);
-        native.reset();
-        let tolerance = self.tolerance;
-        {
-            let mut sink = VelloHybridSceneSink::with_renderer(&mut native, self);
-            sink.set_tolerance(tolerance);
-            source.paint_into(&mut sink);
-            sink.finish()?;
-        }
-        Ok(native)
-    }
-
-    /// Render a native [`vello_hybrid::Scene`] into an RGBA8 image (unpremultiplied).
-    pub fn render_into(
-        &mut self,
-        scene: &vello_hybrid::Scene,
-        width: u16,
-        height: u16,
-        image: &mut RgbaImage,
-    ) -> Result<(), Error> {
-        self.resize_target(width, height);
-        let texture_view = self.target.texture_view().clone();
-        let target_width = self.target.width();
-        let target_height = self.target.height();
-        self.render_to_view(scene, &texture_view, target_width, target_height)?;
-        readback_into(
-            &self.device,
-            &self.queue,
-            self.target.texture(),
-            target_width,
-            target_height,
-            image,
-        )
-    }
-
-    /// Render a native [`vello_hybrid::Scene`] and return an RGBA8 image (unpremultiplied).
-    pub fn render(
-        &mut self,
-        scene: &vello_hybrid::Scene,
-        width: u16,
-        height: u16,
-    ) -> Result<RgbaImage, Error> {
-        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
-        self.render_into(scene, width, height, &mut image)?;
-        Ok(image)
-    }
-
-    /// Render a native [`vello_hybrid::Scene`] into a caller-provided texture view.
-    pub fn render_to_texture_view(
-        &mut self,
-        scene: &vello_hybrid::Scene,
-        texture_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-    ) -> Result<(), Error> {
-        self.render_to_view(scene, texture_view, width, height)
-    }
-
-    fn resize_target(&mut self, width: u16, height: u16) {
-        if self.width == width && self.height == height {
-            return;
-        }
-
-        self.target
-            .resize(&self.device, u32::from(width), u32::from(height));
-        self.width = width;
-        self.height = height;
-    }
-
     fn render_to_view(
         &mut self,
         scene: &vello_hybrid::Scene,
@@ -423,23 +328,86 @@ impl VelloHybridRenderer {
     }
 }
 
-impl ImageRenderer for VelloHybridRenderer {
-    type Error = Error;
+impl VelloHybridTargetRenderer {
+    /// Create a renderer bound to an existing `wgpu` device and queue.
+    #[must_use]
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self {
+            state: VelloHybridRendererState::new(device, queue),
+        }
+    }
 
-    fn render_source_into<S: RenderSource + ?Sized>(
+    /// Set the tolerance used when converting shapes to paths.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        self.state.tolerance = tolerance;
+    }
+
+    /// Destroy all uploaded hybrid image resources cached by this renderer.
+    pub fn clear_cached_images(&mut self) {
+        self.state.clear_cached_images();
+    }
+
+    pub(crate) fn begin_image_upload_session(
+        &mut self,
+        label: &'static str,
+    ) -> HybridImageUploadSession<'_> {
+        self.state.begin_image_upload_session(label)
+    }
+
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`vello_hybrid::Scene`].
+    pub fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<vello_hybrid::Scene, Error> {
+        scene.validate().map_err(Error::InvalidScene)?;
+        let mut native = vello_hybrid::Scene::new(width, height);
+        native.reset();
+        let tolerance = self.state.tolerance;
+        {
+            let mut sink = VelloHybridSceneSink::with_renderer(&mut native, self);
+            sink.set_tolerance(tolerance);
+            replay(scene, &mut sink);
+            sink.finish()?;
+        }
+        Ok(native)
+    }
+
+    fn encode_source<S: RenderSource + ?Sized>(
         &mut self,
         source: &mut S,
         width: u32,
         height: u32,
-        image: &mut RgbaImage,
-    ) -> Result<(), Self::Error> {
-        let native = self.encode_source(source, width, height)?;
-        let (width, height) = Self::checked_size(width, height)?;
-        self.render_into(&native, width, height, image)
+    ) -> Result<vello_hybrid::Scene, Error> {
+        source.validate().map_err(Error::InvalidScene)?;
+        let (width, height) = VelloHybridRendererState::checked_size(width, height)?;
+        let mut native = vello_hybrid::Scene::new(width, height);
+        native.reset();
+        let tolerance = self.state.tolerance;
+        {
+            let mut sink = VelloHybridSceneSink::with_renderer(&mut native, self);
+            sink.set_tolerance(tolerance);
+            source.paint_into(&mut sink);
+            sink.finish()?;
+        }
+        Ok(native)
+    }
+
+    /// Render a native [`vello_hybrid::Scene`] into a caller-provided texture view.
+    pub fn render_to_texture_view(
+        &mut self,
+        scene: &vello_hybrid::Scene,
+        texture_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        self.state
+            .render_to_view(scene, texture_view, width, height)
     }
 }
 
-impl TextureRenderer for VelloHybridRenderer {
+impl TextureRenderer for VelloHybridTargetRenderer {
     type Error = Error;
     type TextureTarget<'a> = TextureTarget<'a>;
 
@@ -450,6 +418,115 @@ impl TextureRenderer for VelloHybridRenderer {
     ) -> Result<(), Self::Error> {
         let native = self.encode_source(source, target.width, target.height)?;
         self.render_to_texture_view(&native, target.view, target.width, target.height)
+    }
+}
+
+impl VelloHybridRenderer {
+    /// Create an image renderer bound to an existing `wgpu` device and queue.
+    #[must_use]
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self {
+            target_renderer: VelloHybridTargetRenderer::new(device, queue),
+            target: None,
+        }
+    }
+
+    /// Access the target renderer used by this image renderer.
+    pub fn target_renderer(&mut self) -> &mut VelloHybridTargetRenderer {
+        &mut self.target_renderer
+    }
+
+    /// Set the tolerance used when converting shapes to paths.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        self.target_renderer.set_tolerance(tolerance);
+    }
+
+    /// Destroy all uploaded hybrid image resources cached by this renderer.
+    pub fn clear_cached_images(&mut self) {
+        self.target_renderer.clear_cached_images();
+    }
+
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`vello_hybrid::Scene`].
+    pub fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<vello_hybrid::Scene, Error> {
+        self.target_renderer.encode_scene(scene, width, height)
+    }
+
+    fn ensure_target(&mut self, width: u16, height: u16) -> &OffscreenTarget {
+        let target = self.target.get_or_insert_with(|| {
+            OffscreenTarget::new(
+                &self.target_renderer.state.device,
+                u32::from(width),
+                u32::from(height),
+            )
+        });
+        target.resize(
+            &self.target_renderer.state.device,
+            u32::from(width),
+            u32::from(height),
+        );
+        target
+    }
+
+    /// Render a native [`vello_hybrid::Scene`] into an RGBA8 image (unpremultiplied).
+    pub fn render_into(
+        &mut self,
+        scene: &vello_hybrid::Scene,
+        width: u16,
+        height: u16,
+        image: &mut RgbaImage,
+    ) -> Result<(), Error> {
+        let target = self.ensure_target(width, height);
+        let texture_view = target.texture_view().clone();
+        let target_texture = target.texture().clone();
+        let target_width = target.width();
+        let target_height = target.height();
+        self.target_renderer.render_to_texture_view(
+            scene,
+            &texture_view,
+            target_width,
+            target_height,
+        )?;
+        readback_into(
+            &self.target_renderer.state.device,
+            &self.target_renderer.state.queue,
+            &target_texture,
+            target_width,
+            target_height,
+            image,
+        )
+    }
+
+    /// Render a native [`vello_hybrid::Scene`] and return an RGBA8 image (unpremultiplied).
+    pub fn render(
+        &mut self,
+        scene: &vello_hybrid::Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+        self.render_into(scene, width, height, &mut image)?;
+        Ok(image)
+    }
+}
+
+impl ImageRenderer for VelloHybridRenderer {
+    type Error = Error;
+
+    fn render_source_into<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        width: u32,
+        height: u32,
+        image: &mut RgbaImage,
+    ) -> Result<(), Self::Error> {
+        let native = self.target_renderer.encode_source(source, width, height)?;
+        let (width, height) = VelloHybridRendererState::checked_size(width, height)?;
+        self.render_into(&native, width, height, image)
     }
 }
 
@@ -559,7 +636,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloHybridRenderer::new(device.clone(), queue);
+        let mut renderer = VelloHybridTargetRenderer::new(device.clone(), queue);
 
         let mut scene = Scene::new();
         {
@@ -598,7 +675,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloHybridRenderer::new(device.clone(), queue);
+        let mut renderer = VelloHybridTargetRenderer::new(device.clone(), queue);
 
         let mut scene = Scene::new();
         {

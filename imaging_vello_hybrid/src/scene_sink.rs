@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::Error;
-use crate::{VelloHybridRenderer, image_registry::HybridImageUploadSession};
+use crate::{VelloHybridTargetRenderer, image_registry::HybridImageUploadSession};
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
     StrokeRef,
@@ -52,7 +52,7 @@ impl<'a> VelloHybridSceneSink<'a> {
     /// renderer and reused across subsequent recordings and renders.
     pub fn with_renderer(
         scene: &'a mut vello_hybrid::Scene,
-        renderer: &'a mut VelloHybridRenderer,
+        renderer: &'a mut VelloHybridTargetRenderer,
     ) -> Self {
         Self {
             scene,

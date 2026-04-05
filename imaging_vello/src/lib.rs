@@ -7,10 +7,11 @@
 //! and renders them to GPU targets or RGBA8 image data using `vello` + `wgpu`.
 //!
 //! Semantic [`imaging::record::Scene`] values can be lowered to native Vello scenes through
-//! [`VelloRenderer::encode_scene`].
+//! [`VelloTargetRenderer::encode_scene`] or [`VelloRenderer::encode_scene`].
 //!
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
-//! presentation targets, then pass those handles into [`VelloRenderer`].
+//! presentation targets, then pass those handles into [`VelloTargetRenderer`] or
+//! [`VelloRenderer`].
 //!
 //! Enable exactly one backend compatibility feature:
 //!
@@ -19,7 +20,8 @@
 //!
 //! # Render A Recorded Scene
 //!
-//! Record commands into [`imaging::record::Scene`], then render them with [`VelloRenderer`].
+//! Record commands into [`imaging::record::Scene`], then render them with [`VelloRenderer`] or
+//! [`VelloTargetRenderer`].
 //!
 //! ```no_run
 //! use imaging::{Painter, record};
@@ -48,7 +50,7 @@
 //!
 //! # Record Into `vello::Scene`
 //!
-//! If you want a backend-native retained scene without going through [`VelloRenderer`], wrap a
+//! If you want a backend-native retained scene without going through a renderer, wrap a
 //! mutable [`vello::Scene`] with [`VelloSceneSink`].
 //!
 //! ```no_run
@@ -75,7 +77,8 @@
 //!
 //! # Render A Native `vello::Scene`
 //!
-//! If you already have a native Vello scene, hand it directly to [`VelloRenderer`].
+//! If you already have a native Vello scene, hand it directly to [`VelloRenderer`] for image
+//! output or [`VelloTargetRenderer`] for caller-owned target rendering.
 //!
 //! ```no_run
 //! use imaging::Painter;
@@ -162,17 +165,28 @@ pub enum Error {
     Internal(&'static str),
 }
 
-/// Renderer that executes `imaging` commands using `vello` + `wgpu`.
-pub struct VelloRenderer {
+struct VelloRendererState {
     renderer: vello::Renderer,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    target: OffscreenTarget,
-    width: u16,
-    height: u16,
 }
 
-/// Caller-owned texture target used with [`imaging::TextureRenderer`] on [`VelloRenderer`].
+/// Renderer that executes `imaging` commands into caller-owned texture views using `vello` +
+/// `wgpu`.
+pub struct VelloTargetRenderer {
+    state: VelloRendererState,
+}
+
+/// Image/readback convenience wrapper around [`VelloTargetRenderer`].
+///
+/// Use [`VelloTargetRenderer`] when the host application already owns the destination texture
+/// view.
+pub struct VelloRenderer {
+    target_renderer: VelloTargetRenderer,
+    target: Option<OffscreenTarget>,
+}
+
+/// Caller-owned texture target used with [`imaging::TextureRenderer`] on [`VelloTargetRenderer`].
 #[derive(Copy, Clone, Debug)]
 pub struct TextureTarget<'a> {
     view: &'a wgpu::TextureView,
@@ -192,16 +206,20 @@ impl<'a> TextureTarget<'a> {
     }
 }
 
-impl core::fmt::Debug for VelloRenderer {
+impl core::fmt::Debug for VelloTargetRenderer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VelloRenderer")
-            .field("width", &self.width)
-            .field("height", &self.height)
+        f.debug_struct("VelloTargetRenderer")
             .finish_non_exhaustive()
     }
 }
 
-impl VelloRenderer {
+impl core::fmt::Debug for VelloRenderer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VelloRenderer").finish_non_exhaustive()
+    }
+}
+
+impl VelloRendererState {
     fn checked_size(width: u32, height: u32) -> Result<(u16, u16), Error> {
         let width = u16::try_from(width).map_err(|_| Error::Internal("render width too large"))?;
         let height =
@@ -209,9 +227,7 @@ impl VelloRenderer {
         Ok((width, height))
     }
 
-    /// Create a renderer bound to an existing `wgpu` device and queue.
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, Error> {
-        let target = OffscreenTarget::new(&device, 1, 1);
+    fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, Error> {
         let renderer = vello::Renderer::new(&device, vello::RendererOptions::default())
             .map_err(Error::Render)?;
 
@@ -219,30 +235,11 @@ impl VelloRenderer {
             renderer,
             device,
             queue,
-            target,
-            width: 1,
-            height: 1,
         })
     }
 
-    fn resize_target(&mut self, width: u16, height: u16) {
-        if self.width == width && self.height == height {
-            return;
-        }
-
-        self.target
-            .resize(&self.device, u32::from(width), u32::from(height));
-        self.width = width;
-        self.height = height;
-    }
-
     /// Lower a semantic [`imaging::record::Scene`] into a native [`crate::vello::Scene`].
-    pub fn encode_scene(
-        &self,
-        scene: &Scene,
-        width: u32,
-        height: u32,
-    ) -> Result<vello::Scene, Error> {
+    fn encode_scene(&self, scene: &Scene, width: u32, height: u32) -> Result<vello::Scene, Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         let mut native = vello::Scene::new();
         let bounds = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
@@ -267,52 +264,6 @@ impl VelloRenderer {
         Ok(native)
     }
 
-    /// Render a native [`crate::vello::Scene`] into an RGBA8 image (unpremultiplied).
-    pub fn render_into(
-        &mut self,
-        scene: &vello::Scene,
-        width: u16,
-        height: u16,
-        image: &mut RgbaImage,
-    ) -> Result<(), Error> {
-        self.resize_target(width, height);
-        let texture_view = self.target.texture_view().clone();
-        let width = self.target.width();
-        let height = self.target.height();
-        self.render_to_view(scene, &texture_view, width, height)?;
-        readback_into(
-            &self.device,
-            &self.queue,
-            self.target.texture(),
-            self.width,
-            self.height,
-            image,
-        )
-    }
-
-    /// Render a native [`crate::vello::Scene`] and return an RGBA8 image (unpremultiplied).
-    pub fn render(
-        &mut self,
-        scene: &vello::Scene,
-        width: u16,
-        height: u16,
-    ) -> Result<RgbaImage, Error> {
-        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
-        self.render_into(scene, width, height, &mut image)?;
-        Ok(image)
-    }
-
-    /// Render a native [`crate::vello::Scene`] into a caller-provided texture view.
-    pub fn render_to_texture_view(
-        &mut self,
-        scene: &vello::Scene,
-        texture_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-    ) -> Result<(), Error> {
-        self.render_to_view(scene, texture_view, width, height)
-    }
-
     fn render_to_view(
         &mut self,
         scene: &vello::Scene,
@@ -333,23 +284,47 @@ impl VelloRenderer {
     }
 }
 
-impl ImageRenderer for VelloRenderer {
-    type Error = Error;
+impl VelloTargetRenderer {
+    /// Create a renderer bound to an existing `wgpu` device and queue.
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, Error> {
+        Ok(Self {
+            state: VelloRendererState::new(device, queue)?,
+        })
+    }
 
-    fn render_source_into<S: RenderSource + ?Sized>(
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`crate::vello::Scene`].
+    pub fn encode_scene(
+        &self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<vello::Scene, Error> {
+        self.state.encode_scene(scene, width, height)
+    }
+
+    fn encode_source<S: RenderSource + ?Sized>(
         &mut self,
         source: &mut S,
         width: u32,
         height: u32,
-        image: &mut RgbaImage,
-    ) -> Result<(), Self::Error> {
-        let native = self.encode_source(source, width, height)?;
-        let (width, height) = Self::checked_size(width, height)?;
-        self.render_into(&native, width, height, image)
+    ) -> Result<vello::Scene, Error> {
+        self.state.encode_source(source, width, height)
+    }
+
+    /// Render a native [`crate::vello::Scene`] into a caller-provided texture view.
+    pub fn render_to_texture_view(
+        &mut self,
+        scene: &vello::Scene,
+        texture_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        self.state
+            .render_to_view(scene, texture_view, width, height)
     }
 }
 
-impl TextureRenderer for VelloRenderer {
+impl TextureRenderer for VelloTargetRenderer {
     type Error = Error;
     type TextureTarget<'a> = TextureTarget<'a>;
 
@@ -360,6 +335,104 @@ impl TextureRenderer for VelloRenderer {
     ) -> Result<(), Self::Error> {
         let native = self.encode_source(source, target.width, target.height)?;
         self.render_to_texture_view(&native, target.view, target.width, target.height)
+    }
+}
+
+impl VelloRenderer {
+    /// Create an image renderer bound to an existing `wgpu` device and queue.
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, Error> {
+        Ok(Self {
+            target_renderer: VelloTargetRenderer::new(device, queue)?,
+            target: None,
+        })
+    }
+
+    /// Access the target renderer used by this image renderer.
+    pub fn target_renderer(&mut self) -> &mut VelloTargetRenderer {
+        &mut self.target_renderer
+    }
+
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`crate::vello::Scene`].
+    pub fn encode_scene(
+        &self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<vello::Scene, Error> {
+        self.target_renderer.encode_scene(scene, width, height)
+    }
+
+    fn ensure_target(&mut self, width: u16, height: u16) -> &OffscreenTarget {
+        let target = self.target.get_or_insert_with(|| {
+            OffscreenTarget::new(
+                &self.target_renderer.state.device,
+                u32::from(width),
+                u32::from(height),
+            )
+        });
+        target.resize(
+            &self.target_renderer.state.device,
+            u32::from(width),
+            u32::from(height),
+        );
+        target
+    }
+
+    /// Render a native [`crate::vello::Scene`] into an RGBA8 image (unpremultiplied).
+    pub fn render_into(
+        &mut self,
+        scene: &vello::Scene,
+        width: u16,
+        height: u16,
+        image: &mut RgbaImage,
+    ) -> Result<(), Error> {
+        let target = self.ensure_target(width, height);
+        let texture_view = target.texture_view().clone();
+        let target_texture = target.texture().clone();
+        let target_width = target.width();
+        let target_height = target.height();
+        self.target_renderer.render_to_texture_view(
+            scene,
+            &texture_view,
+            target_width,
+            target_height,
+        )?;
+        readback_into(
+            &self.target_renderer.state.device,
+            &self.target_renderer.state.queue,
+            &target_texture,
+            width,
+            height,
+            image,
+        )
+    }
+
+    /// Render a native [`crate::vello::Scene`] and return an RGBA8 image (unpremultiplied).
+    pub fn render(
+        &mut self,
+        scene: &vello::Scene,
+        width: u16,
+        height: u16,
+    ) -> Result<RgbaImage, Error> {
+        let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+        self.render_into(scene, width, height, &mut image)?;
+        Ok(image)
+    }
+}
+
+impl ImageRenderer for VelloRenderer {
+    type Error = Error;
+
+    fn render_source_into<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        width: u32,
+        height: u32,
+        image: &mut RgbaImage,
+    ) -> Result<(), Self::Error> {
+        let native = self.target_renderer.encode_source(source, width, height)?;
+        let (width, height) = VelloRendererState::checked_size(width, height)?;
+        self.render_into(&native, width, height, image)
     }
 }
 
@@ -472,7 +545,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloRenderer::new(device.clone(), queue).unwrap();
+        let mut renderer = VelloTargetRenderer::new(device.clone(), queue).unwrap();
 
         let mut scene = Scene::new();
         {
@@ -511,7 +584,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloRenderer::new(device.clone(), queue).unwrap();
+        let mut renderer = VelloTargetRenderer::new(device.clone(), queue).unwrap();
 
         let mut scene = Scene::new();
         {

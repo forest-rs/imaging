@@ -118,14 +118,15 @@
 //! # GPU Rendering
 //!
 //! Enable the `gpu` feature when you want Skia Ganesh rendering through app-owned `wgpu`
-//! handles. `SkiaGpuRenderer` reuses the current backend selected by `wgpu` and renders native
-//! [`skia_safe::Picture`] values into caller-owned `wgpu::Texture` targets.
+//! handles. [`SkiaGpuTargetRenderer`] reuses the current backend selected by `wgpu` and renders
+//! native [`skia_safe::Picture`] values into caller-owned `wgpu::Texture` targets. Use
+//! [`SkiaGpuRenderer`] when you want RGBA8 image output instead.
 //!
 //! ```no_run
 //! # #[cfg(feature = "gpu")]
 //! # {
 //! use imaging::{Painter, record};
-//! use imaging_skia::SkiaGpuRenderer;
+//! use imaging_skia::SkiaGpuTargetRenderer;
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //!
@@ -142,7 +143,7 @@
 //!     );
 //! }
 //!
-//! let mut renderer = SkiaGpuRenderer::new(adapter, device, queue)?;
+//! let mut renderer = SkiaGpuTargetRenderer::new(adapter, device, queue)?;
 //! let picture = renderer.encode_scene(&scene, 128, 128)?;
 //! renderer.render_picture_to_texture(&picture, &texture)?;
 //! # }
@@ -791,7 +792,8 @@ fn encode_source_to_picture<S: RenderSource + ?Sized>(
 }
 
 #[cfg(feature = "gpu")]
-/// Caller-owned texture target used with [`imaging::TextureRenderer`] on [`SkiaGpuRenderer`].
+/// Caller-owned texture target used with [`imaging::TextureRenderer`] on
+/// [`SkiaGpuTargetRenderer`].
 #[derive(Copy, Clone, Debug)]
 pub struct TextureTarget<'a> {
     texture: &'a wgpu::Texture,
@@ -807,22 +809,35 @@ impl<'a> TextureTarget<'a> {
 }
 
 #[cfg(feature = "gpu")]
-/// GPU Skia renderer that shares an app-owned `wgpu` device and queue.
-///
-/// This renderer uses Skia Ganesh for drawing and treats caller-owned `wgpu::Texture` values as
-/// the primary GPU target API. Hosts are expected to own surface acquisition and presentation.
 #[derive(Debug)]
-pub struct SkiaGpuRenderer {
+struct SkiaGpuRendererState {
     backend: GaneshBackend,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    scratch: ScratchTexture,
     tolerance: f64,
     caches: SkiaCaches,
 }
 
 #[cfg(feature = "gpu")]
-impl SkiaGpuRenderer {
+/// GPU Skia renderer that shares an app-owned `wgpu` device and queue and renders into
+/// caller-owned textures.
+#[derive(Debug)]
+pub struct SkiaGpuTargetRenderer {
+    state: SkiaGpuRendererState,
+}
+
+#[cfg(feature = "gpu")]
+/// Convenience GPU renderer that owns a lazy scratch texture for RGBA8 readback.
+///
+/// Use [`SkiaGpuTargetRenderer`] when the host application already owns the destination texture.
+#[derive(Debug)]
+pub struct SkiaGpuRenderer {
+    target_renderer: SkiaGpuTargetRenderer,
+    scratch: Option<ScratchTexture>,
+}
+
+#[cfg(feature = "gpu")]
+impl SkiaGpuRendererState {
     fn checked_texture_size(texture: &wgpu::Texture) -> Result<(u32, u32), Error> {
         if texture.dimension() != wgpu::TextureDimension::D2 {
             return Err(Error::Internal(
@@ -837,6 +852,46 @@ impl SkiaGpuRenderer {
         Ok((texture.width(), texture.height()))
     }
 
+    fn new(
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: SkiaConfig,
+    ) -> Result<Self, Error> {
+        config.cache_config.apply();
+        config
+            .caches
+            .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
+        config
+            .caches
+            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
+        let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
+        Ok(Self {
+            backend,
+            device,
+            queue,
+            tolerance: 0.1,
+            caches: config.caches,
+        })
+    }
+
+    fn render_picture_to_texture(
+        &mut self,
+        picture: &sk::Picture,
+        texture: &wgpu::Texture,
+    ) -> Result<(), Error> {
+        let _ = Self::checked_texture_size(texture)?;
+        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        let mut surface = self.backend.wrap_texture(texture)?;
+        surface.canvas().clear(sk::Color::TRANSPARENT);
+        surface.canvas().draw_picture(picture, None, None);
+        self.backend.flush_surface(&mut surface);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SkiaGpuTargetRenderer {
     /// Create a GPU renderer bound to an existing `wgpu` adapter, device, and queue.
     ///
     /// The adapter is used to select the active Ganesh interop backend at runtime. This matters
@@ -856,52 +911,32 @@ impl SkiaGpuRenderer {
         queue: wgpu::Queue,
         config: SkiaConfig,
     ) -> Result<Self, Error> {
-        config.cache_config.apply();
-        config
-            .caches
-            .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
-        config
-            .caches
-            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
-        let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
-        let scratch = ScratchTexture::new(
-            &device,
-            1,
-            1,
-            wgpu::TextureFormat::Rgba8Unorm,
-            "imaging_skia gpu scratch target",
-        );
         Ok(Self {
-            backend,
-            device,
-            queue,
-            scratch,
-            tolerance: 0.1,
-            caches: config.caches,
+            state: SkiaGpuRendererState::new(adapter, device, queue, config)?,
         })
     }
 
     /// Set the tolerance used when converting shapes to paths during scene encoding.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        if self.tolerance != tolerance {
-            self.caches.mask_cache().borrow_mut().clear();
+        if self.state.tolerance != tolerance {
+            self.state.caches.mask_cache().borrow_mut().clear();
         }
-        self.tolerance = tolerance;
+        self.state.tolerance = tolerance;
     }
 
     /// Drop any realized mask artifacts cached by the renderer.
     pub fn clear_cached_masks(&mut self) {
-        self.caches.mask_cache().borrow_mut().clear();
+        self.state.caches.mask_cache().borrow_mut().clear();
     }
 
     /// Drop any realized image resources cached by the renderer.
     pub fn clear_cached_images(&mut self) {
-        self.caches.image_cache().borrow_mut().clear();
+        self.state.caches.image_cache().borrow_mut().clear();
     }
 
     /// Drop all renderer-local caches, including shared font state.
     pub fn clear_caches(&mut self) {
-        self.caches.clear();
+        self.state.caches.clear();
     }
 
     /// Lower a semantic [`imaging::record::Scene`] into a native [`skia_safe::Picture`].
@@ -916,9 +951,9 @@ impl SkiaGpuRenderer {
             &mut source,
             width,
             height,
-            self.tolerance,
-            self.caches.image_cache(),
-            self.caches.font_cache(),
+            self.state.tolerance,
+            self.state.caches.image_cache(),
+            self.state.caches.font_cache(),
         )
     }
 
@@ -928,13 +963,106 @@ impl SkiaGpuRenderer {
         picture: &sk::Picture,
         texture: &wgpu::Texture,
     ) -> Result<(), Error> {
-        let _ = Self::checked_texture_size(texture)?;
-        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
-        let mut surface = self.backend.wrap_texture(texture)?;
-        surface.canvas().clear(sk::Color::TRANSPARENT);
-        surface.canvas().draw_picture(picture, None, None);
-        self.backend.flush_surface(&mut surface);
-        Ok(())
+        self.state.render_picture_to_texture(picture, texture)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl TextureRenderer for SkiaGpuTargetRenderer {
+    type Error = Error;
+    type TextureTarget<'a> = TextureTarget<'a>;
+
+    fn render_source_to_texture<'a, S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        let (width, height) = SkiaGpuRendererState::checked_texture_size(target.texture)?;
+        let picture = encode_source_to_picture(
+            source,
+            width,
+            height,
+            self.state.tolerance,
+            self.state.caches.image_cache(),
+            self.state.caches.font_cache(),
+        )?;
+        self.render_picture_to_texture(&picture, target.texture)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SkiaGpuRenderer {
+    /// Create a convenience GPU image renderer bound to an existing `wgpu` adapter, device, and queue.
+    pub fn new(
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Result<Self, Error> {
+        Self::new_with_config(adapter, device, queue, SkiaConfig::new())
+    }
+
+    /// Create a convenience GPU image renderer using the provided shared caches and cache budgets.
+    pub fn new_with_config(
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: SkiaConfig,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            target_renderer: SkiaGpuTargetRenderer::new_with_config(
+                adapter, device, queue, config,
+            )?,
+            scratch: None,
+        })
+    }
+
+    /// Access the target renderer used by this image renderer.
+    pub fn target_renderer(&mut self) -> &mut SkiaGpuTargetRenderer {
+        &mut self.target_renderer
+    }
+
+    /// Set the tolerance used when converting shapes to paths during scene encoding.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        self.target_renderer.set_tolerance(tolerance);
+    }
+
+    /// Drop any realized mask artifacts cached by the renderer.
+    pub fn clear_cached_masks(&mut self) {
+        self.target_renderer.clear_cached_masks();
+    }
+
+    /// Drop any realized image resources cached by the renderer.
+    pub fn clear_cached_images(&mut self) {
+        self.target_renderer.clear_cached_images();
+    }
+
+    /// Drop all renderer-local caches, including shared font state.
+    pub fn clear_caches(&mut self) {
+        self.target_renderer.clear_caches();
+    }
+
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`skia_safe::Picture`].
+    pub fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<sk::Picture, Error> {
+        self.target_renderer.encode_scene(scene, width, height)
+    }
+
+    fn scratch_texture(&mut self, width: u32, height: u32) -> wgpu::Texture {
+        let scratch = self.scratch.get_or_insert_with(|| {
+            ScratchTexture::new(
+                &self.target_renderer.state.device,
+                width,
+                height,
+                wgpu::TextureFormat::Rgba8Unorm,
+                "imaging_skia gpu scratch target",
+            )
+        });
+        scratch.resize(&self.target_renderer.state.device, width, height);
+        scratch.texture().clone()
     }
 
     /// Render a native [`skia_safe::Picture`] into an RGBA8 image (unpremultiplied).
@@ -945,16 +1073,22 @@ impl SkiaGpuRenderer {
         height: u32,
         image: &mut RgbaImage,
     ) -> Result<(), Error> {
-        self.scratch.resize(&self.device, width, height);
-        let scratch = self.scratch.texture().clone();
-        self.render_picture_to_texture(picture, &scratch)?;
-        read_texture_into(&self.device, &self.queue, &scratch, width, height, image).map_err(
-            |err| match err {
-                ReadbackError::DevicePoll => Error::Internal("wgpu device poll failed"),
-                ReadbackError::CallbackDropped => Error::Internal("wgpu readback callback dropped"),
-                ReadbackError::BufferMap => Error::Internal("wgpu readback buffer map failed"),
-            },
+        let scratch = self.scratch_texture(width, height);
+        self.target_renderer
+            .render_picture_to_texture(picture, &scratch)?;
+        read_texture_into(
+            &self.target_renderer.state.device,
+            &self.target_renderer.state.queue,
+            &scratch,
+            width,
+            height,
+            image,
         )
+        .map_err(|err| match err {
+            ReadbackError::DevicePoll => Error::Internal("wgpu device poll failed"),
+            ReadbackError::CallbackDropped => Error::Internal("wgpu readback callback dropped"),
+            ReadbackError::BufferMap => Error::Internal("wgpu readback buffer map failed"),
+        })
     }
 
     /// Render a native [`skia_safe::Picture`] and return an RGBA8 image (unpremultiplied).
@@ -985,34 +1119,11 @@ impl ImageRenderer for SkiaGpuRenderer {
             source,
             width,
             height,
-            self.tolerance,
-            self.caches.image_cache(),
-            self.caches.font_cache(),
+            self.target_renderer.state.tolerance,
+            self.target_renderer.state.caches.image_cache(),
+            self.target_renderer.state.caches.font_cache(),
         )?;
         self.render_picture_into(&picture, width, height, image)
-    }
-}
-
-#[cfg(feature = "gpu")]
-impl TextureRenderer for SkiaGpuRenderer {
-    type Error = Error;
-    type TextureTarget<'a> = TextureTarget<'a>;
-
-    fn render_source_to_texture<'a, S: RenderSource + ?Sized>(
-        &mut self,
-        source: &mut S,
-        target: Self::TextureTarget<'a>,
-    ) -> Result<(), Self::Error> {
-        let (width, height) = Self::checked_texture_size(target.texture)?;
-        let picture = encode_source_to_picture(
-            source,
-            width,
-            height,
-            self.tolerance,
-            self.caches.image_cache(),
-            self.caches.font_cache(),
-        )?;
-        self.render_picture_to_texture(&picture, target.texture)
     }
 }
 
@@ -1952,6 +2063,17 @@ mod tests {
     }
 
     #[cfg(feature = "gpu")]
+    fn try_init_gpu_target_renderer() -> Option<(SkiaGpuTargetRenderer, wgpu::Device)> {
+        let instance = wgpu::Instance::default();
+        let adapter =
+            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let desc = wgpu::DeviceDescriptor::default();
+        let (device, queue) = block_on(adapter.request_device(&desc)).ok()?;
+        let renderer = SkiaGpuTargetRenderer::new(adapter, device.clone(), queue).ok()?;
+        Some((renderer, device))
+    }
+
+    #[cfg(feature = "gpu")]
     #[test]
     fn gpu_renderer_renders_picture_to_image() {
         let Some(mut renderer) = try_init_gpu_renderer() else {
@@ -1978,11 +2100,9 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_renderer_renders_source_to_texture() {
-        let Some(mut renderer) = try_init_gpu_renderer() else {
+        let Some((mut renderer, device)) = try_init_gpu_target_renderer() else {
             return;
         };
-
-        let device = renderer.device.clone();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("imaging_skia gpu target"),
             size: wgpu::Extent3d {
