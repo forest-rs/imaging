@@ -25,6 +25,9 @@ mod tests {
 
         let mut bad = Scene::new();
         bad.pop_clip();
-        assert_eq!(bad.validate(), Err(ValidateError::UnbalancedPopClip));
+        assert_eq!(
+            bad.validate(),
+            Err(ValidateError::UnbalancedPopClip { contexts: vec![] })
+        );
     }
 }

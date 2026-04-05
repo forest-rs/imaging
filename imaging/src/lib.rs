@@ -10,6 +10,10 @@
 //! The root of the crate is intentionally focused on the streaming surface and the shared drawing
 //! vocabulary. Retained scene data and low-level recording payloads live under [`record`].
 //!
+//! Optional scoped context annotations can be attached during painting with
+//! [`Painter::with_context`] or the [`with_context!`] macro. Recorded scenes intern context labels
+//! and file names only when contexts are actually emitted.
+//!
 //! # Painting
 //!
 //! Use [`Painter`] when you want to stream commands directly into a renderer, backend-native
@@ -115,11 +119,59 @@ pub mod render;
 pub mod validation;
 
 pub use paint::{
-    AppliedMaskRef, ClipRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskRef,
-    PaintSink, StrokeRef,
+    AppliedMaskRef, ClipRef, ContextRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef,
+    MaskRef, PaintSink, SourceLocationRef, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
 pub use render::{ImageRenderer, RenderSource, TextureRenderer};
+
+/// Run a painter closure inside a labeled context scope using the call-site source location.
+///
+/// This is shorthand for:
+///
+/// ```rust
+/// # use imaging::{Painter, SourceLocationRef, record};
+/// # let mut scene = record::Scene::new();
+/// # let mut painter = Painter::new(&mut scene);
+/// painter.with_context(
+///     "toolbar/button",
+///     Some(SourceLocationRef::new(file!(), line!(), column!())),
+///     |p| {
+///         let _ = p;
+///     },
+/// );
+/// ```
+///
+/// The macro has two forms:
+///
+/// ```rust
+/// # use imaging::{record, Painter};
+/// # let mut scene = record::Scene::new();
+/// # let mut painter = Painter::new(&mut scene);
+/// imaging::with_context!(painter, "toolbar/button", |p| {
+///     let _ = p;
+/// });
+///
+/// imaging::with_context!(
+///     painter,
+///     "toolbar/button",
+///     Some(imaging::SourceLocationRef::new("widgets.rs", 7, 3)),
+///     |p| {
+///         let _ = p;
+///     }
+/// );
+/// ```
+#[macro_export]
+macro_rules! with_context {
+    ($painter:expr, $label:expr, |$p:ident| $body:block) => {{
+        $painter.with_context(
+            $label,
+            Some($crate::SourceLocationRef::new(file!(), line!(), column!())),
+            |$p| $body,
+        )
+    }};
+    ($painter:expr, $label:expr, $source:expr, |$p:ident| $body:block) => {{ $painter.with_context($label, $source, |$p| $body) }};
+}
 
 /// Owned unpremultiplied RGBA8 image data returned by renderers.
 ///
