@@ -118,7 +118,7 @@
 //! # GPU Rendering
 //!
 //! Enable the `gpu` feature when you want Skia Ganesh rendering through app-owned `wgpu`
-//! handles. [`SkiaGpuRenderer`] reuses the current backend selected by `wgpu` and renders native
+//! handles. `SkiaGpuRenderer` reuses the current backend selected by `wgpu` and renders native
 //! [`skia_safe::Picture`] values into caller-owned `wgpu::Texture` targets.
 //!
 //! ```no_run
@@ -266,13 +266,17 @@ impl SkiaFontCache {
 #[derive(Clone, Debug, Default)]
 pub struct SkiaCaches {
     font_cache: SkiaFontCache,
+    mask_cache: Rc<RefCell<MaskCache>>,
 }
 
 impl SkiaCaches {
     /// Create a cache bundle with fresh default caches.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            font_cache: SkiaFontCache::new(),
+            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
+        }
     }
 
     /// Replace the shared font cache in this bundle.
@@ -285,6 +289,132 @@ impl SkiaCaches {
     fn font_cache(&self) -> SkiaFontCache {
         self.font_cache.clone()
     }
+
+    fn mask_cache(&self) -> Rc<RefCell<MaskCache>> {
+        Rc::clone(&self.mask_cache)
+    }
+
+    fn set_mask_cache_total_bytes_limit(&self, limit: usize) {
+        self.mask_cache.borrow_mut().set_max_bytes(limit);
+    }
+}
+
+/// Configurable cache and resource budgets for Skia-backed rendering.
+///
+/// These limits are applied through Skia's process-global `graphics` cache settings when a
+/// renderer is constructed from [`SkiaConfig`]. If multiple renderers apply different cache
+/// configs, the most recently constructed renderer wins for Skia's global resource limits.
+#[derive(Clone, Copy, Debug)]
+pub struct SkiaCacheConfig {
+    /// Maximum number of entries Skia keeps in its global font cache.
+    pub font_cache_count_limit: i32,
+    /// Maximum number of cached typefaces Skia keeps globally.
+    pub typeface_cache_count_limit: i32,
+    /// Maximum number of bytes Skia keeps in its global resource cache.
+    pub resource_cache_total_bytes_limit: usize,
+    /// Maximum size of a single entry in Skia's global resource cache.
+    pub resource_cache_single_allocation_byte_limit: Option<usize>,
+    /// Maximum number of bytes retained by the renderer-local realized mask cache.
+    pub mask_cache_total_bytes_limit: usize,
+}
+
+impl Default for SkiaCacheConfig {
+    fn default() -> Self {
+        Self {
+            font_cache_count_limit: 100,
+            typeface_cache_count_limit: 100,
+            resource_cache_total_bytes_limit: 10 * 1024 * 1024,
+            resource_cache_single_allocation_byte_limit: None,
+            mask_cache_total_bytes_limit: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl SkiaCacheConfig {
+    /// Create cache budgets with the default limits.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the Skia global font-cache entry limit.
+    #[must_use]
+    pub fn with_font_cache_count_limit(mut self, limit: i32) -> Self {
+        self.font_cache_count_limit = limit;
+        self
+    }
+
+    /// Override the Skia global typeface-cache entry limit.
+    #[must_use]
+    pub fn with_typeface_cache_count_limit(mut self, limit: i32) -> Self {
+        self.typeface_cache_count_limit = limit;
+        self
+    }
+
+    /// Override the Skia global resource-cache byte limit.
+    #[must_use]
+    pub fn with_resource_cache_total_bytes_limit(mut self, limit: usize) -> Self {
+        self.resource_cache_total_bytes_limit = limit;
+        self
+    }
+
+    /// Override the Skia global single-allocation resource-cache byte limit.
+    #[must_use]
+    pub fn with_resource_cache_single_allocation_byte_limit(
+        mut self,
+        limit: Option<usize>,
+    ) -> Self {
+        self.resource_cache_single_allocation_byte_limit = limit;
+        self
+    }
+
+    /// Override the renderer-local realized-mask cache byte limit.
+    #[must_use]
+    pub fn with_mask_cache_total_bytes_limit(mut self, limit: usize) -> Self {
+        self.mask_cache_total_bytes_limit = limit;
+        self
+    }
+
+    fn apply(self) {
+        sk::graphics::set_font_cache_count_limit(self.font_cache_count_limit);
+        sk::graphics::set_typeface_cache_count_limit(self.typeface_cache_count_limit);
+        sk::graphics::set_resource_cache_total_bytes_limit(self.resource_cache_total_bytes_limit);
+        sk::graphics::set_resource_cache_single_allocation_byte_limit(
+            self.resource_cache_single_allocation_byte_limit,
+        );
+    }
+}
+
+/// Shared renderer configuration for Skia backends.
+///
+/// This groups shareable renderer state and cache budgets so construction stays stable as Skia
+/// grows more configurable over time.
+#[derive(Clone, Debug, Default)]
+pub struct SkiaConfig {
+    caches: SkiaCaches,
+    cache_config: SkiaCacheConfig,
+}
+
+impl SkiaConfig {
+    /// Create renderer configuration with fresh default caches and cache budgets.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the shared caches in this config.
+    #[must_use]
+    pub fn with_caches(mut self, caches: SkiaCaches) -> Self {
+        self.caches = caches;
+        self
+    }
+
+    /// Replace the cache budgets in this config.
+    #[must_use]
+    pub fn with_cache_config(mut self, cache_config: SkiaCacheConfig) -> Self {
+        self.cache_config = cache_config;
+        self
+    }
 }
 
 /// Renderer that executes `imaging` commands using a Skia raster surface.
@@ -294,7 +424,6 @@ pub struct SkiaRenderer {
     width: i32,
     height: i32,
     tolerance: f64,
-    mask_cache: Rc<RefCell<MaskCache>>,
     caches: SkiaCaches,
 }
 
@@ -328,37 +457,40 @@ impl SkiaRenderer {
 
     /// Create a renderer.
     pub fn new() -> Self {
-        Self::new_with_caches(SkiaCaches::new())
+        Self::new_with_config(SkiaConfig::new())
     }
 
-    /// Create a renderer that shares the provided caches with other Skia renderers.
-    pub fn new_with_caches(caches: SkiaCaches) -> Self {
+    /// Create a renderer using the provided shared caches and cache budgets.
+    pub fn new_with_config(config: SkiaConfig) -> Self {
+        config.cache_config.apply();
+        config
+            .caches
+            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let surface = Self::create_surface(1, 1);
         Self {
             surface,
             width: 1,
             height: 1,
             tolerance: 0.1,
-            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
-            caches,
+            caches: config.caches,
         }
     }
 
     /// Set the tolerance used when converting shapes to paths.
     pub fn set_tolerance(&mut self, tolerance: f64) {
         if self.tolerance != tolerance {
-            self.mask_cache.borrow_mut().clear();
+            self.caches.mask_cache().borrow_mut().clear();
         }
         self.tolerance = tolerance;
     }
 
     /// Drop any realized mask artifacts cached by the renderer.
     ///
-    /// The cache is renderer-scoped so unchanged masked subscenes can be reused across renders.
-    /// Call this if you need to release memory aggressively or after changing assumptions that
-    /// affect mask realization outside the recorded scene itself.
+    /// The cache is shared through [`SkiaCaches`], so unchanged masked subscenes can be reused
+    /// across compatible renderers. Call this if you need to release memory aggressively or after
+    /// changing assumptions that affect mask realization outside the recorded scene itself.
     pub fn clear_cached_masks(&mut self) {
-        self.mask_cache.borrow_mut().clear();
+        self.caches.mask_cache().borrow_mut().clear();
     }
 
     fn resize(&mut self, width: i32, height: i32) {
@@ -392,7 +524,7 @@ impl SkiaRenderer {
         self.reset();
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
-            Rc::clone(&self.mask_cache),
+            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -481,7 +613,7 @@ impl ImageRenderer for SkiaRenderer {
         self.reset();
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
-            Rc::clone(&self.mask_cache),
+            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -535,7 +667,6 @@ pub struct SkiaGpuRenderer {
     queue: wgpu::Queue,
     scratch: ScratchTexture,
     tolerance: f64,
-    mask_cache: Rc<RefCell<MaskCache>>,
     caches: SkiaCaches,
 }
 
@@ -564,16 +695,20 @@ impl SkiaGpuRenderer {
         device: wgpu::Device,
         queue: wgpu::Queue,
     ) -> Result<Self, Error> {
-        Self::new_with_caches(adapter, device, queue, SkiaCaches::new())
+        Self::new_with_config(adapter, device, queue, SkiaConfig::new())
     }
 
-    /// Create a GPU renderer that shares the provided caches with other Skia renderers.
-    pub fn new_with_caches(
+    /// Create a GPU renderer using the provided shared caches and cache budgets.
+    pub fn new_with_config(
         adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
-        caches: SkiaCaches,
+        config: SkiaConfig,
     ) -> Result<Self, Error> {
+        config.cache_config.apply();
+        config
+            .caches
+            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
         let scratch = ScratchTexture::new(
             &device,
@@ -588,22 +723,21 @@ impl SkiaGpuRenderer {
             queue,
             scratch,
             tolerance: 0.1,
-            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
-            caches,
+            caches: config.caches,
         })
     }
 
     /// Set the tolerance used when converting shapes to paths during scene encoding.
     pub fn set_tolerance(&mut self, tolerance: f64) {
         if self.tolerance != tolerance {
-            self.mask_cache.borrow_mut().clear();
+            self.caches.mask_cache().borrow_mut().clear();
         }
         self.tolerance = tolerance;
     }
 
     /// Drop any realized mask artifacts cached by the renderer.
     pub fn clear_cached_masks(&mut self) {
-        self.mask_cache.borrow_mut().clear();
+        self.caches.mask_cache().borrow_mut().clear();
     }
 
     /// Lower a semantic [`imaging::record::Scene`] into a native [`skia_safe::Picture`].
@@ -1431,10 +1565,10 @@ mod tests {
         let mut renderer = SkiaRenderer::new();
 
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
 
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
     }
 
     #[test]
@@ -1443,13 +1577,13 @@ mod tests {
         let mut renderer = SkiaRenderer::new();
 
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
 
         renderer.clear_cached_masks();
-        assert_eq!(renderer.mask_cache.borrow().len(), 0);
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
 
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
     }
 
     #[test]
@@ -1458,10 +1592,21 @@ mod tests {
         let mut renderer = SkiaRenderer::new();
 
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
 
         renderer.set_tolerance(0.25);
-        assert_eq!(renderer.mask_cache.borrow().len(), 0);
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
+    }
+
+    #[test]
+    fn config_can_disable_realized_mask_retention() {
+        let scene = masked_scene(MaskMode::Alpha);
+        let config = SkiaConfig::new()
+            .with_cache_config(SkiaCacheConfig::new().with_mask_cache_total_bytes_limit(0));
+        let mut renderer = SkiaRenderer::new_with_config(config);
+
+        renderer.render_scene(&scene, 64, 64).unwrap();
+        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
     }
 
     #[test]
@@ -1524,12 +1669,13 @@ mod tests {
         }
 
         let caches = SkiaCaches::new().with_font_cache(SkiaFontCache::new());
-        let mut renderer = SkiaRenderer::new_with_caches(caches.clone());
+        let config = SkiaConfig::new().with_caches(caches.clone());
+        let mut renderer = SkiaRenderer::new_with_config(config.clone());
         renderer.render_scene(&scene, 48, 48).unwrap();
         let counts = caches.font_cache().counts();
         assert_eq!(counts, (1, 1, 1));
 
-        let mut second_renderer = SkiaRenderer::new_with_caches(caches.clone());
+        let mut second_renderer = SkiaRenderer::new_with_config(config);
         second_renderer.render_scene(&scene, 48, 48).unwrap();
         assert_eq!(caches.font_cache().counts(), counts);
     }
