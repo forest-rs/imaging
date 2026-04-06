@@ -27,6 +27,7 @@ wgpu = { optional = true, version = "28.0.0" }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 foreign-types-shared = { version = "0.3", optional = true }
+oaty = "0.1"
 skia-safe = { version = "0.90.0", features = ["metal"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -118,9 +118,9 @@
 //! # GPU Rendering
 //!
 //! Enable the `gpu` feature when you want Skia Ganesh rendering through app-owned `wgpu`
-//! handles. [`SkiaGpuTargetRenderer`] reuses the current backend selected by `wgpu` and renders
+//! handles. `SkiaGpuTargetRenderer` reuses the current backend selected by `wgpu` and renders
 //! native [`skia_safe::Picture`] values into caller-owned `wgpu::Texture` targets. Use
-//! [`SkiaGpuRenderer`] when you want RGBA8 image output instead.
+//! `SkiaGpuRenderer` when you want RGBA8 image output instead.
 //!
 //! ```no_run
 //! # #[cfg(feature = "gpu")]
@@ -1247,6 +1247,8 @@ struct FontKey {
 #[derive(Debug)]
 struct FontCache {
     font_mgr: sk::FontMgr,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    extracted_font_data: HashMap<BaseTypefaceKey, peniko::FontData>,
     base_typefaces: HashMap<BaseTypefaceKey, sk::Typeface>,
     typefaces: HashMap<TypefaceKey, sk::Typeface>,
     fonts: HashMap<FontKey, sk::Font>,
@@ -1256,6 +1258,8 @@ impl FontCache {
     fn new() -> Self {
         Self {
             font_mgr: sk::FontMgr::default(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            extracted_font_data: HashMap::new(),
             base_typefaces: HashMap::new(),
             typefaces: HashMap::new(),
             fonts: HashMap::new(),
@@ -1263,6 +1267,8 @@ impl FontCache {
     }
 
     fn clear(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        self.extracted_font_data.clear();
         self.base_typefaces.clear();
         self.typefaces.clear();
         self.fonts.clear();
@@ -1355,9 +1361,10 @@ impl FontCache {
             return Some(typeface.clone());
         }
 
-        let typeface = self
-            .font_mgr
-            .new_from_data(font.data.as_ref(), font.index as usize)?;
+        let extracted_font = extracted_font_data(self, key, font)?;
+        let font_bytes = extracted_font.data.as_ref();
+        let font_index = extracted_font.index as usize;
+        let typeface = self.font_mgr.new_from_data(font_bytes, font_index)?;
         self.base_typefaces.insert(key.clone(), typeface.clone());
         Some(typeface)
     }
@@ -1370,6 +1377,43 @@ impl FontCache {
             self.fonts.len(),
         )
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn extracted_font_data(
+    cache: &mut FontCache,
+    key: &BaseTypefaceKey,
+    font: &peniko::FontData,
+) -> Option<peniko::FontData> {
+    use peniko::Blob;
+    use std::sync::Arc;
+
+    if let Some(collection) = oaty::Collection::new(font.data.data()) {
+        cache
+            .extracted_font_data
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let data = collection
+                    .get_font(font.index)
+                    .and_then(|font| font.copy_data())
+                    .unwrap_or_default();
+                peniko::FontData::new(Blob::new(Arc::new(data)), 0)
+            });
+        if let Some(extracted) = cache.extracted_font_data.get(key) {
+            return Some(extracted.clone());
+        }
+    }
+
+    Some(font.clone())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn extracted_font_data(
+    _: &mut FontCache,
+    _: &BaseTypefaceKey,
+    font: &peniko::FontData,
+) -> Option<peniko::FontData> {
+    Some(font.clone())
 }
 
 fn skia_font_from_glyph_run(
