@@ -258,7 +258,15 @@ where
     /// do not. Pair with [`Self::pop_context`] or prefer [`Self::with_context`] /
     /// [`crate::with_context!`] when the annotated work fits naturally in a closure.
     pub fn push_context(&mut self, label: &str, source: Option<SourceLocationRef<'_>>) {
-        self.sink.push_context(ContextRef::new(label, source));
+        self.push_context_ref(ContextRef::label(label, source));
+    }
+
+    /// Push a structured context annotation onto the context stack.
+    ///
+    /// Use this when the scope is naturally identified by structured data like widget IDs,
+    /// indices, or named slots and you want to avoid formatting those into strings eagerly.
+    pub fn push_context_ref(&mut self, context: ContextRef<'_>) {
+        self.sink.push_context(context);
     }
 
     /// Pop the most recently pushed context annotation.
@@ -276,7 +284,16 @@ where
         source: Option<SourceLocationRef<'_>>,
         f: impl FnOnce(&mut Painter<'_, S>),
     ) {
-        self.push_context(label, source);
+        self.with_context_ref(ContextRef::label(label, source), f);
+    }
+
+    /// Push a structured context annotation, run the provided closure, then pop the context.
+    pub fn with_context_ref(
+        &mut self,
+        context: ContextRef<'_>,
+        f: impl FnOnce(&mut Painter<'_, S>),
+    ) {
+        self.push_context_ref(context);
         f(self);
         self.pop_context();
     }
@@ -732,11 +749,57 @@ mod tests {
             ]
         );
         let context = scene.context(record::ContextId(0));
-        assert_eq!(scene.label(context.label), "toolbar/button");
+        assert_eq!(context.kind, record::ContextKind::Label);
+        assert_eq!(context.value, record::ContextValue::Str(record::LabelId(0)));
+        assert_eq!(scene.label(record::LabelId(0)), "toolbar/button");
         let source = context.source.as_ref().expect("expected source location");
         assert_eq!(scene.file(source.file), "widgets.rs");
         assert_eq!(source.line, 7);
         assert_eq!(source.column, 3);
+    }
+
+    #[test]
+    fn with_context_ref_records_structured_contexts_without_formatting() {
+        let mut scene = record::Scene::new();
+        let mut painter = Painter::new(&mut scene);
+
+        painter.with_context_ref(
+            ContextRef::widget(42, Some(SourceLocationRef::new("widgets.rs", 9, 5))),
+            |p| {
+                p.with_context_ref(ContextRef::named_usize("row", 3, None), |p| {
+                    p.fill(Rect::new(0.0, 0.0, 5.0, 6.0), peniko::Color::BLACK)
+                        .draw();
+                });
+            },
+        );
+
+        assert_eq!(
+            scene.commands(),
+            &[
+                record::Command::PushContext(record::ContextId(0)),
+                record::Command::PushContext(record::ContextId(1)),
+                record::Command::Draw(record::DrawId(0)),
+                record::Command::PopContext,
+                record::Command::PopContext,
+            ]
+        );
+        assert_eq!(
+            scene.context(record::ContextId(0)).kind,
+            record::ContextKind::Widget
+        );
+        assert_eq!(
+            scene.context(record::ContextId(0)).value,
+            record::ContextValue::U64(42)
+        );
+        assert_eq!(
+            scene.context(record::ContextId(1)).kind,
+            record::ContextKind::Named(record::LabelId(0))
+        );
+        assert_eq!(
+            scene.context(record::ContextId(1)).value,
+            record::ContextValue::Usize(3)
+        );
+        assert_eq!(scene.label(record::LabelId(0)), "row");
     }
 
     #[test]

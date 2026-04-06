@@ -343,7 +343,7 @@ impl Scene {
 
 fn context_note(context: ContextRef<'_>) -> ContextNote {
     ContextNote {
-        label: context.label.into(),
+        label: context.format(),
         source: context.source.map(resolved_source_location),
     }
 }
@@ -552,8 +552,14 @@ mod tests {
         scene.pop_context();
         scene.pop_context();
 
-        assert_eq!(scene.context(ContextId(0)).label.0, 0);
-        assert_eq!(scene.context(ContextId(1)).label.0, 1);
+        assert_eq!(
+            scene.context(ContextId(0)).value,
+            crate::record::ContextValue::Str(crate::record::LabelId(0))
+        );
+        assert_eq!(
+            scene.context(ContextId(1)).value,
+            crate::record::ContextValue::Str(crate::record::LabelId(1))
+        );
     }
 
     #[test]
@@ -646,6 +652,38 @@ mod tests {
             d.contexts
                 == vec![ContextNote {
                     label: "scoped".into(),
+                    source: None,
+                }]
+        }));
+    }
+
+    #[test]
+    fn diagnose_formats_structured_context_values_lazily() {
+        let mut scene = Scene::new();
+        scene.push_context_ref(ContextRef::widget(42, None));
+        scene.push_context_ref(ContextRef::named_usize("row", 3, None));
+        scene.pop_context();
+        scene.pop_context();
+
+        let diagnostics = scene.diagnose();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.contexts
+                == vec![
+                    ContextNote {
+                        label: "widget=42".into(),
+                        source: None,
+                    },
+                    ContextNote {
+                        label: "row=3".into(),
+                        source: None,
+                    },
+                ]
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.contexts
+                == vec![ContextNote {
+                    label: "widget=42".into(),
                     source: None,
                 }]
         }));

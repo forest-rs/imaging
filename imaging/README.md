@@ -31,8 +31,10 @@ The root of the crate is intentionally focused on the streaming surface and the 
 vocabulary. Retained scene data and low-level recording payloads live under [`record`].
 
 Optional scoped context annotations can be attached during painting with
-[`Painter::with_context`] or the [`with_context!`] macro. Recorded scenes intern context labels
-and file names only when contexts are actually emitted.
+[`Painter::with_context`], [`Painter::with_context_ref`], or the [`with_context!`] macro.
+Recorded scenes intern context strings and file names only when contexts are actually emitted,
+so structured context values like widget IDs or child indices do not require eager string
+formatting on the hot path.
 
 # Painting
 
@@ -129,6 +131,7 @@ The API is intentionally small and experimental; expect breaking changes while w
 [`PaintSink`]: https://docs.rs/imaging/latest/imaging/trait.PaintSink.html
 [`Painter`]: https://docs.rs/imaging/latest/imaging/struct.Painter.html
 [`Painter::with_context`]: https://docs.rs/imaging/latest/imaging/struct.Painter.html#method.with_context
+[`Painter::with_context_ref`]: https://docs.rs/imaging/latest/imaging/struct.Painter.html#method.with_context_ref
 [`record`]: https://docs.rs/imaging/latest/imaging/record/
 [`record::Clip`]: https://docs.rs/imaging/latest/imaging/record/enum.Clip.html
 [`record::Draw`]: https://docs.rs/imaging/latest/imaging/record/enum.Draw.html

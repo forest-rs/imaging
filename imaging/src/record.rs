@@ -12,8 +12,8 @@ use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
 use peniko::{Brush, Fill, FontData, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef, MaskMode,
-    NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, ContextKindRef, ContextRef, ContextValueRef, FillRef,
+    GlyphRunRef, GroupRef, MaskMode, NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef,
 };
 
 /// A geometry payload stored in a recording.
@@ -90,7 +90,7 @@ pub struct MaskId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DrawId(pub(crate) u32);
 
-/// Identifier for an interned context label stored in a [`Scene`].
+/// Identifier for an interned context string stored in a [`Scene`].
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LabelId(pub(crate) u32);
@@ -116,11 +116,43 @@ pub struct SourceLocation {
     pub column: u32,
 }
 
+/// Semantic kind for a context annotation stored in a [`Scene`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextKind {
+    /// Human-oriented freeform label.
+    Label,
+    /// Numeric widget identifier.
+    Widget,
+    /// Child index within a parent/container.
+    ChildIndex,
+    /// Named slot.
+    Slot,
+    /// User-defined named context kind.
+    Named(LabelId),
+}
+
+/// Structured value for a context annotation stored in a [`Scene`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextValue {
+    /// String payload.
+    Str(LabelId),
+    /// Unsigned 64-bit payload.
+    U64(u64),
+    /// Signed 64-bit payload.
+    I64(i64),
+    /// Machine-word-sized unsigned payload.
+    Usize(usize),
+    /// Boolean payload.
+    Bool(bool),
+}
+
 /// A context annotation stored in a [`Scene`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
-    /// Human-readable label.
-    pub label: LabelId,
+    /// Semantic kind of this context entry.
+    pub kind: ContextKind,
+    /// Structured value of this context entry.
+    pub value: ContextValue,
     /// Optional source location associated with the context.
     pub source: Option<SourceLocation>,
 }
@@ -130,12 +162,39 @@ impl Context {
     #[must_use]
     pub fn as_ref<'a>(&'a self, scene: &'a Scene) -> ContextRef<'a> {
         ContextRef {
-            label: scene.label(self.label),
+            kind: self.kind.as_ref(scene),
+            value: self.value.as_ref(scene),
             source: self.source.as_ref().map(|source| SourceLocationRef {
                 file: scene.file(source.file),
                 line: source.line,
                 column: source.column,
             }),
+        }
+    }
+}
+
+impl ContextKind {
+    #[must_use]
+    fn as_ref<'a>(&'a self, scene: &'a Scene) -> ContextKindRef<'a> {
+        match self {
+            Self::Label => ContextKindRef::Label,
+            Self::Widget => ContextKindRef::Widget,
+            Self::ChildIndex => ContextKindRef::ChildIndex,
+            Self::Slot => ContextKindRef::Slot,
+            Self::Named(name) => ContextKindRef::Named(scene.label(*name)),
+        }
+    }
+}
+
+impl ContextValue {
+    #[must_use]
+    fn as_ref<'a>(&'a self, scene: &'a Scene) -> ContextValueRef<'a> {
+        match self {
+            Self::Str(value) => ContextValueRef::Str(scene.label(*value)),
+            Self::U64(value) => ContextValueRef::U64(*value),
+            Self::I64(value) => ContextValueRef::I64(*value),
+            Self::Usize(value) => ContextValueRef::Usize(*value),
+            Self::Bool(value) => ContextValueRef::Bool(*value),
         }
     }
 }
@@ -456,7 +515,7 @@ impl Scene {
         &self.contexts[id.0 as usize]
     }
 
-    /// Resolve an interned label string by ID.
+    /// Resolve an interned context string by ID.
     #[inline]
     pub fn label(&self, id: LabelId) -> &str {
         &self.labels[id.0 as usize]
@@ -509,15 +568,38 @@ impl Scene {
         label: &str,
         source: Option<SourceLocationRef<'_>>,
     ) -> ContextId {
-        let label = self.define_label(label);
-        let source = source.map(|source| SourceLocation {
+        self.push_context_ref(ContextRef::label(label, source))
+    }
+
+    /// Push a structured context annotation.
+    #[inline]
+    pub fn push_context_ref(&mut self, context: ContextRef<'_>) -> ContextId {
+        let kind = match context.kind {
+            ContextKindRef::Label => ContextKind::Label,
+            ContextKindRef::Widget => ContextKind::Widget,
+            ContextKindRef::ChildIndex => ContextKind::ChildIndex,
+            ContextKindRef::Slot => ContextKind::Slot,
+            ContextKindRef::Named(name) => ContextKind::Named(self.define_label(name)),
+        };
+        let value = match context.value {
+            ContextValueRef::Str(value) => ContextValue::Str(self.define_label(value)),
+            ContextValueRef::U64(value) => ContextValue::U64(value),
+            ContextValueRef::I64(value) => ContextValue::I64(value),
+            ContextValueRef::Usize(value) => ContextValue::Usize(value),
+            ContextValueRef::Bool(value) => ContextValue::Bool(value),
+        };
+        let source = context.source.map(|source| SourceLocation {
             file: self.define_file(source.file),
             line: source.line,
             column: source.column,
         });
         let idx = u32::try_from(self.contexts.len()).expect("scene context table overflow");
         let id = ContextId(idx);
-        self.contexts.push(Context { label, source });
+        self.contexts.push(Context {
+            kind,
+            value,
+            source,
+        });
         self.commands.push(Command::PushContext(id));
         id
     }
@@ -598,7 +680,7 @@ impl Scene {
             .map(|id| {
                 let context = self.context(*id);
                 ContextNote {
-                    label: self.label(context.label).into(),
+                    label: context.as_ref(self).format(),
                     source: context
                         .source
                         .as_ref()
@@ -690,7 +772,7 @@ impl Scene {
 impl PaintSink for Scene {
     #[inline]
     fn push_context(&mut self, context: ContextRef<'_>) {
-        let _ = Self::push_context(self, context.label, context.source);
+        let _ = Self::push_context_ref(self, context);
     }
 
     #[inline]
@@ -1002,10 +1084,12 @@ mod tests {
                 Command::PopContext,
             ]
         );
+        assert_eq!(dest.context(ContextId(0)).kind, ContextKind::Label);
         assert_eq!(
-            dest.label(dest.context(ContextId(0)).label),
-            "toolbar/button"
+            dest.context(ContextId(0)).value,
+            ContextValue::Str(LabelId(0))
         );
+        assert_eq!(dest.label(LabelId(0)), "toolbar/button");
         let source = dest
             .context(ContextId(0))
             .source

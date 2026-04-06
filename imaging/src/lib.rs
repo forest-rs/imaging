@@ -11,8 +11,10 @@
 //! vocabulary. Retained scene data and low-level recording payloads live under [`record`].
 //!
 //! Optional scoped context annotations can be attached during painting with
-//! [`Painter::with_context`] or the [`with_context!`] macro. Recorded scenes intern context labels
-//! and file names only when contexts are actually emitted.
+//! [`Painter::with_context`], [`Painter::with_context_ref`], or the [`with_context!`] macro.
+//! Recorded scenes intern context strings and file names only when contexts are actually emitted,
+//! so structured context values like widget IDs or child indices do not require eager string
+//! formatting on the hot path.
 //!
 //! # Painting
 //!
@@ -121,8 +123,8 @@ pub mod render;
 pub mod validation;
 
 pub use paint::{
-    AppliedMaskRef, ClipRef, ContextRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef,
-    MaskRef, PaintSink, SourceLocationRef, StrokeRef,
+    AppliedMaskRef, ClipRef, ContextKindRef, ContextRef, ContextValueRef, DrawRef, FillRef,
+    GeometryRef, GlyphRunRef, GroupRef, MaskRef, PaintSink, SourceLocationRef, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
 pub use render::{
