@@ -1,28 +1,43 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Advisory diagnostics for retained `imaging` scenes.
+//! Advisory diagnostics for `imaging` command streams and retained scenes.
 //!
 //! Unlike [`crate::record::Scene::validate`], diagnostics report suspicious or wasteful patterns
 //! that are still structurally valid.
+//!
+//! Use [`DiagnosingSink`] when you want stream-local findings while painting into another sink.
+//! [`crate::record::Scene::diagnose`] is the retained convenience entry point; it replays the
+//! scene into a `DiagnosingSink` and may add retained-only findings in the future.
 
 use alloc::vec::Vec;
 
-use peniko::Brush;
+use peniko::BrushRef;
 
 use crate::{
-    Composite,
-    record::{Clip, Command, ContextNote, Draw, DrawId, Geometry, Scene},
+    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef, PaintSink,
+    SourceLocationRef, StrokeRef,
+    record::{ContextNote, ResolvedSourceLocation, Scene},
 };
 
-/// Severity of a retained-scene diagnostic.
+/// Scope of a diagnostic kind.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DiagnosticScope {
+    /// The finding can be produced while streaming commands through a [`PaintSink`].
+    StreamLocal,
+    /// The finding requires retained-scene inspection and only appears through
+    /// [`crate::record::Scene::diagnose`].
+    RetainedScene,
+}
+
+/// Severity of a diagnostic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DiagnosticLevel {
     /// Suspicious or wasteful content that is still structurally valid.
     Warning,
 }
 
-/// Kind of retained-scene diagnostic reported by [`Scene::diagnose`].
+/// Kind of diagnostic reported by [`DiagnosingSink`] or [`Scene::diagnose`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DiagnosticKind {
     /// A context scope contains no draw commands.
@@ -45,7 +60,26 @@ pub enum DiagnosticKind {
     ZeroBlurredRoundedRect,
 }
 
-/// A non-fatal retained-scene finding reported by [`Scene::diagnose`].
+impl DiagnosticKind {
+    /// Return whether this finding can be produced during streaming or requires retained-scene
+    /// inspection.
+    #[must_use]
+    pub const fn scope(self) -> DiagnosticScope {
+        match self {
+            Self::EmptyContext
+            | Self::EmptyClip
+            | Self::EmptyGroup
+            | Self::TransparentDraw
+            | Self::IdentityGroup
+            | Self::EmptyMaskScene
+            | Self::EmptyPath
+            | Self::ZeroWidthStroke
+            | Self::ZeroBlurredRoundedRect => DiagnosticScope::StreamLocal,
+        }
+    }
+}
+
+/// A non-fatal finding reported by [`DiagnosingSink`] or [`Scene::diagnose`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     /// Severity of the finding.
@@ -59,163 +93,266 @@ pub struct Diagnostic {
 }
 
 #[derive(Copy, Clone, Debug)]
-struct ScopeDiagnosticFrame {
+struct ScopeFrame {
     command_index: u32,
     draw_count: u32,
 }
 
 #[derive(Copy, Clone, Debug)]
-struct GroupDiagnosticFrame {
+struct GroupFrame {
     command_index: u32,
     draw_count: u32,
     is_identity: bool,
 }
 
-impl Scene {
-    /// Analyze the retained command stream for suspicious but still structurally valid patterns.
-    #[must_use]
-    pub fn diagnose(&self) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-        let mut context_stack = Vec::new();
-        let mut context_frames = Vec::new();
-        let mut clip_frames = Vec::new();
-        let mut group_frames = Vec::new();
-        let mut draw_count = 0_u32;
+/// A [`PaintSink`] wrapper that collects advisory diagnostics while forwarding commands.
+///
+/// This is the stream-local counterpart to [`Scene::diagnose`]. It observes the same borrowed
+/// command stream a backend sink would receive and records non-fatal findings such as empty scopes,
+/// transparent draws, and other no-op or suspicious constructs.
+#[derive(Debug)]
+pub struct DiagnosingSink<S> {
+    inner: S,
+    diagnostics: Vec<Diagnostic>,
+    command_index: u32,
+    draw_count: u32,
+    context_stack: Vec<ContextNote>,
+    context_frames: Vec<ScopeFrame>,
+    clip_frames: Vec<ScopeFrame>,
+    group_frames: Vec<GroupFrame>,
+}
 
-        for (command_index, cmd) in self.commands().iter().enumerate() {
-            let command_index =
-                u32::try_from(command_index).expect("scene command stream overflow");
-            match *cmd {
-                Command::PushContext(id) => {
-                    context_stack.push(id);
-                    context_frames.push(ScopeDiagnosticFrame {
-                        command_index,
-                        draw_count,
-                    });
-                }
-                Command::PopContext => {
-                    if let Some(frame) = context_frames.pop()
-                        && frame.draw_count == draw_count
-                    {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::EmptyContext,
-                            command_index: frame.command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                    context_stack.pop();
-                }
-                Command::PushClip(id) => {
-                    if clip_uses_empty_path(self.clip(id)) {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::EmptyPath,
-                            command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                    if clip_uses_zero_width_stroke(self.clip(id)) {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::ZeroWidthStroke,
-                            command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                    clip_frames.push(ScopeDiagnosticFrame {
-                        command_index,
-                        draw_count,
-                    });
-                }
-                Command::PopClip => {
-                    if let Some(frame) = clip_frames.pop()
-                        && frame.draw_count == draw_count
-                    {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::EmptyClip,
-                            command_index: frame.command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                }
-                Command::PushGroup(id) => {
-                    let group = self.group(id);
-                    if let Some(mask) = &group.mask
-                        && !scene_has_any_draw(&self.mask(mask.mask).scene)
-                    {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::EmptyMaskScene,
-                            command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                    group_frames.push(GroupDiagnosticFrame {
-                        command_index,
-                        draw_count,
-                        is_identity: group_is_identity(group),
-                    });
-                }
-                Command::PopGroup => {
-                    if let Some(frame) = group_frames.pop() {
-                        if frame.draw_count == draw_count {
-                            diagnostics.push(Diagnostic {
-                                level: DiagnosticLevel::Warning,
-                                kind: DiagnosticKind::EmptyGroup,
-                                command_index: frame.command_index,
-                                contexts: self.context_notes_for_stack(&context_stack),
-                            });
-                        } else if frame.is_identity {
-                            diagnostics.push(Diagnostic {
-                                level: DiagnosticLevel::Warning,
-                                kind: DiagnosticKind::IdentityGroup,
-                                command_index: frame.command_index,
-                                contexts: self.context_notes_for_stack(&context_stack),
-                            });
-                        }
-                    }
-                }
-                Command::Draw(id) => {
-                    draw_count += 1;
-                    if draw_uses_empty_path(self.draw_op(id)) {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::EmptyPath,
-                            command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                    if draw_uses_zero_width_stroke(self.draw_op(id)) {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::ZeroWidthStroke,
-                            command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                    if draw_uses_zero_blur(self.draw_op(id)) {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::ZeroBlurredRoundedRect,
-                            command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                    if draw_is_fully_transparent(self, id) {
-                        diagnostics.push(Diagnostic {
-                            level: DiagnosticLevel::Warning,
-                            kind: DiagnosticKind::TransparentDraw,
-                            command_index,
-                            contexts: self.context_notes_for_stack(&context_stack),
-                        });
-                    }
-                }
+impl<S> DiagnosingSink<S> {
+    /// Wrap a sink and collect diagnostics while forwarding commands to it.
+    #[must_use]
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            diagnostics: Vec::new(),
+            command_index: 0,
+            draw_count: 0,
+            context_stack: Vec::new(),
+            context_frames: Vec::new(),
+            clip_frames: Vec::new(),
+            group_frames: Vec::new(),
+        }
+    }
+
+    /// Borrow the wrapped sink.
+    #[must_use]
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Mutably borrow the wrapped sink.
+    #[must_use]
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    /// Borrow the diagnostics accumulated so far.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Unwrap the sink, returning the wrapped sink and all collected diagnostics.
+    #[must_use]
+    pub fn into_inner(self) -> (S, Vec<Diagnostic>) {
+        (self.inner, self.diagnostics)
+    }
+
+    fn push_diagnostic(&mut self, kind: DiagnosticKind) {
+        self.diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            kind,
+            command_index: self.command_index,
+            contexts: self.context_stack.clone(),
+        });
+    }
+
+    fn finish_command(&mut self) {
+        self.command_index = self
+            .command_index
+            .checked_add(1)
+            .expect("diagnostic command stream overflow");
+    }
+}
+
+impl<S> PaintSink for DiagnosingSink<S>
+where
+    S: PaintSink,
+{
+    fn push_context(&mut self, context: ContextRef<'_>) {
+        self.context_stack.push(context_note(context));
+        self.context_frames.push(ScopeFrame {
+            command_index: self.command_index,
+            draw_count: self.draw_count,
+        });
+        self.inner.push_context(context);
+        self.finish_command();
+    }
+
+    fn pop_context(&mut self) {
+        if let Some(frame) = self.context_frames.pop()
+            && frame.draw_count == self.draw_count
+        {
+            self.push_diagnostic(DiagnosticKind::EmptyContext);
+            self.diagnostics
+                .last_mut()
+                .expect("just pushed diagnostic")
+                .command_index = frame.command_index;
+        }
+        self.inner.pop_context();
+        self.context_stack.pop();
+        self.finish_command();
+    }
+
+    fn push_clip(&mut self, clip: ClipRef<'_>) {
+        if clip_uses_empty_path(&clip) {
+            self.push_diagnostic(DiagnosticKind::EmptyPath);
+        }
+        if clip_uses_zero_width_stroke(&clip) {
+            self.push_diagnostic(DiagnosticKind::ZeroWidthStroke);
+        }
+        self.clip_frames.push(ScopeFrame {
+            command_index: self.command_index,
+            draw_count: self.draw_count,
+        });
+        self.inner.push_clip(clip);
+        self.finish_command();
+    }
+
+    fn pop_clip(&mut self) {
+        if let Some(frame) = self.clip_frames.pop()
+            && frame.draw_count == self.draw_count
+        {
+            self.push_diagnostic(DiagnosticKind::EmptyClip);
+            self.diagnostics
+                .last_mut()
+                .expect("just pushed diagnostic")
+                .command_index = frame.command_index;
+        }
+        self.inner.pop_clip();
+        self.finish_command();
+    }
+
+    fn push_group(&mut self, group: GroupRef<'_>) {
+        if let Some(mask) = &group.mask
+            && !scene_has_any_draw(mask.mask.scene)
+        {
+            self.push_diagnostic(DiagnosticKind::EmptyMaskScene);
+        }
+        self.group_frames.push(GroupFrame {
+            command_index: self.command_index,
+            draw_count: self.draw_count,
+            is_identity: group_is_identity(&group),
+        });
+        self.inner.push_group(group);
+        self.finish_command();
+    }
+
+    fn pop_group(&mut self) {
+        if let Some(frame) = self.group_frames.pop() {
+            if frame.draw_count == self.draw_count {
+                self.push_diagnostic(DiagnosticKind::EmptyGroup);
+                self.diagnostics
+                    .last_mut()
+                    .expect("just pushed diagnostic")
+                    .command_index = frame.command_index;
+            } else if frame.is_identity {
+                self.push_diagnostic(DiagnosticKind::IdentityGroup);
+                self.diagnostics
+                    .last_mut()
+                    .expect("just pushed diagnostic")
+                    .command_index = frame.command_index;
             }
         }
+        self.inner.pop_group();
+        self.finish_command();
+    }
 
+    fn fill(&mut self, draw: FillRef<'_>) {
+        self.draw_count += 1;
+        if draw_uses_empty_path_fill(&draw) {
+            self.push_diagnostic(DiagnosticKind::EmptyPath);
+        }
+        if draw_is_fully_transparent_fill(&draw) {
+            self.push_diagnostic(DiagnosticKind::TransparentDraw);
+        }
+        self.inner.fill(draw);
+        self.finish_command();
+    }
+
+    fn stroke(&mut self, draw: StrokeRef<'_>) {
+        self.draw_count += 1;
+        if draw_uses_empty_path_stroke(&draw) {
+            self.push_diagnostic(DiagnosticKind::EmptyPath);
+        }
+        if draw.stroke.width <= 0.0 {
+            self.push_diagnostic(DiagnosticKind::ZeroWidthStroke);
+        }
+        if draw_is_fully_transparent_stroke(&draw) {
+            self.push_diagnostic(DiagnosticKind::TransparentDraw);
+        }
+        self.inner.stroke(draw);
+        self.finish_command();
+    }
+
+    fn glyph_run(
+        &mut self,
+        draw: GlyphRunRef<'_>,
+        glyphs: &mut dyn Iterator<Item = crate::record::Glyph>,
+    ) {
+        self.draw_count += 1;
+        if draw_is_fully_transparent_glyph_run(&draw) {
+            self.push_diagnostic(DiagnosticKind::TransparentDraw);
+        }
+        self.inner.glyph_run(draw, glyphs);
+        self.finish_command();
+    }
+
+    fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        self.draw_count += 1;
+        if draw.std_dev == 0.0 {
+            self.push_diagnostic(DiagnosticKind::ZeroBlurredRoundedRect);
+        }
+        if draw.composite.alpha <= 0.0 || draw.color.components[3] <= 0.0 {
+            self.push_diagnostic(DiagnosticKind::TransparentDraw);
+        }
+        self.inner.blurred_rounded_rect(draw);
+        self.finish_command();
+    }
+}
+
+impl Scene {
+    /// Analyze the retained command stream for suspicious but still structurally valid patterns.
+    ///
+    /// Diagnostics whose [`DiagnosticKind::scope`] is [`DiagnosticScope::StreamLocal`] are
+    /// produced by replaying this scene into a [`DiagnosingSink`]. Future
+    /// [`DiagnosticScope::RetainedScene`] findings may be appended here without affecting the
+    /// streaming API.
+    #[must_use]
+    pub fn diagnose(&self) -> Vec<Diagnostic> {
+        let mut sink = DiagnosingSink::new(NullSink);
+        crate::record::replay(self, &mut sink);
+        let (_, diagnostics) = sink.into_inner();
         diagnostics
+    }
+}
+
+fn context_note(context: ContextRef<'_>) -> ContextNote {
+    ContextNote {
+        label: context.label.into(),
+        source: context.source.map(resolved_source_location),
+    }
+}
+
+fn resolved_source_location(source: SourceLocationRef<'_>) -> ResolvedSourceLocation {
+    ResolvedSourceLocation {
+        file: source.file.into(),
+        line: source.line,
+        column: source.column,
     }
 }
 
@@ -223,79 +360,90 @@ fn scene_has_any_draw(scene: &Scene) -> bool {
     scene
         .commands()
         .iter()
-        .any(|command| matches!(command, Command::Draw(_)))
+        .any(|command| matches!(command, crate::record::Command::Draw(_)))
 }
 
-fn group_is_identity(group: &crate::record::Group) -> bool {
+fn group_is_identity(group: &GroupRef<'_>) -> bool {
     group.clip.is_none()
         && group.mask.is_none()
         && group.filters.is_empty()
         && group.composite == Composite::default()
 }
 
-fn clip_uses_empty_path(clip: &Clip) -> bool {
+fn clip_uses_empty_path(clip: &ClipRef<'_>) -> bool {
     match clip {
-        Clip::Fill { shape, .. } | Clip::Stroke { shape, .. } => geometry_is_empty_path(shape),
+        ClipRef::Fill { shape, .. } | ClipRef::Stroke { shape, .. } => {
+            geometry_ref_is_empty_path(shape)
+        }
     }
 }
 
-fn clip_uses_zero_width_stroke(clip: &Clip) -> bool {
+fn clip_uses_zero_width_stroke(clip: &ClipRef<'_>) -> bool {
     match clip {
-        Clip::Fill { .. } => false,
-        Clip::Stroke { stroke, .. } => stroke.width <= 0.0,
+        ClipRef::Fill { .. } => false,
+        ClipRef::Stroke { stroke, .. } => stroke.width <= 0.0,
     }
 }
 
-fn draw_uses_empty_path(draw: &Draw) -> bool {
-    match draw {
-        Draw::Fill { shape, .. } | Draw::Stroke { shape, .. } => geometry_is_empty_path(shape),
-        Draw::GlyphRun(_) | Draw::BlurredRoundedRect(_) => false,
-    }
+fn draw_uses_empty_path_fill(draw: &FillRef<'_>) -> bool {
+    geometry_ref_is_empty_path(&draw.shape)
 }
 
-fn draw_uses_zero_width_stroke(draw: &Draw) -> bool {
-    match draw {
-        Draw::Stroke { stroke, .. } => stroke.width <= 0.0,
-        Draw::Fill { .. } | Draw::GlyphRun(_) | Draw::BlurredRoundedRect(_) => false,
-    }
+fn draw_uses_empty_path_stroke(draw: &StrokeRef<'_>) -> bool {
+    geometry_ref_is_empty_path(&draw.shape)
 }
 
-fn draw_uses_zero_blur(draw: &Draw) -> bool {
-    match draw {
-        Draw::BlurredRoundedRect(draw) => draw.std_dev == 0.0,
-        Draw::Fill { .. } | Draw::Stroke { .. } | Draw::GlyphRun(_) => false,
-    }
-}
-
-fn geometry_is_empty_path(geometry: &Geometry) -> bool {
+fn geometry_ref_is_empty_path(geometry: &crate::GeometryRef<'_>) -> bool {
     match geometry {
-        Geometry::Path(path) => path.is_empty(),
-        Geometry::Rect(_) | Geometry::RoundedRect(_) => false,
+        crate::GeometryRef::Path(path) => path.is_empty(),
+        crate::GeometryRef::OwnedPath(path) => path.is_empty(),
+        crate::GeometryRef::Rect(_) | crate::GeometryRef::RoundedRect(_) => false,
     }
 }
 
-fn draw_is_fully_transparent(scene: &Scene, id: DrawId) -> bool {
-    match scene.draw_op(id) {
-        Draw::Fill {
-            brush, composite, ..
-        }
-        | Draw::Stroke {
-            brush, composite, ..
-        } => composite.alpha <= 0.0 || solid_brush_is_fully_transparent(brush),
-        Draw::GlyphRun(glyph_run) => {
-            glyph_run.composite.alpha <= 0.0 || solid_brush_is_fully_transparent(&glyph_run.brush)
-        }
-        Draw::BlurredRoundedRect(draw) => {
-            draw.composite.alpha <= 0.0 || draw.color.components[3] <= 0.0
-        }
-    }
+fn draw_is_fully_transparent_fill(draw: &FillRef<'_>) -> bool {
+    draw.composite.alpha <= 0.0 || brush_ref_is_fully_transparent(draw.brush)
 }
 
-fn solid_brush_is_fully_transparent(brush: &Brush) -> bool {
+fn draw_is_fully_transparent_stroke(draw: &StrokeRef<'_>) -> bool {
+    draw.composite.alpha <= 0.0 || brush_ref_is_fully_transparent(draw.brush)
+}
+
+fn draw_is_fully_transparent_glyph_run(draw: &GlyphRunRef<'_>) -> bool {
+    draw.composite.alpha <= 0.0 || brush_ref_is_fully_transparent(draw.brush)
+}
+
+fn brush_ref_is_fully_transparent(brush: BrushRef<'_>) -> bool {
     match brush {
-        Brush::Solid(color) => color.components[3] <= 0.0,
-        Brush::Gradient(_) | Brush::Image(_) => false,
+        BrushRef::Solid(color) => color.components[3] <= 0.0,
+        BrushRef::Gradient(_) | BrushRef::Image(_) => false,
     }
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct NullSink;
+
+impl PaintSink for NullSink {
+    fn push_clip(&mut self, _clip: ClipRef<'_>) {}
+
+    fn pop_clip(&mut self) {}
+
+    fn push_group(&mut self, _group: GroupRef<'_>) {}
+
+    fn pop_group(&mut self) {}
+
+    fn fill(&mut self, _draw: FillRef<'_>) {}
+
+    fn stroke(&mut self, _draw: StrokeRef<'_>) {}
+
+    fn glyph_run(
+        &mut self,
+        _draw: GlyphRunRef<'_>,
+        _glyphs: &mut dyn Iterator<Item = crate::record::Glyph>,
+    ) {
+    }
+
+    fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
 }
 
 #[cfg(test)]
@@ -307,12 +455,10 @@ mod tests {
 
     use super::*;
     use crate::Composite;
-    use crate::SourceLocationRef;
-    use crate::{
-        BlurredRoundedRect, MaskMode,
-        record::{
-            AppliedMask, Clip, ContextId, Draw, Geometry, Group, Mask, ResolvedSourceLocation,
-        },
+    use crate::MaskMode;
+    use crate::Painter;
+    use crate::record::{
+        AppliedMask, Clip, ContextId, Draw, Geometry, Group, Mask, ResolvedSourceLocation,
     };
 
     #[test]
@@ -346,6 +492,7 @@ mod tests {
         assert_eq!(diagnostics[1].kind, DiagnosticKind::EmptyGroup);
         assert_eq!(diagnostics[2].kind, DiagnosticKind::TransparentDraw);
         for diagnostic in diagnostics {
+            assert_eq!(diagnostic.kind.scope(), DiagnosticScope::StreamLocal);
             assert_eq!(
                 diagnostic.contexts,
                 vec![ContextNote {
@@ -502,5 +649,30 @@ mod tests {
                     source: None,
                 }]
         }));
+    }
+
+    #[test]
+    fn diagnosing_sink_collects_stream_local_findings_while_forwarding() {
+        let mut sink = DiagnosingSink::new(Scene::new());
+
+        {
+            let mut painter = Painter::new(&mut sink);
+            painter.with_context("ctx", None, |p| {
+                p.fill(Geometry::Path(BezPath::new()), Color::TRANSPARENT)
+                    .draw();
+            });
+        }
+
+        let (scene, diagnostics) = sink.into_inner();
+        assert_eq!(scene.commands().len(), 3);
+        assert_eq!(
+            diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(),
+            vec![DiagnosticKind::EmptyPath, DiagnosticKind::TransparentDraw,]
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind.scope() == DiagnosticScope::StreamLocal)
+        );
     }
 }
