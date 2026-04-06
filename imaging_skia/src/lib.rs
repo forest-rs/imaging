@@ -1589,9 +1589,16 @@ fn brush_to_paint(
             let mut pos: Vec<f32> = Vec::with_capacity(stops.len());
 
             for s in stops {
-                let comps = s.color.components;
-                let a = comps[3] * alpha_scale;
-                colors.push(sk::Color4f::new(comps[0], comps[1], comps[2], a));
+                let color = s
+                    .color
+                    .to_alpha_color::<peniko::color::Srgb>()
+                    .multiply_alpha(alpha_scale);
+                colors.push(sk::Color4f::new(
+                    color.components[0],
+                    color.components[1],
+                    color.components[2],
+                    color.components[3],
+                ));
                 pos.push(s.offset.clamp(0.0, 1.0));
             }
 
