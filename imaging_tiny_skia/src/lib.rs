@@ -21,10 +21,7 @@ use imaging::{
     record::{Scene, ValidateError},
     render::{ImageRenderer, RenderSource},
 };
-use kurbo::{
-    Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke as KurboStroke, StrokeOpts, Vec2,
-    stroke as kurbo_stroke_outline,
-};
+use kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke as KurboStroke, Vec2};
 use peniko::{
     BlendMode, BrushRef, Color, Compose, Extend, Gradient, GradientKind, ImageData, ImageQuality,
     InterpolationAlphaSpace, Mix, RadialGradientPosition,
@@ -357,6 +354,7 @@ pub(crate) struct ClipPath {
     path: Path,
     rect: Rect,
     simple_rect: Option<Rect>,
+    stroke_source: Option<(Path, TinyStroke)>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -533,6 +531,7 @@ struct Layer<'a> {
     alpha: f32,
     group_mask: Option<PendingGroupMask>,
     filters: Vec<Filter>,
+    clip_applied_in_content: bool,
 }
 
 struct PendingGroupMask {
@@ -582,6 +581,7 @@ impl Layer<'static> {
             alpha: 1.0,
             group_mask: None,
             filters: Vec::new(),
+            clip_applied_in_content: false,
         })
     }
 
@@ -610,6 +610,7 @@ impl Layer<'static> {
             alpha,
             group_mask: None,
             filters: Vec::new(),
+            clip_applied_in_content: false,
         };
         layer.rebuild_clip_mask();
         Ok(layer)
@@ -650,6 +651,7 @@ impl<'a> Layer<'a> {
             alpha: 1.0,
             group_mask: None,
             filters: Vec::new(),
+            clip_applied_in_content: false,
         })
     }
 
@@ -688,11 +690,6 @@ impl<'a> Layer<'a> {
         self.mask_valid = true;
     }
 
-    fn intersect_mask_rect(&mut self, rect: Rect) {
-        Self::intersect_mask_rect_in(&mut self.mask, rect);
-        self.mask_valid = true;
-    }
-
     fn materialize_simple_clip_mask(&mut self) {
         if self.clip.is_some()
             && !self.mask_valid
@@ -721,6 +718,51 @@ impl<'a> Layer<'a> {
             data[row..row + x0].fill(0);
             data[row + x1..row + width].fill(0);
         }
+    }
+
+    fn clip_mask_from_stroke_source(mask: &Mask, path: &Path, stroke: &TinyStroke) -> Option<Mask> {
+        let mut pixmap = Pixmap::new(mask.width(), mask.height())?;
+        let paint = Paint {
+            shader: Shader::SolidColor(tiny_skia::Color::WHITE),
+            anti_alias: true,
+            ..Default::default()
+        };
+        pixmap.stroke_path(path, &paint, stroke, Transform::identity(), None);
+        Some(Mask::from_pixmap(pixmap.as_ref(), MaskType::Alpha))
+    }
+
+    fn fill_mask_from_clip(mask: &mut Mask, clip: &ClipPath) {
+        if let Some((path, stroke)) = &clip.stroke_source {
+            mask.clear();
+            if let Some(stroke_mask) = Self::clip_mask_from_stroke_source(mask, path, stroke) {
+                mask.data_mut().copy_from_slice(stroke_mask.data());
+            }
+            return;
+        }
+
+        if clip.simple_rect.is_some() {
+            Self::write_mask_rect_to(mask, clip.rect);
+        } else {
+            mask.fill_path(&clip.path, FillRule::Winding, true, Transform::identity());
+        }
+    }
+
+    fn intersect_mask_with_clip(mask: &mut Mask, clip: &ClipPath) {
+        if let Some(simple_rect) = clip.simple_rect {
+            Self::intersect_mask_rect_in(mask, simple_rect);
+            return;
+        }
+        if let Some((path, stroke)) = &clip.stroke_source {
+            let Some(stroke_mask) = Self::clip_mask_from_stroke_source(mask, path, stroke) else {
+                mask.clear();
+                return;
+            };
+            for (dst, src) in mask.data_mut().iter_mut().zip(stroke_mask.data().iter()) {
+                *dst = mul_div_255(*dst, *src);
+            }
+            return;
+        }
+        mask.intersect_path(&clip.path, FillRule::Winding, true, Transform::identity());
     }
 
     fn intersect_clip_path(&mut self, clip: &ClipPath) {
@@ -757,33 +799,13 @@ impl<'a> Layer<'a> {
         }
 
         if self.active_mask().is_some() {
-            if clip.simple_rect.is_some() {
-                self.intersect_mask_rect(clip.rect);
-            } else {
-                self.mask.intersect_path(
-                    &clip.path,
-                    FillRule::Winding,
-                    false,
-                    Transform::identity(),
-                );
-            }
+            Self::intersect_mask_with_clip(&mut self.mask, clip);
         } else {
             if let Some(simple_clip) = prior_simple_clip {
                 self.fill_mask_rect(simple_clip);
-                if clip.simple_rect.is_some() {
-                    self.intersect_mask_rect(clip.rect);
-                } else {
-                    self.mask.intersect_path(
-                        &clip.path,
-                        FillRule::Winding,
-                        false,
-                        Transform::identity(),
-                    );
-                }
+                Self::intersect_mask_with_clip(&mut self.mask, clip);
             } else {
-                self.mask.clear();
-                self.mask
-                    .fill_path(&clip.path, FillRule::Winding, false, Transform::identity());
+                Self::fill_mask_from_clip(&mut self.mask, clip);
             }
         }
 
@@ -857,18 +879,12 @@ impl<'a> Layer<'a> {
         let mask = &mut self.mask;
         if let Some(simple_clip) = self.simple_clip {
             Self::write_mask_rect_to(mask, simple_clip);
-        } else if first.simple_rect.is_some() {
-            Self::write_mask_rect_to(mask, first.rect);
         } else {
-            mask.fill_path(&first.path, FillRule::Winding, false, Transform::identity());
+            Self::fill_mask_from_clip(mask, first);
         }
 
         for clip in clips {
-            if clip.simple_rect.is_some() {
-                Self::intersect_mask_rect_in(mask, clip.rect);
-            } else {
-                mask.intersect_path(&clip.path, FillRule::Winding, false, Transform::identity());
-            }
+            Self::intersect_mask_with_clip(mask, clip);
         }
         self.mask_valid = true;
     }
@@ -1532,10 +1548,15 @@ impl<'a> Layer<'a> {
             None => return false,
         };
         let sample_transform = brush_transform.unwrap_or(Affine::IDENTITY).inverse();
-        let sample_origin =
-            sample_transform * Point::new(f64::from(x0) + 0.5, f64::from(y0) + 0.5);
-        let sample_dx = Vec2::new(sample_transform.as_coeffs()[0], sample_transform.as_coeffs()[1]);
-        let sample_dy = Vec2::new(sample_transform.as_coeffs()[2], sample_transform.as_coeffs()[3]);
+        let sample_origin = sample_transform * Point::new(f64::from(x0) + 0.5, f64::from(y0) + 0.5);
+        let sample_dx = Vec2::new(
+            sample_transform.as_coeffs()[0],
+            sample_transform.as_coeffs()[1],
+        );
+        let sample_dy = Vec2::new(
+            sample_transform.as_coeffs()[2],
+            sample_transform.as_coeffs()[3],
+        );
         let coverage_data = coverage.data();
         let pixels = pixmap.pixels_mut();
         let stride = usize_from_u32(local_width);
@@ -1549,7 +1570,8 @@ impl<'a> Layer<'a> {
                 let coverage_alpha = coverage_data[idx];
                 if coverage_alpha != 0 {
                     let sampled = sample_image_brush_at(&image_pixmap, image, point);
-                    pixels[idx] = scale_premultiplied_color(sampled, mul_div_255(alpha, coverage_alpha));
+                    pixels[idx] =
+                        scale_premultiplied_color(sampled, mul_div_255(alpha, coverage_alpha));
                 }
                 point += sample_dx;
             }
@@ -1589,6 +1611,7 @@ impl Layer<'_> {
                 .device_transform()
                 .transform_rect_bbox(shape.bounding_box()),
             simple_rect: transformed_axis_aligned_rect(shape, self.device_transform()),
+            stroke_source: None,
         }));
     }
     fn stroke_with_brush_transform<'b, 's>(
@@ -1620,28 +1643,7 @@ impl Layer<'_> {
         let path = try_ret!(shape_to_path(shape));
         let paint = try_ret!(brush_to_paint(brush, brush_transform, opacity, blend_mode));
         self.mark_stroke_bounds(shape, stroke);
-        let line_cap = match stroke.end_cap {
-            Cap::Butt => LineCap::Butt,
-            Cap::Square => LineCap::Square,
-            Cap::Round => LineCap::Round,
-        };
-        let line_join = match stroke.join {
-            Join::Bevel => LineJoin::Bevel,
-            Join::Miter => LineJoin::Miter,
-            Join::Round => LineJoin::Round,
-        };
-        let stroke = TinyStroke {
-            width: f64_to_f32(stroke.width),
-            miter_limit: f64_to_f32(stroke.miter_limit),
-            line_cap,
-            line_join,
-            dash: (!stroke.dash_pattern.is_empty())
-                .then_some(StrokeDash::new(
-                    stroke.dash_pattern.iter().map(|v| f64_to_f32(*v)).collect(),
-                    f64_to_f32(stroke.dash_offset),
-                ))
-                .flatten(),
-        };
+        let stroke = kurbo_stroke_to_tiny_stroke(stroke);
         self.materialize_simple_clip_mask();
         let clip_mask = self.clip.is_some().then_some(&self.mask);
         self.pixmap
@@ -1677,13 +1679,7 @@ impl Layer<'_> {
     ) {
         let brush = brush.into();
         if let BrushRef::Image(image) = brush {
-            if self.try_fill_image_fallback(
-                shape,
-                &image,
-                brush_transform,
-                opacity,
-                blend_mode,
-            ) {
+            if self.try_fill_image_fallback(shape, &image, brush_transform, opacity, blend_mode) {
                 return;
             }
             let image_pixmap = try_ret!(image_brush_pixmap(&image));
@@ -1782,6 +1778,13 @@ pub struct TinySkiaRendererImpl<'a> {
     transform: Affine,
     mask_cache: VecDeque<CachedMask>,
     layers: Vec<Layer<'a>>,
+    group_frames: Vec<GroupFrame>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupFrame {
+    Direct { pushed_clip: bool },
+    Isolated,
 }
 
 /// tiny-skia renderer that draws directly into a caller-owned CPU target.
@@ -1819,6 +1822,7 @@ impl<'a> TinySkiaTargetRenderer<'a> {
                     target.width,
                     target.height,
                 )?],
+                group_frames: Vec::new(),
             };
             inner.clear_root_layer();
             return Ok(Self { inner });
@@ -1834,10 +1838,19 @@ fn translate_clip_path(clip: &ClipPath, dx: f64, dy: f64) -> ClipPath {
         .clone()
         .transform(Transform::from_translate(f64_to_f32(dx), f64_to_f32(dy)))
         .expect("translation should preserve clip path");
+    let stroke_source = clip.stroke_source.as_ref().map(|(path, stroke)| {
+        (
+            path.clone()
+                .transform(Transform::from_translate(f64_to_f32(dx), f64_to_f32(dy)))
+                .expect("translation should preserve stroke clip path"),
+            stroke.clone(),
+        )
+    });
     ClipPath {
         path,
         rect: translate_rect(clip.rect, dx, dy),
         simple_rect: clip.simple_rect.map(|rect| translate_rect(rect, dx, dy)),
+        stroke_source,
     }
 }
 
@@ -1852,6 +1865,18 @@ fn translate_clip_paths_in_place(clips: &mut [ClipPath], dx: f64, dy: f64) {
 }
 
 impl<'a> TinySkiaRendererImpl<'a> {
+    fn simple_inherited_clips(clips: &[ClipPath]) -> Vec<ClipPath> {
+        clips
+            .iter()
+            .filter(|clip| clip.simple_rect.is_some())
+            .cloned()
+            .collect()
+    }
+
+    fn group_requires_isolation(group: &GroupRef<'_>) -> bool {
+        group.composite != Composite::default() || !group.filters.is_empty() || group.mask.is_some()
+    }
+
     fn default_group_clip(&self) -> Option<ClipPath> {
         let rect = self.canvas_size().to_rect();
         self.clip_path_for_geometry(imaging::GeometryRef::Rect(rect), Affine::IDENTITY)
@@ -1884,7 +1909,7 @@ impl<'a> TinySkiaRendererImpl<'a> {
     ) -> Option<Layer<'static>> {
         let parent_origin = self.current_layer().origin;
         let clip = translate_clip_path(&clip, parent_origin.x, parent_origin.y);
-        let mut inherited_clips = self.current_layer().effective_clips_in_root();
+        let inherited_clips = self.current_layer().effective_clips_in_root();
         let mut group_bounds = clip.rect;
         for inherited in &inherited_clips {
             group_bounds = group_bounds.intersect(inherited.rect);
@@ -1893,7 +1918,13 @@ impl<'a> TinySkiaRendererImpl<'a> {
         let group_bounds = rect_to_int_rect(group_bounds)?;
         let group_origin = Point::new(f64::from(group_bounds.x()), f64::from(group_bounds.y()));
         let clip = translate_clip_path(&clip, -group_origin.x, -group_origin.y);
-        translate_clip_paths_in_place(&mut inherited_clips, -group_origin.x, -group_origin.y);
+        let mut applied_inherited_clips = Self::simple_inherited_clips(&inherited_clips);
+        let omitted_non_simple = applied_inherited_clips.len() != inherited_clips.len();
+        translate_clip_paths_in_place(
+            &mut applied_inherited_clips,
+            -group_origin.x,
+            -group_origin.y,
+        );
         let mut child = Layer::new_with_base_clip(
             composite.blend,
             composite.alpha,
@@ -1903,9 +1934,10 @@ impl<'a> TinySkiaRendererImpl<'a> {
             group_bounds.height(),
         )
         .ok()?;
-        child.rebuild_clip_mask_with_extra_clips(&inherited_clips);
+        child.rebuild_clip_mask_with_extra_clips(&applied_inherited_clips);
         child.group_mask = group_mask;
         child.filters = filters.to_vec();
+        child.clip_applied_in_content = !omitted_non_simple;
         Some(child)
     }
 
@@ -1985,6 +2017,7 @@ impl<'a> TinySkiaRendererImpl<'a> {
             parent,
             blend_mode,
             child.alpha,
+            false,
         );
         true
     }
@@ -2080,19 +2113,34 @@ impl<'a> TinySkiaRendererImpl<'a> {
                 shape,
                 stroke,
             } => {
-                let shape_path = shape.to_path(0.1);
-                let stroked = kurbo_stroke_outline(
-                    shape_path.elements().iter().copied(),
-                    stroke,
-                    &StrokeOpts::default(),
-                    0.1,
+                let origin = self.current_layer().origin;
+                let transform = Affine::translate((-origin.x, -origin.y)) * transform;
+                let shape_path = match shape {
+                    imaging::GeometryRef::Rect(rect) => shape_to_path(&rect)?,
+                    imaging::GeometryRef::RoundedRect(rect) => shape_to_path(&rect)?,
+                    imaging::GeometryRef::Path(path) => path_to_tiny_skia_path(path)?,
+                    imaging::GeometryRef::OwnedPath(ref path) => path_to_tiny_skia_path(path)?,
+                };
+                let tiny_stroke = kurbo_stroke_to_tiny_stroke(stroke);
+                let res_scale =
+                    tiny_skia::PathStroker::compute_resolution_scale(&affine_to_skia(transform));
+                let stroked =
+                    tiny_skia::PathStroker::new().stroke(&shape_path, &tiny_stroke, res_scale)?;
+                let rect = Rect::new(
+                    f64::from(stroked.bounds().left()),
+                    f64::from(stroked.bounds().top()),
+                    f64::from(stroked.bounds().right()),
+                    f64::from(stroked.bounds().bottom()),
                 );
-                let path =
-                    path_to_tiny_skia_path(&stroked)?.transform(affine_to_skia(transform))?;
+                let path = stroked.transform(affine_to_skia(transform))?;
                 Some(ClipPath {
                     path,
-                    rect: transform.transform_rect_bbox(stroked.bounding_box()),
+                    rect: transform.transform_rect_bbox(rect),
                     simple_rect: None,
+                    stroke_source: Some((
+                        shape_path.transform(affine_to_skia(transform))?,
+                        tiny_stroke,
+                    )),
                 })
             }
         }
@@ -2130,6 +2178,7 @@ impl<'a> TinySkiaRendererImpl<'a> {
             path,
             rect: transform.transform_rect_bbox(bounds),
             simple_rect,
+            stroke_source: None,
         })
     }
 
@@ -2179,12 +2228,17 @@ impl<'a> TinySkiaRendererImpl<'a> {
             let layer = self.current_layer_mut();
             layer.effective_clips()
         };
+        let omitted_non_simple = inherited_clips
+            .iter()
+            .any(|clip| clip.simple_rect.is_none());
+        let applied_inherited_clips = Self::simple_inherited_clips(&inherited_clips);
 
         let mut child = Layer::new_root(width, height).ok()?;
         child.blend_mode = composite.blend;
         child.alpha = composite.alpha;
         child.transform = transform;
-        child.rebuild_clip_mask_with_extra_clips(&inherited_clips);
+        child.rebuild_clip_mask_with_extra_clips(&applied_inherited_clips);
+        child.clip_applied_in_content = !omitted_non_simple;
         Some(child)
     }
 
@@ -2387,6 +2441,7 @@ impl TinySkiaRendererImpl<'static> {
             cache_color: CacheColor(false),
             mask_cache: VecDeque::new(),
             layers: vec![main_layer],
+            group_frames: Vec::new(),
         })
     }
 
@@ -2398,6 +2453,10 @@ impl TinySkiaRendererImpl<'static> {
         assert!(
             self.layers.len() == 1,
             "TinySkiaRenderer must contain only the root layer at frame start"
+        );
+        assert!(
+            self.group_frames.is_empty(),
+            "TinySkiaRenderer must not have open groups at frame start"
         );
         self.transform = Affine::IDENTITY;
         self.clear_root_layer();
@@ -2445,6 +2504,17 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
+        if !Self::group_requires_isolation(&group) {
+            let pushed_clip = if let Some(clip) = group.clip {
+                self.push_clip(clip);
+                true
+            } else {
+                false
+            };
+            self.group_frames.push(GroupFrame::Direct { pushed_clip });
+            return;
+        }
+
         if let Some(clip) = self.group_clip_path(group.clip)
             && let Some(child) = self.build_group_child_layer(
                 group.composite,
@@ -2454,15 +2524,28 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
             )
         {
             self.layers.push(child);
+            self.group_frames.push(GroupFrame::Isolated);
         }
     }
 
     fn pop_group(&mut self) {
-        if self.layers.len() <= 1 {
+        let Some(frame) = self.group_frames.pop() else {
             return;
+        };
+        match frame {
+            GroupFrame::Direct { pushed_clip } => {
+                if pushed_clip {
+                    self.pop_clip();
+                }
+            }
+            GroupFrame::Isolated => {
+                if self.layers.len() <= 1 {
+                    return;
+                }
+                let child = self.layers.pop().expect("checked layer depth");
+                self.finish_popped_group(child);
+            }
         }
-        let child = self.layers.pop().expect("checked layer depth");
-        self.finish_popped_group(child);
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -2882,6 +2965,31 @@ fn image_quality_to_filter_quality(quality: ImageQuality) -> FilterQuality {
     }
 }
 
+fn kurbo_stroke_to_tiny_stroke(stroke: &KurboStroke) -> TinyStroke {
+    let line_cap = match stroke.end_cap {
+        Cap::Butt => LineCap::Butt,
+        Cap::Square => LineCap::Square,
+        Cap::Round => LineCap::Round,
+    };
+    let line_join = match stroke.join {
+        Join::Bevel => LineJoin::Bevel,
+        Join::Miter => LineJoin::Miter,
+        Join::Round => LineJoin::Round,
+    };
+    TinyStroke {
+        width: f64_to_f32(stroke.width),
+        miter_limit: f64_to_f32(stroke.miter_limit),
+        line_cap,
+        line_join,
+        dash: (!stroke.dash_pattern.is_empty())
+            .then_some(StrokeDash::new(
+                stroke.dash_pattern.iter().map(|v| f64_to_f32(*v)).collect(),
+                f64_to_f32(stroke.dash_offset),
+            ))
+            .flatten(),
+    }
+}
+
 fn mul_div_255(value: u8, factor: u8) -> u8 {
     u8::try_from((u16::from(value) * u16::from(factor) + 127) / 255)
         .expect("scaled 8-bit value must fit in u8")
@@ -3075,7 +3183,8 @@ fn draw_brushed_glyphs_into_layer<'a>(
     );
     content_layer.draw_bounds = Some(mask_bounds);
     layer.draw_bounds = Some(
-        layer.draw_bounds
+        layer
+            .draw_bounds
             .map(|bounds| bounds.union(mask_bounds))
             .unwrap_or(mask_bounds),
     );
@@ -3090,6 +3199,7 @@ fn draw_brushed_glyphs_into_layer<'a>(
         layer,
         TinyBlendMode::SourceOver,
         1.0,
+        true,
     );
 }
 
@@ -3115,14 +3225,9 @@ fn draw_glyphs_into_layer<'a>(
             &glyphs,
             Color::from(color),
         ),
-        _ => draw_brushed_glyphs_into_layer(
-            caches,
-            layer,
-            cache_color,
-            origin,
-            run.clone(),
-            &glyphs,
-        ),
+        _ => {
+            draw_brushed_glyphs_into_layer(caches, layer, cache_color, origin, run.clone(), &glyphs)
+        }
     }
 }
 
@@ -3527,6 +3632,7 @@ fn render_cached_blurred_rounded_rect(
         layer,
         blend_mode,
         draw.composite.alpha.clamp(0.0, 1.0),
+        true,
     );
     true
 }
@@ -3617,7 +3723,11 @@ fn extend_image_axis(coord: f32, size: u32, extend: Extend) -> Option<f32> {
         Extend::Reflect => {
             let period = size * 2.0;
             let value = coord.rem_euclid(period);
-            if value < size { value } else { period - value - 1.0 }
+            if value < size {
+                value
+            } else {
+                period - value - 1.0
+            }
         }
     })
 }
@@ -3659,9 +3769,7 @@ where
     };
 
     let color = match quality {
-        FilterQuality::Nearest => {
-            sample(f64_to_f32(point.x).floor(), f64_to_f32(point.y).floor())
-        }
+        FilterQuality::Nearest => sample(f64_to_f32(point.x).floor(), f64_to_f32(point.y).floor()),
         FilterQuality::Bilinear => {
             let x = f64_to_f32(point.x) - 0.5;
             let y = f64_to_f32(point.y) - 0.5;
@@ -4377,7 +4485,9 @@ fn layer_composite_rect(layer: &Layer<'_>, parent: &Layer<'_>) -> Option<IntRect
     if let Some(layer_clip) = layer.clip_in_root() {
         rect = rect.intersect(layer_clip);
     }
-    if let Some(parent_clip) = parent.clip_in_root() {
+    if !layer.clip_applied_in_content
+        && let Some(parent_clip) = parent.clip_in_root()
+    {
         rect = rect.intersect(parent_clip);
     }
 
@@ -4414,6 +4524,7 @@ fn draw_layer_pixmap(
     parent: &mut Layer<'_>,
     blend_mode: TinyBlendMode,
     alpha: f32,
+    apply_parent_clip: bool,
 ) {
     parent.mark_drawn_local_rect(Rect::new(
         f64::from(x),
@@ -4434,8 +4545,12 @@ fn draw_layer_pixmap(
         blend_mode,
         quality: FilterQuality::Nearest,
     };
-    parent.materialize_simple_clip_mask();
-    let clip_mask = parent.clip.is_some().then_some(&parent.mask);
+    let clip_mask = if apply_parent_clip {
+        parent.materialize_simple_clip_mask();
+        parent.clip.is_some().then_some(&parent.mask)
+    } else {
+        None
+    };
 
     parent.pixmap.draw_pixmap(
         x,
@@ -4455,12 +4570,13 @@ fn draw_layer_region_at(
     y: i32,
     blend_mode: TinyBlendMode,
     alpha: f32,
+    apply_parent_clip: bool,
 ) {
     let Some(cropped) = pixmap.clone_rect(src_rect) else {
         return;
     };
 
-    draw_layer_pixmap(&cropped, x, y, parent, blend_mode, alpha);
+    draw_layer_pixmap(&cropped, x, y, parent, blend_mode, alpha, apply_parent_clip);
 }
 
 struct LocalPixmapRegion {
@@ -5008,6 +5124,7 @@ fn apply_layer_multipass(
         y,
         first_pass,
         1.0,
+        !layer.clip_applied_in_content,
     );
 
     let Some(mut intermediate) = parent.pixmap.clone_rect(parent_rect) else {
@@ -5015,8 +5132,24 @@ fn apply_layer_multipass(
     };
     apply_alpha_mask_from_pixmap(&mut intermediate, coverage.as_ref());
 
-    draw_layer_pixmap(&original_parent, x, y, parent, TinyBlendMode::Source, 1.0);
-    draw_layer_pixmap(&intermediate, x, y, parent, second_pass, layer.alpha);
+    draw_layer_pixmap(
+        &original_parent,
+        x,
+        y,
+        parent,
+        TinyBlendMode::Source,
+        1.0,
+        true,
+    );
+    draw_layer_pixmap(
+        &intermediate,
+        x,
+        y,
+        parent,
+        second_pass,
+        layer.alpha,
+        !layer.clip_applied_in_content,
+    );
 }
 
 fn apply_layer(layer: &Layer<'_>, parent: &mut Layer<'_>) {
@@ -5039,6 +5172,7 @@ fn apply_layer(layer: &Layer<'_>, parent: &mut Layer<'_>) {
                 y,
                 blend_mode,
                 layer.alpha,
+                !layer.clip_applied_in_content,
             );
         }
         BlendStrategy::MultiPass {
@@ -5078,8 +5212,8 @@ fn skia_transform(affine: Affine) -> Transform {
 mod tests {
     use super::*;
     use imaging::{GroupRef, MaskMode, Painter, record::Scene};
-    use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
     use peniko::color::{ColorSpaceTag, HueDirection, palette::css};
+    use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 
     /// Creates a `Layer` directly without a window, for offscreen rendering.
     fn make_layer(width: u32, height: u32) -> Layer<'static> {
@@ -5100,6 +5234,7 @@ mod tests {
             alpha: 1.0,
             group_mask: None,
             filters: Vec::new(),
+            clip_applied_in_content: false,
         }
     }
 
@@ -5423,6 +5558,7 @@ mod tests {
             path: clip_path,
             rect: Rect::new(0.0, 0.0, 6.0, 6.0),
             simple_rect: None,
+            stroke_source: None,
         }));
 
         child.fill(&Rect::new(0.0, 0.0, 6.0, 6.0), Color::from_rgb8(255, 0, 0));
@@ -5614,6 +5750,27 @@ mod tests {
 
         assert!(rgba_distance(rendered, expected_longer) <= 10);
         assert!(rgba_distance(rendered, expected_shorter) >= 40);
+    }
+
+    #[test]
+    fn default_group_with_clip_does_not_isolate() {
+        let mut renderer = TinySkiaRenderer::new_with_size(16, 16).expect("renderer");
+        let clip = ClipRef::fill(imaging::GeometryRef::Rect(Rect::new(2.0, 2.0, 14.0, 14.0)));
+
+        renderer.push_group(GroupRef::new().with_clip(clip));
+
+        assert_eq!(renderer.layers.len(), 1);
+        assert_eq!(
+            renderer.group_frames,
+            vec![GroupFrame::Direct { pushed_clip: true }]
+        );
+        assert_eq!(renderer.current_layer().clip_stack.len(), 1);
+
+        renderer.pop_group();
+
+        assert!(renderer.group_frames.is_empty());
+        assert_eq!(renderer.layers.len(), 1);
+        assert!(renderer.current_layer().clip_stack.is_empty());
     }
 
     #[test]

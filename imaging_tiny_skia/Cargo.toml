@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 imaging = { workspace = true }
 kurbo.workspace = true
-peniko = { workspace = true, features = ["std"] }
+peniko = { features = ["std"], workspace = true }
 rustc-hash = "2.1"
 swash = "0.2"
 tiny-skia = "0.11"
