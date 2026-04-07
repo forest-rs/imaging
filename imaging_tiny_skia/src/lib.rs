@@ -196,11 +196,13 @@ impl GlyphCacheKey {
 
 type ImageCacheMap = FxHashMap<u64, (CacheColor, Arc<Pixmap>)>;
 type ScaledImageCacheMap = FxHashMap<ScaledImageCacheKey, (CacheColor, Arc<Pixmap>)>;
+type BlurredRRectCacheMap = FxHashMap<BlurredRRectCacheKey, (CacheColor, Arc<Pixmap>)>;
 type GlyphCacheMap = FxHashMap<(GlyphCacheKey, u32), GlyphCacheEntry>;
 
 struct RendererCaches {
     image_cache: ImageCacheMap,
     scaled_image_cache: ScaledImageCacheMap,
+    blurred_rrect_cache: BlurredRRectCacheMap,
     // The `u32` is a color encoded as a u32 so that it is hashable and eq.
     glyph_cache: GlyphCacheMap,
     scale_context: ScaleContext,
@@ -211,6 +213,7 @@ impl RendererCaches {
         Self {
             image_cache: FxHashMap::default(),
             scaled_image_cache: FxHashMap::default(),
+            blurred_rrect_cache: FxHashMap::default(),
             glyph_cache: FxHashMap::default(),
             scale_context: ScaleContext::new(),
         }
@@ -381,6 +384,17 @@ struct ScaledImageCacheKey {
     width: u32,
     height: u32,
     quality: Discriminant<ImageQuality>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct BlurredRRectCacheKey {
+    x_bits: u64,
+    y_bits: u64,
+    width_bits: u64,
+    height_bits: u64,
+    radius_bits: u64,
+    std_dev_bits: u64,
+    color_rgba: u32,
 }
 
 enum LayerPixmap<'a> {
@@ -603,7 +617,10 @@ impl Layer<'static> {
 }
 
 impl<'a> Layer<'a> {
-    fn all_clips<'b>(&'b self, extra_clips: &'b [ClipPath]) -> impl Iterator<Item = &'b ClipPath> + 'b {
+    fn all_clips<'b>(
+        &'b self,
+        extra_clips: &'b [ClipPath],
+    ) -> impl Iterator<Item = &'b ClipPath> + 'b {
         self.base_clip
             .iter()
             .chain(self.clip_stack.iter())
@@ -1812,7 +1829,8 @@ impl<'a> TinySkiaRendererImpl<'a> {
         let Some(bounds) = mask_bounds else {
             return false;
         };
-        let BlendStrategy::SinglePass(blend_mode) = determine_blend_strategy(&child.blend_mode) else {
+        let BlendStrategy::SinglePass(blend_mode) = determine_blend_strategy(&child.blend_mode)
+        else {
             child.group_mask = Some(group_mask);
             return false;
         };
@@ -1820,7 +1838,8 @@ impl<'a> TinySkiaRendererImpl<'a> {
             child.group_mask = Some(group_mask);
             return false;
         };
-        let Some(mut localized_child) = clone_pixmap_region(child.pixmap.as_ref(), local_bounds) else {
+        let Some(mut localized_child) = clone_pixmap_region(child.pixmap.as_ref(), local_bounds)
+        else {
             child.group_mask = Some(group_mask);
             return false;
         };
@@ -2273,7 +2292,6 @@ impl TinySkiaRendererImpl<'static> {
         self.transform = Affine::IDENTITY;
         self.clear_root_layer();
     }
-
 }
 
 fn rasterize_scene_pixmap(
@@ -2435,6 +2453,19 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        if let BlendStrategy::SinglePass(blend_mode) =
+            determine_blend_strategy(&draw.composite.blend)
+        {
+            let cache_color = self.cache_color;
+            let (caches, layers) = (&mut self.caches, &mut self.layers);
+            let layer = layers
+                .last_mut()
+                .expect("TinySkiaRenderer always has a root layer");
+            if render_cached_blurred_rounded_rect(caches, cache_color, layer, &draw, blend_mode) {
+                return;
+            }
+        }
+
         let Some(mut child) = self.new_composite_child_layer(draw.composite, draw.transform) else {
             return;
         };
@@ -2923,6 +2954,9 @@ impl TinySkiaRendererImpl<'_> {
         self.caches
             .scaled_image_cache
             .retain(|_, (c, _)| *c == self.cache_color);
+        self.caches
+            .blurred_rrect_cache
+            .retain(|_, (c, _)| *c == self.cache_color);
         let now = Instant::now();
         self.caches
             .glyph_cache
@@ -3173,6 +3207,113 @@ where
     true
 }
 
+fn translation_components_if_axis_aligned(affine: Affine) -> Option<(f64, f64)> {
+    let [xx, yx, xy, yy, dx, dy] = affine.as_coeffs();
+    (xx == 1.0 && yx == 0.0 && xy == 0.0 && yy == 1.0).then_some((dx, dy))
+}
+
+fn blurred_rrect_cache_key(
+    rect: Rect,
+    radius: f64,
+    std_dev: f64,
+    color: Color,
+) -> BlurredRRectCacheKey {
+    BlurredRRectCacheKey {
+        x_bits: rect.x0.to_bits(),
+        y_bits: rect.y0.to_bits(),
+        width_bits: rect.width().to_bits(),
+        height_bits: rect.height().to_bits(),
+        radius_bits: radius.to_bits(),
+        std_dev_bits: std_dev.to_bits(),
+        color_rgba: color.to_rgba8().to_u32(),
+    }
+}
+
+fn render_blurred_rounded_rect_pixmap(
+    rect: Rect,
+    radius: f64,
+    std_dev: f64,
+    color: Color,
+    width: u32,
+    height: u32,
+) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(width, height)?;
+    let shape = rect.to_rounded_rect(radius);
+    let path = shape_to_path(&shape)?;
+    let paint = Paint {
+        shader: Shader::SolidColor(to_color(color)),
+        blend_mode: TinyBlendMode::SourceOver,
+        anti_alias: true,
+        ..Default::default()
+    };
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+    blur_pixmap(&pixmap, f64_to_f32(std_dev), f64_to_f32(std_dev))
+}
+
+fn render_cached_blurred_rounded_rect(
+    caches: &mut RendererCaches,
+    cache_color: CacheColor,
+    layer: &mut Layer<'_>,
+    draw: &BlurredRoundedRect,
+    blend_mode: TinyBlendMode,
+) -> bool {
+    let Some((dx, dy)) = translation_components_if_axis_aligned(draw.transform) else {
+        return false;
+    };
+    let translated_rect = translate_rect(draw.rect, dx, dy);
+    let Some(bounds) = rect_to_int_rect(blur_bounds(
+        translated_rect,
+        f64_to_f32(draw.std_dev),
+        f64_to_f32(draw.std_dev),
+    )) else {
+        return false;
+    };
+    let local_rect = translate_rect(
+        translated_rect,
+        -f64::from(bounds.x()),
+        -f64::from(bounds.y()),
+    );
+    let key = blurred_rrect_cache_key(local_rect, draw.radius, draw.std_dev, draw.color);
+    let pixmap = if let Some((entry_color, pixmap)) = caches.blurred_rrect_cache.get_mut(&key) {
+        *entry_color = cache_color;
+        pixmap.clone()
+    } else {
+        let Some(pixmap) = render_blurred_rounded_rect_pixmap(
+            local_rect,
+            draw.radius,
+            draw.std_dev,
+            draw.color,
+            bounds.width(),
+            bounds.height(),
+        ) else {
+            return false;
+        };
+        let pixmap = Arc::new(pixmap);
+        caches
+            .blurred_rrect_cache
+            .insert(key, (cache_color, pixmap.clone()));
+        pixmap
+    };
+
+    let x = bounds.x() - round_to_i32(layer.origin.x);
+    let y = bounds.y() - round_to_i32(layer.origin.y);
+    draw_layer_pixmap(
+        pixmap.as_ref(),
+        x,
+        y,
+        layer,
+        blend_mode,
+        draw.composite.alpha.clamp(0.0, 1.0),
+    );
+    true
+}
+
 fn brush_to_paint<'b>(
     brush: impl Into<BrushRef<'b>>,
     brush_transform: Option<Affine>,
@@ -3320,10 +3461,9 @@ fn expand_gradient_segment(
 ) {
     let push_sample =
         |expanded: &mut Vec<ExpandedGradientStop>, t: f32, color: color::AlphaColor<Srgb>| {
-        let offset =
-            segment.start_offset + (segment.end_offset - segment.start_offset) * t;
-        push_gradient_stop(expanded, offset, color, opacity);
-    };
+            let offset = segment.start_offset + (segment.end_offset - segment.start_offset) * t;
+            push_gradient_stop(expanded, offset, color, opacity);
+        };
 
     for (i, (t, color)) in color::gradient::<Srgb>(
         segment.start_color,
@@ -4542,8 +4682,7 @@ fn apply_layer_multipass(
     first_pass: TinyBlendMode,
     second_pass: TinyBlendMode,
 ) {
-    let parent_rect =
-        IntRect::from_xywh(x, y, width, height).expect("parent rect must be valid");
+    let parent_rect = IntRect::from_xywh(x, y, width, height).expect("parent rect must be valid");
     let Some(original_parent) = parent.pixmap.clone_rect(parent_rect) else {
         return;
     };
@@ -4551,7 +4690,15 @@ fn apply_layer_multipass(
         return;
     };
 
-    draw_layer_region_at(parent, layer.pixmap.as_ref(), layer_rect, x, y, first_pass, 1.0);
+    draw_layer_region_at(
+        parent,
+        layer.pixmap.as_ref(),
+        layer_rect,
+        x,
+        y,
+        first_pass,
+        1.0,
+    );
 
     let Some(mut intermediate) = parent.pixmap.clone_rect(parent_rect) else {
         return;
@@ -4800,6 +4947,53 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(caches.image_cache.len(), 1);
         assert_eq!(caches.scaled_image_cache.len(), 1);
+    }
+
+    #[test]
+    fn blurred_rrect_cache_is_used_for_translation_only_draws() {
+        let mut caches = RendererCaches::new();
+        let draw = BlurredRoundedRect {
+            transform: Affine::translate((0.0, 8.0)),
+            rect: Rect::new(8.5, 10.25, 40.5, 46.25),
+            color: Color::from_rgba8(23, 33, 66, 150),
+            radius: 12.0,
+            std_dev: 6.0,
+            composite: Composite::default(),
+        };
+
+        let mut first_layer = make_layer(64, 64);
+        assert!(render_cached_blurred_rounded_rect(
+            &mut caches,
+            CacheColor(false),
+            &mut first_layer,
+            &draw,
+            TinyBlendMode::SourceOver,
+        ));
+        assert_eq!(caches.blurred_rrect_cache.len(), 1);
+        let cached = caches
+            .blurred_rrect_cache
+            .values()
+            .next()
+            .expect("cached blurred rounded rect")
+            .1
+            .clone();
+
+        let mut second_layer = make_layer(64, 64);
+        assert!(render_cached_blurred_rounded_rect(
+            &mut caches,
+            CacheColor(true),
+            &mut second_layer,
+            &draw,
+            TinyBlendMode::SourceOver,
+        ));
+        let reused = caches
+            .blurred_rrect_cache
+            .values()
+            .next()
+            .expect("cached blurred rounded rect")
+            .1
+            .clone();
+        assert!(Arc::ptr_eq(&cached, &reused));
     }
 
     #[test]
