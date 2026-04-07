@@ -6,6 +6,10 @@ Kompari-based image snapshot tests for `imaging` backends.
 
 - Run one backend directly:
   `cargo test -p imaging_snapshot_tests --features vello_cpu --test vello_cpu_snapshots`
+- Run the repeatable CPU release benchmark set:
+  `./imaging_snapshot_tests/scripts/bench_cpu_release.sh tiny_skia`
+- Override loops or narrow to specific cases:
+  `./imaging_snapshot_tests/scripts/bench_cpu_release.sh tiny_skia 120 gm_image_brushes gm_gradients_sweep`
 - Bless new baselines:
   `IMAGING_TEST=accept cargo test -p imaging_snapshot_tests --features vello_cpu --test vello_cpu_snapshots`
 - Write all current outputs for inspection:
