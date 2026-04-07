@@ -1492,6 +1492,7 @@ impl<'a> Layer<'a> {
     fn try_fill_image_fallback<T>(
         &mut self,
         shape: &impl Shape,
+        image_pixmap: &Pixmap,
         image: &peniko::ImageBrush<T>,
         brush_transform: Option<Affine>,
         opacity: f32,
@@ -1504,9 +1505,6 @@ impl<'a> Layer<'a> {
             return false;
         }
         let Some(path) = shape_to_path(shape) else {
-            return false;
-        };
-        let Some(image_pixmap) = image_brush_pixmap(image) else {
             return false;
         };
 
@@ -1547,7 +1545,7 @@ impl<'a> Layer<'a> {
             Some(pixmap) => pixmap,
             None => return false,
         };
-        let sample_transform = brush_transform.unwrap_or(Affine::IDENTITY).inverse();
+        let sample_transform = brush_transform.unwrap_or(Affine::IDENTITY);
         let sample_origin = sample_transform * Point::new(f64::from(x0) + 0.5, f64::from(y0) + 0.5);
         let sample_dx = Vec2::new(
             sample_transform.as_coeffs()[0],
@@ -1562,6 +1560,146 @@ impl<'a> Layer<'a> {
         let stride = usize_from_u32(local_width);
         let alpha = opacity_to_u8(opacity);
 
+        if sample_dx.y == 0.0 && sample_dy.x == 0.0 {
+            let source_pixels = image_pixmap.pixels();
+            let source_width = usize_from_u32(image_pixmap.width());
+            match image_quality_to_filter_quality(image.sampler.quality) {
+                FilterQuality::Nearest => {
+                    let x_samples = nearest_axis_samples(
+                        f64_to_f32(sample_origin.x),
+                        f64_to_f32(sample_dx.x),
+                        local_width,
+                        image_pixmap.width(),
+                        image.sampler.x_extend,
+                    );
+                    let y_samples = nearest_axis_samples(
+                        f64_to_f32(sample_origin.y),
+                        f64_to_f32(sample_dy.y),
+                        local_height,
+                        image_pixmap.height(),
+                        image.sampler.y_extend,
+                    );
+                    for local_y in 0..local_height {
+                        let y_sample = y_samples[usize_from_u32(local_y)];
+                        for local_x in 0..local_width {
+                            let idx = usize_from_u32(local_y) * stride + usize_from_u32(local_x);
+                            let coverage_alpha = coverage_data[idx];
+                            if coverage_alpha == 0 {
+                                continue;
+                            }
+                            let x_sample = x_samples[usize_from_u32(local_x)];
+                            let sampled = pixmap_pixel_or_transparent(
+                                source_pixels,
+                                source_width,
+                                x_sample.index,
+                                y_sample.index,
+                            );
+                            pixels[idx] = scale_premultiplied_color(
+                                sampled,
+                                mul_div_255(alpha, coverage_alpha),
+                            );
+                        }
+                    }
+                    self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
+                    self.materialize_simple_clip_mask();
+                    let clip_mask = self.clip.is_some().then_some(&self.mask);
+                    self.pixmap.draw_pixmap(
+                        x0,
+                        y0,
+                        pixmap.as_ref(),
+                        &PixmapPaint {
+                            opacity: 1.0,
+                            blend_mode,
+                            quality: FilterQuality::Nearest,
+                        },
+                        Transform::identity(),
+                        clip_mask,
+                    );
+                    return true;
+                }
+                FilterQuality::Bilinear => {
+                    let x_samples = bilinear_axis_samples(
+                        f64_to_f32(sample_origin.x),
+                        f64_to_f32(sample_dx.x),
+                        local_width,
+                        image_pixmap.width(),
+                        image.sampler.x_extend,
+                    );
+                    let y_samples = bilinear_axis_samples(
+                        f64_to_f32(sample_origin.y),
+                        f64_to_f32(sample_dy.y),
+                        local_height,
+                        image_pixmap.height(),
+                        image.sampler.y_extend,
+                    );
+                    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+                    for local_y in 0..local_height {
+                        let y_sample = y_samples[usize_from_u32(local_y)];
+                        for local_x in 0..local_width {
+                            let idx = usize_from_u32(local_y) * stride + usize_from_u32(local_x);
+                            let coverage_alpha = coverage_data[idx];
+                            if coverage_alpha == 0 {
+                                continue;
+                            }
+                            let x_sample = x_samples[usize_from_u32(local_x)];
+                            let c00 = premul_to_rgba_f32(pixmap_pixel_or_transparent(
+                                source_pixels,
+                                source_width,
+                                x_sample.i0,
+                                y_sample.i0,
+                            ));
+                            let c10 = premul_to_rgba_f32(pixmap_pixel_or_transparent(
+                                source_pixels,
+                                source_width,
+                                x_sample.i1,
+                                y_sample.i0,
+                            ));
+                            let c01 = premul_to_rgba_f32(pixmap_pixel_or_transparent(
+                                source_pixels,
+                                source_width,
+                                x_sample.i0,
+                                y_sample.i1,
+                            ));
+                            let c11 = premul_to_rgba_f32(pixmap_pixel_or_transparent(
+                                source_pixels,
+                                source_width,
+                                x_sample.i1,
+                                y_sample.i1,
+                            ));
+                            let mut rgba = [0.0; 4];
+                            for i in 0..4 {
+                                let top = lerp(c00[i], c10[i], x_sample.t);
+                                let bottom = lerp(c01[i], c11[i], x_sample.t);
+                                rgba[i] = lerp(top, bottom, y_sample.t);
+                            }
+                            let sampled = premul_from_rgba_f32(rgba);
+                            pixels[idx] = scale_premultiplied_color(
+                                sampled,
+                                mul_div_255(alpha, coverage_alpha),
+                            );
+                        }
+                    }
+                    self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
+                    self.materialize_simple_clip_mask();
+                    let clip_mask = self.clip.is_some().then_some(&self.mask);
+                    self.pixmap.draw_pixmap(
+                        x0,
+                        y0,
+                        pixmap.as_ref(),
+                        &PixmapPaint {
+                            opacity: 1.0,
+                            blend_mode,
+                            quality: FilterQuality::Nearest,
+                        },
+                        Transform::identity(),
+                        clip_mask,
+                    );
+                    return true;
+                }
+                FilterQuality::Bicubic => {}
+            }
+        }
+
         let mut row_point = sample_origin;
         for local_y in 0..local_height {
             let mut point = row_point;
@@ -1569,7 +1707,7 @@ impl<'a> Layer<'a> {
                 let idx = usize_from_u32(local_y) * stride + usize_from_u32(local_x);
                 let coverage_alpha = coverage_data[idx];
                 if coverage_alpha != 0 {
-                    let sampled = sample_image_brush_at(&image_pixmap, image, point);
+                    let sampled = sample_image_brush_at(image_pixmap, image, point);
                     pixels[idx] =
                         scale_premultiplied_color(sampled, mul_div_255(alpha, coverage_alpha));
                 }
@@ -1594,6 +1732,98 @@ impl<'a> Layer<'a> {
             clip_mask,
         );
         true
+    }
+
+    fn fill_image_with_pixmap_and_mode<T>(
+        &mut self,
+        shape: &impl Shape,
+        image_pixmap: &Pixmap,
+        image: &peniko::ImageBrush<T>,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) where
+        T: Borrow<ImageData>,
+    {
+        if self.try_fill_image_fallback(
+            shape,
+            image_pixmap,
+            image,
+            brush_transform,
+            opacity,
+            blend_mode,
+        ) {
+            return;
+        }
+
+        let paint = Paint {
+            shader: Pattern::new(
+                image_pixmap.as_ref(),
+                image_brush_spread_mode(image),
+                image_quality_to_filter_quality(image.sampler.quality),
+                image.sampler.alpha * opacity,
+                affine_to_skia(brush_transform.unwrap_or(Affine::IDENTITY)),
+            ),
+            blend_mode,
+            ..Default::default()
+        };
+        self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
+        if let Some(rect) = shape.as_rect() {
+            if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
+                let rect = try_ret!(to_skia_rect(rect));
+                self.materialize_simple_clip_mask();
+                let clip_mask = self.clip.is_some().then_some(&self.mask);
+                self.pixmap
+                    .fill_rect(rect, &paint, self.skia_transform(), clip_mask);
+            }
+        } else {
+            let path = try_ret!(shape_to_path(shape));
+            self.materialize_simple_clip_mask();
+            let clip_mask = self.clip.is_some().then_some(&self.mask);
+            self.pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                self.skia_transform(),
+                clip_mask,
+            );
+        }
+    }
+
+    fn stroke_image_with_pixmap_and_mode<T>(
+        &mut self,
+        shape: &impl Shape,
+        image_pixmap: &Pixmap,
+        image: &peniko::ImageBrush<T>,
+        stroke: &KurboStroke,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) where
+        T: Borrow<ImageData>,
+    {
+        if image_brush_has_mixed_extend(image) {
+            return;
+        }
+
+        let path = try_ret!(shape_to_path(shape));
+        self.mark_stroke_bounds(shape, stroke);
+        let stroke = kurbo_stroke_to_tiny_stroke(stroke);
+        self.materialize_simple_clip_mask();
+        let clip_mask = self.clip.is_some().then_some(&self.mask);
+        let paint = Paint {
+            shader: Pattern::new(
+                image_pixmap.as_ref(),
+                image_brush_spread_mode(image),
+                image_quality_to_filter_quality(image.sampler.quality),
+                image.sampler.alpha * opacity,
+                affine_to_skia(brush_transform.unwrap_or(Affine::IDENTITY)),
+            ),
+            blend_mode,
+            ..Default::default()
+        };
+        self.pixmap
+            .stroke_path(&path, &paint, &stroke, self.skia_transform(), clip_mask);
     }
 
     fn skia_transform(&self) -> Transform {
@@ -1641,11 +1871,26 @@ impl Layer<'_> {
         blend_mode: TinyBlendMode,
     ) {
         let path = try_ret!(shape_to_path(shape));
-        let paint = try_ret!(brush_to_paint(brush, brush_transform, opacity, blend_mode));
+        let brush = brush.into();
+        if let BrushRef::Image(image) = brush {
+            let image_pixmap = try_ret!(image_brush_pixmap(&image));
+            self.stroke_image_with_pixmap_and_mode(
+                shape,
+                &image_pixmap,
+                &image,
+                stroke,
+                brush_transform,
+                opacity,
+                blend_mode,
+            );
+            return;
+        }
+
         self.mark_stroke_bounds(shape, stroke);
         let stroke = kurbo_stroke_to_tiny_stroke(stroke);
         self.materialize_simple_clip_mask();
         let clip_mask = self.clip.is_some().then_some(&self.mask);
+        let paint = try_ret!(brush_to_paint(brush, brush_transform, opacity, blend_mode));
         self.pixmap
             .stroke_path(&path, &paint, &stroke, self.skia_transform(), clip_mask);
     }
@@ -1679,42 +1924,15 @@ impl Layer<'_> {
     ) {
         let brush = brush.into();
         if let BrushRef::Image(image) = brush {
-            if self.try_fill_image_fallback(shape, &image, brush_transform, opacity, blend_mode) {
-                return;
-            }
             let image_pixmap = try_ret!(image_brush_pixmap(&image));
-            let paint = Paint {
-                shader: Pattern::new(
-                    image_pixmap.as_ref(),
-                    image_brush_spread_mode(&image),
-                    image_quality_to_filter_quality(image.sampler.quality),
-                    image.sampler.alpha * opacity,
-                    affine_to_skia(brush_transform.unwrap_or(Affine::IDENTITY)),
-                ),
+            self.fill_image_with_pixmap_and_mode(
+                shape,
+                &image_pixmap,
+                &image,
+                brush_transform,
+                opacity,
                 blend_mode,
-                ..Default::default()
-            };
-            self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
-            if let Some(rect) = shape.as_rect() {
-                if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
-                    let rect = try_ret!(to_skia_rect(rect));
-                    self.materialize_simple_clip_mask();
-                    let clip_mask = self.clip.is_some().then_some(&self.mask);
-                    self.pixmap
-                        .fill_rect(rect, &paint, self.skia_transform(), clip_mask);
-                }
-            } else {
-                let path = try_ret!(shape_to_path(shape));
-                self.materialize_simple_clip_mask();
-                let clip_mask = self.clip.is_some().then_some(&self.mask);
-                self.pixmap.fill_path(
-                    &path,
-                    &paint,
-                    FillRule::Winding,
-                    self.skia_transform(),
-                    clip_mask,
-                );
-            }
+            );
             return;
         }
 
@@ -2356,6 +2574,51 @@ impl<'a> TinySkiaRendererImpl<'a> {
         }
     }
 
+    fn fill_image_geometry_with_mode(
+        layer: &mut Layer<'_>,
+        shape: &imaging::GeometryRef<'_>,
+        image_pixmap: &Pixmap,
+        image: &peniko::ImageBrush,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) {
+        match shape {
+            imaging::GeometryRef::Rect(rect) => layer.fill_image_with_pixmap_and_mode(
+                rect,
+                image_pixmap,
+                image,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+            imaging::GeometryRef::RoundedRect(rect) => layer.fill_image_with_pixmap_and_mode(
+                rect,
+                image_pixmap,
+                image,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+            imaging::GeometryRef::Path(path) => layer.fill_image_with_pixmap_and_mode(
+                path,
+                image_pixmap,
+                image,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+            imaging::GeometryRef::OwnedPath(path) => layer.fill_image_with_pixmap_and_mode(
+                path,
+                image_pixmap,
+                image,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+        }
+    }
+
     fn stroke_geometry<'b>(
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
@@ -2416,6 +2679,56 @@ impl<'a> TinySkiaRendererImpl<'a> {
             imaging::GeometryRef::OwnedPath(path) => layer.stroke_with_brush_transform_and_mode(
                 path,
                 brush,
+                stroke,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+        }
+    }
+
+    fn stroke_image_geometry_with_mode(
+        layer: &mut Layer<'_>,
+        shape: &imaging::GeometryRef<'_>,
+        image_pixmap: &Pixmap,
+        image: &peniko::ImageBrush,
+        stroke: &KurboStroke,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) {
+        match shape {
+            imaging::GeometryRef::Rect(rect) => layer.stroke_image_with_pixmap_and_mode(
+                rect,
+                image_pixmap,
+                image,
+                stroke,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+            imaging::GeometryRef::RoundedRect(rect) => layer.stroke_image_with_pixmap_and_mode(
+                rect,
+                image_pixmap,
+                image,
+                stroke,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+            imaging::GeometryRef::Path(path) => layer.stroke_image_with_pixmap_and_mode(
+                path,
+                image_pixmap,
+                image,
+                stroke,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ),
+            imaging::GeometryRef::OwnedPath(path) => layer.stroke_image_with_pixmap_and_mode(
+                path,
+                image_pixmap,
+                image,
                 stroke,
                 brush_transform,
                 opacity,
@@ -2552,10 +2865,49 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
-        if let imaging::GeometryRef::Rect(rect) = draw.shape
-            && let peniko::Brush::Image(image) = &brush
-            && self.try_fill_cached_image_rect(image, rect, &draw)
-        {
+        if let peniko::Brush::Image(image) = &brush {
+            let Some(image_pixmap) = cache_image_pixmap(&mut self.caches, self.cache_color, image)
+            else {
+                return;
+            };
+            if let imaging::GeometryRef::Rect(rect) = draw.shape
+                && self.try_fill_cached_image_rect(image, rect, &draw)
+            {
+                return;
+            }
+
+            if let BlendStrategy::SinglePass(blend_mode) =
+                determine_blend_strategy(&draw.composite.blend)
+            {
+                let layer = self.current_layer_mut();
+                layer.transform = draw.transform;
+                Self::fill_image_geometry_with_mode(
+                    layer,
+                    &draw.shape,
+                    &image_pixmap,
+                    image,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                );
+                return;
+            }
+
+            let Some(mut child) = self.new_composite_child_layer(draw.composite, draw.transform)
+            else {
+                return;
+            };
+            Self::fill_image_geometry_with_mode(
+                &mut child,
+                &draw.shape,
+                &image_pixmap,
+                image,
+                draw.brush_transform,
+                1.0,
+                TinyBlendMode::SourceOver,
+            );
+            let parent = self.current_layer_mut();
+            apply_layer(&child, parent);
             return;
         }
 
@@ -2587,6 +2939,48 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
+        if let peniko::Brush::Image(image) = &brush {
+            let Some(image_pixmap) = cache_image_pixmap(&mut self.caches, self.cache_color, image)
+            else {
+                return;
+            };
+            if let BlendStrategy::SinglePass(blend_mode) =
+                determine_blend_strategy(&draw.composite.blend)
+            {
+                let layer = self.current_layer_mut();
+                layer.transform = draw.transform;
+                Self::stroke_image_geometry_with_mode(
+                    layer,
+                    &draw.shape,
+                    &image_pixmap,
+                    image,
+                    draw.stroke,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                );
+                return;
+            }
+
+            let Some(mut child) = self.new_composite_child_layer(draw.composite, draw.transform)
+            else {
+                return;
+            };
+            Self::stroke_image_geometry_with_mode(
+                &mut child,
+                &draw.shape,
+                &image_pixmap,
+                image,
+                draw.stroke,
+                draw.brush_transform,
+                1.0,
+                TinyBlendMode::SourceOver,
+            );
+            let parent = self.current_layer_mut();
+            apply_layer(&child, parent);
+            return;
+        }
+
         if let BlendStrategy::SinglePass(blend_mode) =
             determine_blend_strategy(&draw.composite.blend)
         {
@@ -3745,6 +4139,87 @@ fn premul_to_rgba_f32(color: PremultipliedColorU8) -> [f32; 4] {
     ]
 }
 
+#[derive(Clone, Copy)]
+struct NearestAxisSample {
+    index: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct BilinearAxisSample {
+    i0: Option<u32>,
+    i1: Option<u32>,
+    t: f32,
+}
+
+fn transparent_premul() -> PremultipliedColorU8 {
+    PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent is valid")
+}
+
+fn premul_from_rgba_f32(rgba: [f32; 4]) -> PremultipliedColorU8 {
+    tiny_skia::Color::from_rgba(
+        rgba[0].clamp(0.0, 1.0),
+        rgba[1].clamp(0.0, 1.0),
+        rgba[2].clamp(0.0, 1.0),
+        rgba[3].clamp(0.0, 1.0),
+    )
+    .expect("sampled image color must be valid")
+    .premultiply()
+    .to_color_u8()
+}
+
+fn nearest_axis_samples(
+    start: f32,
+    step: f32,
+    out_len: u32,
+    source_len: u32,
+    extent: Extend,
+) -> Vec<NearestAxisSample> {
+    let mut value = start;
+    let mut out = Vec::with_capacity(usize_from_u32(out_len));
+    for _ in 0..out_len {
+        let index = extend_image_axis(value.floor(), source_len, extent)
+            .map(|coord| u32::try_from(f32_to_i32(coord.round())).expect("wrapped index fits u32"));
+        out.push(NearestAxisSample { index });
+        value += step;
+    }
+    out
+}
+
+fn bilinear_axis_samples(
+    start: f32,
+    step: f32,
+    out_len: u32,
+    source_len: u32,
+    extent: Extend,
+) -> Vec<BilinearAxisSample> {
+    let mut value = start;
+    let mut out = Vec::with_capacity(usize_from_u32(out_len));
+    for _ in 0..out_len {
+        let pos = value - 0.5;
+        let p0 = pos.floor();
+        let t = pos - p0;
+        let i0 = extend_image_axis(p0, source_len, extent)
+            .map(|coord| u32::try_from(f32_to_i32(coord.round())).expect("wrapped index fits u32"));
+        let i1 = extend_image_axis(p0 + 1.0, source_len, extent)
+            .map(|coord| u32::try_from(f32_to_i32(coord.round())).expect("wrapped index fits u32"));
+        out.push(BilinearAxisSample { i0, i1, t });
+        value += step;
+    }
+    out
+}
+
+fn pixmap_pixel_or_transparent(
+    pixels: &[PremultipliedColorU8],
+    width: usize,
+    x: Option<u32>,
+    y: Option<u32>,
+) -> PremultipliedColorU8 {
+    match (x, y) {
+        (Some(x), Some(y)) => pixels[usize_from_u32(y) * width + usize_from_u32(x)],
+        _ => transparent_premul(),
+    }
+}
+
 fn sample_image_brush_at<T>(
     pixmap: &Pixmap,
     image: &peniko::ImageBrush<T>,
@@ -3792,15 +4267,7 @@ where
                 let bottom = lerp(c01[i], c11[i], tx);
                 rgba[i] = lerp(top, bottom, ty);
             }
-            tiny_skia::Color::from_rgba(
-                rgba[0].clamp(0.0, 1.0),
-                rgba[1].clamp(0.0, 1.0),
-                rgba[2].clamp(0.0, 1.0),
-                rgba[3].clamp(0.0, 1.0),
-            )
-            .expect("sampled image color must be valid")
-            .premultiply()
-            .to_color_u8()
+            premul_from_rgba_f32(rgba)
         }
         FilterQuality::Bicubic => sample(f64_to_f32(point.x), f64_to_f32(point.y)),
     };
@@ -5226,8 +5693,8 @@ mod tests {
                 Pixmap::new(width, height).expect("failed to create pixmap"),
             ),
             origin: Point::ZERO,
-            clip_stack: vec![],
             base_clip: None,
+            clip_stack: vec![],
             clip: None,
             simple_clip: None,
             draw_bounds: None,
