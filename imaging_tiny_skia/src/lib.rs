@@ -1530,21 +1530,19 @@ impl Layer<'_> {
             .stroke_path(&path, &paint, &stroke, self.skia_transform(), clip_mask);
     }
 
-    fn fill<'b>(&mut self, shape: &impl Shape, brush: impl Into<BrushRef<'b>>, blur_radius: f64) {
-        self.fill_with_brush_transform(shape, brush, blur_radius, None);
+    fn fill<'b>(&mut self, shape: &impl Shape, brush: impl Into<BrushRef<'b>>) {
+        self.fill_with_brush_transform(shape, brush, None);
     }
 
     fn fill_with_brush_transform<'b>(
         &mut self,
         shape: &impl Shape,
         brush: impl Into<BrushRef<'b>>,
-        blur_radius: f64,
         brush_transform: Option<Affine>,
     ) {
         self.fill_with_brush_transform_and_mode(
             shape,
             brush,
-            blur_radius,
             brush_transform,
             1.0,
             TinyBlendMode::SourceOver,
@@ -1555,13 +1553,10 @@ impl Layer<'_> {
         &mut self,
         shape: &impl Shape,
         brush: impl Into<BrushRef<'b>>,
-        blur_radius: f64,
         brush_transform: Option<Affine>,
         opacity: f32,
         blend_mode: TinyBlendMode,
     ) {
-        let _ = blur_radius;
-
         let brush = brush.into();
         if let BrushRef::Image(image) = brush {
             let image_pixmap = try_ret!(image_brush_pixmap(&image));
@@ -1719,13 +1714,170 @@ fn translate_clip_path(clip: &ClipPath, dx: f64, dy: f64) -> ClipPath {
     }
 }
 
-fn translate_clip_paths(clips: &[ClipPath], dx: f64, dy: f64) -> Vec<ClipPath> {
-    clips.iter()
-        .map(|clip| translate_clip_path(clip, dx, dy))
-        .collect()
+fn translate_clip_path_in_place(clip: &mut ClipPath, dx: f64, dy: f64) {
+    *clip = translate_clip_path(clip, dx, dy);
+}
+
+fn translate_clip_paths_in_place(clips: &mut [ClipPath], dx: f64, dy: f64) {
+    for clip in clips {
+        translate_clip_path_in_place(clip, dx, dy);
+    }
 }
 
 impl<'a> TinySkiaRendererImpl<'a> {
+    fn default_group_clip(&self) -> Option<ClipPath> {
+        let rect = self.canvas_size().to_rect();
+        self.clip_path_for_geometry(imaging::GeometryRef::Rect(rect), Affine::IDENTITY)
+    }
+
+    fn group_clip_path(&self, clip: Option<ClipRef<'_>>) -> Option<ClipPath> {
+        match clip {
+            Some(clip) => self.clip_path_for_clip(clip),
+            None => self.default_group_clip(),
+        }
+    }
+
+    fn pending_group_mask(
+        &self,
+        mask: Option<imaging::AppliedMaskRef<'_>>,
+    ) -> Option<PendingGroupMask> {
+        mask.map(|mask| PendingGroupMask {
+            scene: mask.mask.scene.clone(),
+            transform: mask.transform,
+            mode: mask.mask.mode,
+        })
+    }
+
+    fn build_group_child_layer(
+        &self,
+        composite: Composite,
+        filters: &[Filter],
+        group_mask: Option<PendingGroupMask>,
+        clip: ClipPath,
+    ) -> Option<Layer<'static>> {
+        let parent_origin = self.current_layer().origin;
+        let clip = translate_clip_path(&clip, parent_origin.x, parent_origin.y);
+        let mut inherited_clips = self.current_layer().effective_clips_in_root();
+        let mut group_bounds = clip.rect;
+        for inherited in &inherited_clips {
+            group_bounds = group_bounds.intersect(inherited.rect);
+        }
+        group_bounds = group_bounds.intersect(self.canvas_size().to_rect());
+        let group_bounds = rect_to_int_rect(group_bounds)?;
+        let group_origin = Point::new(f64::from(group_bounds.x()), f64::from(group_bounds.y()));
+        let clip = translate_clip_path(&clip, -group_origin.x, -group_origin.y);
+        translate_clip_paths_in_place(&mut inherited_clips, -group_origin.x, -group_origin.y);
+        let mut child = Layer::new_with_base_clip(
+            composite.blend,
+            composite.alpha,
+            clip,
+            group_origin,
+            group_bounds.width(),
+            group_bounds.height(),
+        )
+        .ok()?;
+        child.rebuild_clip_mask_with_extra_clips(&inherited_clips);
+        child.group_mask = group_mask;
+        child.filters = filters.to_vec();
+        Some(child)
+    }
+
+    fn finish_popped_group(&mut self, mut child: Layer<'_>) {
+        let mask_bounds = child
+            .group_mask
+            .as_ref()
+            .and_then(|_| group_mask_bounds(&child));
+
+        if self.try_pop_group_with_localized_mask(&mut child, mask_bounds) {
+            return;
+        }
+
+        self.apply_deferred_group_mask(&mut child, mask_bounds);
+        apply_group_filters(&mut child);
+        let parent = self.current_layer_mut();
+        apply_layer(&child, parent);
+    }
+
+    fn try_pop_group_with_localized_mask(
+        &mut self,
+        child: &mut Layer<'_>,
+        mask_bounds: Option<IntRect>,
+    ) -> bool {
+        if !child.filters.is_empty() {
+            return false;
+        }
+        let Some(group_mask) = child.group_mask.take() else {
+            return false;
+        };
+        let Some(bounds) = mask_bounds else {
+            return false;
+        };
+        let BlendStrategy::SinglePass(blend_mode) = determine_blend_strategy(&child.blend_mode) else {
+            child.group_mask = Some(group_mask);
+            return false;
+        };
+        let Some(local_bounds) = root_rect_to_local_int_rect(child, bounds) else {
+            child.group_mask = Some(group_mask);
+            return false;
+        };
+        let Some(mut localized_child) = clone_pixmap_region(child.pixmap.as_ref(), local_bounds) else {
+            child.group_mask = Some(group_mask);
+            return false;
+        };
+        let Some(localized_mask) = self.realize_group_mask(
+            &group_mask.scene,
+            group_mask.mode,
+            group_mask.transform,
+            bounds,
+        ) else {
+            child.group_mask = Some(group_mask);
+            return false;
+        };
+
+        let local_bounds = IntRect::from_xywh(
+            0,
+            0,
+            localized_mask.bounds.width(),
+            localized_mask.bounds.height(),
+        )
+        .expect("localized mask bounds must be valid");
+        apply_group_mask_to_pixmap(
+            &mut localized_child,
+            &GroupMask {
+                bounds: local_bounds,
+                coverage: localized_mask.coverage,
+            },
+        );
+        let parent = self.current_layer_mut();
+        draw_layer_pixmap(
+            &localized_child,
+            bounds.x(),
+            bounds.y(),
+            parent,
+            blend_mode,
+            child.alpha,
+        );
+        true
+    }
+
+    fn apply_deferred_group_mask(&mut self, child: &mut Layer<'_>, mask_bounds: Option<IntRect>) {
+        let Some(group_mask) = child.group_mask.take() else {
+            return;
+        };
+        let Some(bounds) = mask_bounds else {
+            return;
+        };
+        let Some(localized_mask) = self.realize_group_mask(
+            &group_mask.scene,
+            group_mask.mode,
+            group_mask.transform,
+            bounds,
+        ) else {
+            return;
+        };
+        apply_group_mask(child, &localized_mask);
+    }
+
     fn lookup_cached_mask(
         &mut self,
         scene: &Scene,
@@ -1963,21 +2115,20 @@ impl<'a> TinySkiaRendererImpl<'a> {
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         brush: impl Into<BrushRef<'b>>,
-        blur_radius: f64,
         brush_transform: Option<Affine>,
     ) {
         match shape {
             imaging::GeometryRef::Rect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, blur_radius, brush_transform);
+                layer.fill_with_brush_transform(rect, brush, brush_transform);
             }
             imaging::GeometryRef::RoundedRect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, blur_radius, brush_transform);
+                layer.fill_with_brush_transform(rect, brush, brush_transform);
             }
             imaging::GeometryRef::Path(path) => {
-                layer.fill_with_brush_transform(path, brush, blur_radius, brush_transform);
+                layer.fill_with_brush_transform(path, brush, brush_transform);
             }
             imaging::GeometryRef::OwnedPath(path) => {
-                layer.fill_with_brush_transform(path, brush, blur_radius, brush_transform);
+                layer.fill_with_brush_transform(path, brush, brush_transform);
             }
         }
     }
@@ -1986,7 +2137,6 @@ impl<'a> TinySkiaRendererImpl<'a> {
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         brush: impl Into<BrushRef<'b>>,
-        blur_radius: f64,
         brush_transform: Option<Affine>,
         opacity: f32,
         blend_mode: TinyBlendMode,
@@ -1995,7 +2145,6 @@ impl<'a> TinySkiaRendererImpl<'a> {
             imaging::GeometryRef::Rect(rect) => layer.fill_with_brush_transform_and_mode(
                 rect,
                 brush,
-                blur_radius,
                 brush_transform,
                 opacity,
                 blend_mode,
@@ -2003,7 +2152,6 @@ impl<'a> TinySkiaRendererImpl<'a> {
             imaging::GeometryRef::RoundedRect(rect) => layer.fill_with_brush_transform_and_mode(
                 rect,
                 brush,
-                blur_radius,
                 brush_transform,
                 opacity,
                 blend_mode,
@@ -2011,7 +2159,6 @@ impl<'a> TinySkiaRendererImpl<'a> {
             imaging::GeometryRef::Path(path) => layer.fill_with_brush_transform_and_mode(
                 path,
                 brush,
-                blur_radius,
                 brush_transform,
                 opacity,
                 blend_mode,
@@ -2019,7 +2166,6 @@ impl<'a> TinySkiaRendererImpl<'a> {
             imaging::GeometryRef::OwnedPath(path) => layer.fill_with_brush_transform_and_mode(
                 path,
                 brush,
-                blur_radius,
                 brush_transform,
                 opacity,
                 blend_mode,
@@ -2171,49 +2317,14 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
-        let clip = match group.clip {
-            Some(clip) => self.clip_path_for_clip(clip),
-            None => {
-                let rect = self.canvas_size().to_rect();
-                self.clip_path_for_geometry(imaging::GeometryRef::Rect(rect), Affine::IDENTITY)
-            }
-        };
-
-        if let Some(clip) = clip {
-            let parent_origin = self.current_layer().origin;
-            let clip = translate_clip_path(&clip, parent_origin.x, parent_origin.y);
-            let inherited_clips = self.current_layer().effective_clips_in_root();
-            let mut group_bounds = clip.rect;
-            for inherited in &inherited_clips {
-                group_bounds = group_bounds.intersect(inherited.rect);
-            }
-            let canvas_bounds = self.canvas_size().to_rect();
-            group_bounds = group_bounds.intersect(canvas_bounds);
-            let Some(group_bounds) = rect_to_int_rect(group_bounds) else {
-                return;
-            };
-            let group_origin = Point::new(f64::from(group_bounds.x()), f64::from(group_bounds.y()));
-            let clip = translate_clip_path(&clip, -group_origin.x, -group_origin.y);
-            let inherited_clips =
-                translate_clip_paths(&inherited_clips, -group_origin.x, -group_origin.y);
-            let group_mask = group.mask.map(|mask| PendingGroupMask {
-                scene: mask.mask.scene.clone(),
-                transform: mask.transform,
-                mode: mask.mask.mode,
-            });
-            let Ok(mut child) = Layer::new_with_base_clip(
-                group.composite.blend,
-                group.composite.alpha,
+        if let Some(clip) = self.group_clip_path(group.clip)
+            && let Some(child) = self.build_group_child_layer(
+                group.composite,
+                group.filters,
+                self.pending_group_mask(group.mask),
                 clip,
-                group_origin,
-                group_bounds.width(),
-                group_bounds.height(),
-            ) else {
-                return;
-            };
-            child.rebuild_clip_mask_with_extra_clips(&inherited_clips);
-            child.group_mask = group_mask;
-            child.filters = group.filters.to_vec();
+            )
+        {
             self.layers.push(child);
         }
     }
@@ -2222,74 +2333,14 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
         if self.layers.len() <= 1 {
             return;
         }
-        let mut child = self.layers.pop().expect("checked layer depth");
-        let mask_bounds = child
-            .group_mask
-            .as_ref()
-            .and_then(|_| group_mask_bounds(&child));
-
-        if child.filters.is_empty()
-            && let Some(group_mask) = child.group_mask.take()
-            && let Some(bounds) = mask_bounds
-            && let BlendStrategy::SinglePass(blend_mode) =
-                determine_blend_strategy(&child.blend_mode)
-            && let Some(local_bounds) = root_rect_to_local_int_rect(&child, bounds)
-            && let Some(mut localized_child) =
-                clone_pixmap_region(child.pixmap.as_ref(), local_bounds)
-            && let Some(localized_mask) = self.realize_group_mask(
-                &group_mask.scene,
-                group_mask.mode,
-                group_mask.transform,
-                bounds,
-            )
-        {
-            let local_bounds = IntRect::from_xywh(
-                0,
-                0,
-                localized_mask.bounds.width(),
-                localized_mask.bounds.height(),
-            )
-            .expect("localized mask bounds must be valid");
-            apply_group_mask_to_pixmap(
-                &mut localized_child,
-                &GroupMask {
-                    bounds: local_bounds,
-                    coverage: localized_mask.coverage,
-                },
-            );
-            let parent = self.current_layer_mut();
-            draw_layer_pixmap(
-                &localized_child,
-                bounds.x(),
-                bounds.y(),
-                parent,
-                blend_mode,
-                child.alpha,
-            );
-            return;
-        }
-
-        if let Some(group_mask) = child.group_mask.take()
-            && let Some(bounds) = mask_bounds
-            && let Some(localized_mask) = self.realize_group_mask(
-                &group_mask.scene,
-                group_mask.mode,
-                group_mask.transform,
-                bounds,
-            )
-        {
-            apply_group_mask(&mut child, &localized_mask);
-        }
-        apply_group_filters(&mut child);
-        let parent = self.current_layer_mut();
-        apply_layer(&child, parent);
+        let child = self.layers.pop().expect("checked layer depth");
+        self.finish_popped_group(child);
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
-        let blur_radius = 0.0;
         if let imaging::GeometryRef::Rect(rect) = draw.shape
             && let peniko::Brush::Image(image) = &brush
             && self.try_fill_cached_image_rect(image, rect, &draw)
@@ -2306,7 +2357,6 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
                 layer,
                 &draw.shape,
                 &brush,
-                blur_radius,
                 draw.brush_transform,
                 draw.composite.alpha,
                 blend_mode,
@@ -2318,7 +2368,7 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
         let brush_transform = draw.brush_transform;
         self.draw_with_composite(draw.composite, |layer| {
             layer.transform = transform;
-            Self::fill_geometry(layer, &draw.shape, &brush, blur_radius, brush_transform);
+            Self::fill_geometry(layer, &draw.shape, &brush, brush_transform);
         });
     }
 
@@ -2389,7 +2439,7 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
             return;
         };
         let shape = draw.rect.to_rounded_rect(draw.radius);
-        child.fill(&shape, draw.color, 0.0);
+        child.fill(&shape, draw.color);
         child.filters.push(Filter::Blur {
             std_deviation_x: f64_to_f32(draw.std_dev),
             std_deviation_y: f64_to_f32(draw.std_dev),
@@ -3963,6 +4013,40 @@ fn draw_layer_region_at(
     draw_layer_pixmap(&cropped, x, y, parent, blend_mode, alpha);
 }
 
+struct LocalPixmapRegion {
+    bounds: IntRect,
+    pixmap: Pixmap,
+}
+
+impl LocalPixmapRegion {
+    fn extract(pixmap: PixmapRef<'_>, bounds: IntRect) -> Option<Self> {
+        Some(Self {
+            bounds,
+            pixmap: pixmap.clone_rect(bounds)?,
+        })
+    }
+
+    fn place_into_full_size(self, target_width: u32, target_height: u32) -> Option<Pixmap> {
+        let mut output = Pixmap::new(target_width, target_height)?;
+        let origin_x = usize::try_from(self.bounds.x()).expect("origin_x fits usize");
+        let origin_y = usize::try_from(self.bounds.y()).expect("origin_y fits usize");
+        let target_stride = usize_from_u32(target_width) * 4;
+        let local_stride = usize_from_u32(self.pixmap.width()) * 4;
+        let local_height = usize_from_u32(self.pixmap.height());
+        let src = self.pixmap.data();
+        let dst = output.data_mut();
+
+        for row in 0..local_height {
+            let src_start = row * local_stride;
+            let src_end = src_start + local_stride;
+            let dst_start = (origin_y + row) * target_stride + origin_x * 4;
+            let dst_end = dst_start + local_stride;
+            dst[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
+        }
+        Some(output)
+    }
+}
+
 fn clone_pixmap_region(pixmap: PixmapRef<'_>, bounds: IntRect) -> Option<Pixmap> {
     pixmap.clone_rect(bounds)
 }
@@ -4317,32 +4401,6 @@ fn pixmap_region_bounds(pixmap: &Pixmap, rect: Rect) -> Option<IntRect> {
     rect_to_int_rect(bounds)
 }
 
-fn draw_local_pixmap(
-    target_width: u32,
-    target_height: u32,
-    origin_x: i32,
-    origin_y: i32,
-    local: &Pixmap,
-) -> Option<Pixmap> {
-    let mut output = Pixmap::new(target_width, target_height)?;
-    let origin_x = usize::try_from(origin_x).expect("origin_x fits usize");
-    let origin_y = usize::try_from(origin_y).expect("origin_y fits usize");
-    let target_stride = usize_from_u32(target_width) * 4;
-    let local_stride = usize_from_u32(local.width()) * 4;
-    let local_height = usize_from_u32(local.height());
-    let src = local.data();
-    let dst = output.data_mut();
-
-    for row in 0..local_height {
-        let src_start = row * local_stride;
-        let src_end = src_start + local_stride;
-        let dst_start = (origin_y + row) * target_stride + origin_x * 4;
-        let dst_end = dst_start + local_stride;
-        dst[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
-    }
-    Some(output)
-}
-
 fn blur_pixmap_local(
     pixmap: &Pixmap,
     bounds: Option<Rect>,
@@ -4353,15 +4411,9 @@ fn blur_pixmap_local(
         return blur_pixmap(pixmap, sigma_x, sigma_y);
     };
     let region = pixmap_region_bounds(pixmap, blur_bounds(bounds, sigma_x, sigma_y))?;
-    let local = pixmap.clone_rect(region)?;
-    let blurred = blur_pixmap(&local, sigma_x, sigma_y)?;
-    draw_local_pixmap(
-        pixmap.width(),
-        pixmap.height(),
-        region.x(),
-        region.y(),
-        &blurred,
-    )
+    let mut local = LocalPixmapRegion::extract(pixmap.as_ref(), region)?;
+    local.pixmap = blur_pixmap(&local.pixmap, sigma_x, sigma_y)?;
+    local.place_into_full_size(pixmap.width(), pixmap.height())
 }
 
 fn drop_shadow_pixmap_local(
@@ -4380,15 +4432,9 @@ fn drop_shadow_pixmap_local(
     let padded = blur_bounds(bounds, sigma_x, sigma_y);
     let shadow_bounds = translate_rect(padded, f64::from(dx), f64::from(dy));
     let region = pixmap_region_bounds(pixmap, bounds.union(shadow_bounds))?;
-    let local = pixmap.clone_rect(region)?;
-    let shadowed = drop_shadow_pixmap(&local, dx, dy, sigma_x, sigma_y, color)?;
-    draw_local_pixmap(
-        pixmap.width(),
-        pixmap.height(),
-        region.x(),
-        region.y(),
-        &shadowed,
-    )
+    let mut local = LocalPixmapRegion::extract(pixmap.as_ref(), region)?;
+    local.pixmap = drop_shadow_pixmap(&local.pixmap, dx, dy, sigma_x, sigma_y, color)?;
+    local.place_into_full_size(pixmap.width(), pixmap.height())
 }
 
 fn filter_output_bounds(bounds: Option<Rect>, filter: &Filter, pixmap: &Pixmap) -> Option<Rect> {
@@ -4485,6 +4531,37 @@ fn apply_group_filters(layer: &mut Layer<'_>) {
     layer.draw_bounds = bounds;
 }
 
+fn apply_layer_multipass(
+    layer: &Layer<'_>,
+    parent: &mut Layer<'_>,
+    layer_rect: IntRect,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    first_pass: TinyBlendMode,
+    second_pass: TinyBlendMode,
+) {
+    let parent_rect =
+        IntRect::from_xywh(x, y, width, height).expect("parent rect must be valid");
+    let Some(original_parent) = parent.pixmap.clone_rect(parent_rect) else {
+        return;
+    };
+    let Some(coverage) = layer.pixmap.clone_rect(layer_rect) else {
+        return;
+    };
+
+    draw_layer_region_at(parent, layer.pixmap.as_ref(), layer_rect, x, y, first_pass, 1.0);
+
+    let Some(mut intermediate) = parent.pixmap.clone_rect(parent_rect) else {
+        return;
+    };
+    apply_alpha_mask_from_pixmap(&mut intermediate, coverage.as_ref());
+
+    draw_layer_pixmap(&original_parent, x, y, parent, TinyBlendMode::Source, 1.0);
+    draw_layer_pixmap(&intermediate, x, y, parent, second_pass, layer.alpha);
+}
+
 fn apply_layer(layer: &Layer<'_>, parent: &mut Layer<'_>) {
     let Some(composite_rect) = layer_composite_rect(layer, parent) else {
         return;
@@ -4510,36 +4587,17 @@ fn apply_layer(layer: &Layer<'_>, parent: &mut Layer<'_>) {
         BlendStrategy::MultiPass {
             first_pass,
             second_pass,
-        } => {
-            let parent_rect =
-                IntRect::from_xywh(x, y, composite_rect.width(), composite_rect.height())
-                    .expect("parent rect must be valid");
-            let Some(original_parent) = parent.pixmap.clone_rect(parent_rect) else {
-                return;
-            };
-            let Some(coverage) = layer.pixmap.clone_rect(layer_rect) else {
-                return;
-            };
-
-            draw_layer_region_at(
-                parent,
-                layer.pixmap.as_ref(),
-                layer_rect,
-                x,
-                y,
-                first_pass,
-                1.0,
-            );
-
-            let Some(mut intermediate) = parent.pixmap.clone_rect(parent_rect) else {
-                return;
-            };
-            apply_alpha_mask_from_pixmap(&mut intermediate, coverage.as_ref());
-
-            draw_layer_pixmap(&original_parent, x, y, parent, TinyBlendMode::Source, 1.0);
-
-            draw_layer_pixmap(&intermediate, x, y, parent, second_pass, layer.alpha);
-        }
+        } => apply_layer_multipass(
+            layer,
+            parent,
+            layer_rect,
+            x,
+            y,
+            composite_rect.width(),
+            composite_rect.height(),
+            first_pass,
+            second_pass,
+        ),
     }
 }
 
@@ -4750,11 +4808,7 @@ mod tests {
         let mut parent = make_layer(8, 8);
         let mut child = make_layer(8, 8);
 
-        child.fill(
-            &Rect::new(2.0, 2.0, 4.0, 4.0),
-            Color::from_rgb8(255, 0, 0),
-            0.0,
-        );
+        child.fill(&Rect::new(2.0, 2.0, 4.0, 4.0), Color::from_rgb8(255, 0, 0));
 
         apply_layer(&child, &mut parent);
         assert!(parent.draw_bounds.is_some());
@@ -4784,7 +4838,7 @@ mod tests {
     #[test]
     fn apply_group_filters_expands_blur_beyond_original_draw_bounds() {
         let mut layer = make_layer(32, 32);
-        layer.fill(&Rect::new(12.0, 12.0, 20.0, 20.0), Color::BLACK, 0.0);
+        layer.fill(&Rect::new(12.0, 12.0, 20.0, 20.0), Color::BLACK);
         layer.filters.push(Filter::Blur {
             std_deviation_x: 3.0,
             std_deviation_y: 3.0,
@@ -4820,11 +4874,7 @@ mod tests {
     #[test]
     fn multipass_blend_respects_non_rect_clip_coverage() {
         let mut parent = make_layer(8, 8);
-        parent.fill(
-            &Rect::new(0.0, 0.0, 8.0, 8.0),
-            Color::from_rgb8(0, 0, 255),
-            0.0,
-        );
+        parent.fill(&Rect::new(0.0, 0.0, 8.0, 8.0), Color::from_rgb8(0, 0, 255));
 
         let mut child = make_layer(8, 8);
         child.blend_mode = BlendMode {
@@ -4845,11 +4895,7 @@ mod tests {
             simple_rect: None,
         }));
 
-        child.fill(
-            &Rect::new(0.0, 0.0, 6.0, 6.0),
-            Color::from_rgb8(255, 0, 0),
-            0.0,
-        );
+        child.fill(&Rect::new(0.0, 0.0, 6.0, 6.0), Color::from_rgb8(255, 0, 0));
 
         apply_layer(&child, &mut parent);
 
@@ -4897,13 +4943,12 @@ mod tests {
         ]);
 
         let mut plain = make_layer(8, 2);
-        plain.fill(&Rect::new(0.0, 0.0, 8.0, 2.0), &gradient, 0.0);
+        plain.fill(&Rect::new(0.0, 0.0, 8.0, 2.0), &gradient);
 
         let mut transformed = make_layer(8, 2);
         transformed.fill_with_brush_transform(
             &Rect::new(0.0, 0.0, 8.0, 2.0),
             &gradient,
-            0.0,
             Some(Affine::translate((2.0, 0.0))),
         );
 
@@ -4993,7 +5038,7 @@ mod tests {
             .with_interpolation_cs(ColorSpaceTag::Oklab)
             .with_stops([(0.0, css::RED), (1.0, css::BLUE)]);
 
-        layer.fill(&Rect::new(0.0, 0.0, 101.0, 1.0), &gradient, 0.0);
+        layer.fill(&Rect::new(0.0, 0.0, 101.0, 1.0), &gradient);
 
         let rendered = pixel_rgba(&layer, 50, 0);
         let expected_oklab = interpolated_midpoint(
@@ -5021,7 +5066,7 @@ mod tests {
             .with_hue_direction(HueDirection::Longer)
             .with_stops([(0.0, css::RED), (1.0, css::BLUE)]);
 
-        layer.fill(&Rect::new(0.0, 0.0, 101.0, 1.0), &gradient, 0.0);
+        layer.fill(&Rect::new(0.0, 0.0, 101.0, 1.0), &gradient);
 
         let rendered = pixel_rgba(&layer, 50, 0);
         let expected_longer = interpolated_midpoint(
