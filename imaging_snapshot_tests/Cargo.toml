@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 imaging = { features = ["std"], workspace = true }
 imaging_skia = { optional = true, workspace = true }
+imaging_tiny_skia = { optional = true, workspace = true }
 imaging_vello = { optional = true, workspace = true }
 imaging_vello_cpu = { optional = true, workspace = true }
 imaging_vello_hybrid = { optional = true, workspace = true }
@@ -32,5 +33,6 @@ pollster = "0.4.0"
 default = []
 vello_cpu = ["dep:imaging_vello_cpu"]
 skia = ["dep:imaging_skia"]
+tiny_skia = ["dep:imaging_tiny_skia"]
 vello_hybrid = ["dep:imaging_vello_hybrid", "dep:vello_hybrid"]
 vello = ["dep:imaging_vello"]

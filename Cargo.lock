@@ -1071,6 +1071,7 @@ version = "0.0.1"
 dependencies = [
  "imaging",
  "imaging_skia",
+ "imaging_tiny_skia",
  "imaging_vello",
  "imaging_vello_cpu",
  "imaging_vello_hybrid",

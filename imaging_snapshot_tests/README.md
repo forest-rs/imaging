@@ -32,6 +32,7 @@ Use the workspace `xtask` wrapper when you want a smoother review flow.
 
 Supported `xtask` backends are:
 - `skia`
+- `tiny_skia`
 - `vello`
 - `vello_cpu`
 - `vello_hybrid`

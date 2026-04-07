@@ -16,17 +16,18 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use imaging::{
-    BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, MaskMode, PaintSink, RgbaImage,
-    StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, MaskMode,
+    PaintSink, RgbaImage, StrokeRef,
     record::{Scene, ValidateError},
     render::{ImageRenderer, RenderSource},
 };
-#[cfg(test)]
-use kurbo::Vec2;
-use kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke as KurboStroke};
+use kurbo::{
+    Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke as KurboStroke, StrokeOpts,
+    Vec2, stroke as kurbo_stroke_outline,
+};
 use peniko::{
     BlendMode, BrushRef, Color, Compose, Extend, Gradient, GradientKind, ImageData, ImageQuality,
-    Mix, RadialGradientPosition,
+    InterpolationAlphaSpace, Mix, RadialGradientPosition,
     color::{self, ColorSpaceTag, DynamicColor, HueDirection, Srgb},
     kurbo::{PathEl, Size},
 };
@@ -34,6 +35,7 @@ use rustc_hash::FxHashMap;
 use std::{
     borrow::Borrow,
     cell::RefCell,
+    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -503,6 +505,7 @@ impl LayerPixmap<'_> {
 
 struct Layer<'a> {
     pixmap: LayerPixmap<'a>,
+    origin: Point,
     base_clip: Option<ClipPath>,
     clip_stack: Vec<ClipPath>,
     /// clip is stored with the transform at the time clip is called
@@ -515,12 +518,43 @@ struct Layer<'a> {
     transform: Affine,
     blend_mode: BlendMode,
     alpha: f32,
-    group_mask: Option<GroupMask>,
+    group_mask: Option<PendingGroupMask>,
+    filters: Vec<Filter>,
+}
+
+struct PendingGroupMask {
+    scene: Scene,
+    transform: Affine,
+    mode: MaskMode,
 }
 
 struct GroupMask {
-    pixmap: Pixmap,
+    bounds: IntRect,
+    coverage: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMask {
+    scene: Scene,
     mode: MaskMode,
+    transform: Affine,
+    bounds: (i32, i32, u32, u32),
+    coverage: Arc<[u8]>,
+}
+
+impl CachedMask {
+    fn matches(
+        &self,
+        scene: &Scene,
+        mode: MaskMode,
+        transform: Affine,
+        bounds: IntRect,
+    ) -> bool {
+        self.scene == *scene
+            && self.mode == mode
+            && self.transform == transform
+            && self.bounds == (bounds.x(), bounds.y(), bounds.width(), bounds.height())
+    }
 }
 impl Layer<'static> {
     fn new_root(width: u32, height: u32) -> Result<Self> {
@@ -528,6 +562,7 @@ impl Layer<'static> {
             pixmap: LayerPixmap::Owned(
                 Pixmap::new(width, height).ok_or(Error::Internal("unable to create pixmap"))?,
             ),
+            origin: Point::ZERO,
             base_clip: None,
             clip_stack: Vec::new(),
             clip: None,
@@ -539,6 +574,7 @@ impl Layer<'static> {
             blend_mode: Mix::Normal.into(),
             alpha: 1.0,
             group_mask: None,
+            filters: Vec::new(),
         })
     }
 
@@ -546,6 +582,7 @@ impl Layer<'static> {
         blend_mode: BlendMode,
         alpha: f32,
         clip: ClipPath,
+        origin: Point,
         width: u32,
         height: u32,
     ) -> Result<Self> {
@@ -553,6 +590,7 @@ impl Layer<'static> {
             pixmap: LayerPixmap::Owned(
                 Pixmap::new(width, height).ok_or(Error::Internal("unable to create pixmap"))?,
             ),
+            origin,
             base_clip: Some(clip),
             clip_stack: Vec::new(),
             clip: None,
@@ -564,6 +602,7 @@ impl Layer<'static> {
             blend_mode,
             alpha,
             group_mask: None,
+            filters: Vec::new(),
         };
         layer.rebuild_clip_mask();
         Ok(layer)
@@ -581,6 +620,7 @@ impl<'a> Layer<'a> {
                 PixmapMut::from_bytes(data, width, height)
                     .ok_or(Error::Internal("unable to wrap target pixmap"))?,
             ),
+            origin: Point::ZERO,
             base_clip: None,
             clip_stack: Vec::new(),
             clip: None,
@@ -592,6 +632,7 @@ impl<'a> Layer<'a> {
             blend_mode: Mix::Normal.into(),
             alpha: 1.0,
             group_mask: None,
+            filters: Vec::new(),
         })
     }
 
@@ -834,20 +875,32 @@ impl<'a> Layer<'a> {
             .collect()
     }
 
-    fn mark_drawn_device_rect(&mut self, rect: Rect) {
-        let mut device_rect = rect;
-        if let Some(clip) = self.clip {
-            device_rect = device_rect.intersect(clip);
+    fn effective_clips_in_root(&self) -> Vec<ClipPath> {
+        self.effective_clips()
+            .into_iter()
+            .map(|clip| translate_clip_path(&clip, self.origin.x, self.origin.y))
+            .collect()
+    }
+
+    fn clip_in_root(&self) -> Option<Rect> {
+        self.clip
+            .map(|clip| translate_rect(clip, self.origin.x, self.origin.y))
+    }
+
+    fn mark_drawn_local_rect(&mut self, rect: Rect) {
+        let mut root_rect = translate_rect(rect, self.origin.x, self.origin.y);
+        if let Some(clip) = self.clip_in_root() {
+            root_rect = root_rect.intersect(clip);
         }
 
-        if device_rect.is_zero_area() {
+        if root_rect.is_zero_area() {
             return;
         }
 
         self.draw_bounds = Some(
             self.draw_bounds
-                .map(|bounds| bounds.union(device_rect))
-                .unwrap_or(device_rect),
+                .map(|bounds| bounds.union(root_rect))
+                .unwrap_or(root_rect),
         );
     }
 
@@ -901,7 +954,7 @@ impl<'a> Layer<'a> {
             return true;
         }
 
-        self.mark_drawn_device_rect(Rect::new(
+        self.mark_drawn_local_rect(Rect::new(
             f64::from(x0),
             f64::from(y0),
             f64::from(x1),
@@ -942,7 +995,7 @@ impl<'a> Layer<'a> {
     }
 
     fn device_transform(&self) -> Affine {
-        self.transform
+        Affine::translate((-self.origin.x, -self.origin.y)) * self.transform
     }
 
     fn intersects_clip(&self, img_rect: Rect, transform: Affine) -> bool {
@@ -953,19 +1006,30 @@ impl<'a> Layer<'a> {
     }
 
     fn mark_drawn_rect_inflated(&mut self, rect: Rect, transform: Affine, pad: f64) {
-        self.mark_drawn_device_rect(transform.transform_rect_bbox(rect).inset(-pad));
+        let mut root_rect = transform.transform_rect_bbox(rect).inset(-pad);
+        if let Some(clip) = self.clip_in_root() {
+            root_rect = root_rect.intersect(clip);
+        }
+        if root_rect.is_zero_area() {
+            return;
+        }
+        self.draw_bounds = Some(
+            self.draw_bounds
+                .map(|bounds| bounds.union(root_rect))
+                .unwrap_or(root_rect),
+        );
     }
 
     fn mark_stroke_bounds(&mut self, shape: &impl Shape, stroke: &KurboStroke) {
-        if let Some(clip) = self.clip {
-            self.mark_drawn_device_rect(clip);
+        if let Some(clip) = self.clip_in_root() {
+            self.mark_drawn_rect_inflated(clip, Affine::IDENTITY, 0.0);
             return;
         }
 
         let stroke_pad = stroke.width + stroke.miter_limit.max(1.0) + 4.0;
         self.mark_drawn_rect_inflated(
             shape.bounding_box().inset(-stroke_pad),
-            self.device_transform(),
+            self.transform,
             4.0,
         );
     }
@@ -990,7 +1054,11 @@ impl<'a> Layer<'a> {
             return true;
         }
 
-        self.mark_drawn_rect_inflated(rect, Affine::IDENTITY, 2.0);
+        self.mark_drawn_rect_inflated(
+            translate_rect(rect, self.origin.x, self.origin.y),
+            Affine::IDENTITY,
+            2.0,
+        );
         if quality == FilterQuality::Nearest && self.blit_pixmap_source_over(pixmap, draw_x, draw_y)
         {
             return true;
@@ -1229,6 +1297,159 @@ impl<'a> Layer<'a> {
         );
     }
 
+    fn try_fill_gradient_fallback(
+        &mut self,
+        shape: &impl Shape,
+        gradient: &Gradient,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) -> bool {
+        let stops = expand_gradient_stops(gradient, opacity);
+        if stops.is_empty() {
+            return true;
+        }
+        let kind = gradient.kind;
+        let needs_fallback = match kind {
+            GradientKind::Sweep(_) => true,
+            GradientKind::Radial(radial) => radial.start_radius > 0.0,
+            GradientKind::Linear(_) => false,
+        };
+        if !needs_fallback {
+            return false;
+        }
+        let Some(path) = shape_to_path(shape) else {
+            return false;
+        };
+
+        let device_bounds = self.device_transform().transform_rect_bbox(shape.bounding_box());
+        let device_bounds = self.clip.map_or(device_bounds, |clip| clip.intersect(device_bounds));
+        let Some(bounds) = rect_to_int_rect(device_bounds) else {
+            return true;
+        };
+        let x0 = bounds.x().max(0);
+        let y0 = bounds.y().max(0);
+        let x1 = (bounds.x() + i32::try_from(bounds.width()).expect("width fits in i32")).min(
+            i32::try_from(self.pixmap.width()).expect("pixmap width fits in i32"),
+        );
+        let y1 = (bounds.y() + i32::try_from(bounds.height()).expect("height fits in i32")).min(
+            i32::try_from(self.pixmap.height()).expect("pixmap height fits in i32"),
+        );
+        if x0 >= x1 || y0 >= y1 {
+            return true;
+        }
+
+        let local_width = u32::try_from(x1 - x0).expect("local width fits u32");
+        let local_height = u32::try_from(y1 - y0).expect("local height fits u32");
+        let mut coverage = match Mask::new(local_width, local_height) {
+            Some(mask) => mask,
+            None => return false,
+        };
+        coverage.fill_path(
+            &path,
+            FillRule::Winding,
+            true,
+            self.skia_transform()
+                .post_translate(-(x0 as f32), -(y0 as f32)),
+        );
+
+        let mut pixmap = match Pixmap::new(local_width, local_height) {
+            Some(pixmap) => pixmap,
+            None => return false,
+        };
+        let sample_transform = brush_transform.unwrap_or(Affine::IDENTITY).inverse();
+        let sample_origin = sample_transform * Point::new(f64::from(x0) + 0.5, f64::from(y0) + 0.5);
+        let sample_dx = Vec2::new(sample_transform.as_coeffs()[0], sample_transform.as_coeffs()[1]);
+        let sample_dy = Vec2::new(sample_transform.as_coeffs()[2], sample_transform.as_coeffs()[3]);
+        let coverage_data = coverage.data();
+        let pixels = pixmap.pixels_mut();
+        let stride = usize_from_u32(local_width);
+        match kind {
+            GradientKind::Sweep(sweep) => {
+                let prepared = PreparedSweep::new(sweep);
+                let sweep_lut = build_expanded_gradient_lut_256(&stops, gradient.extend);
+                let (mut row_x, mut row_y) = prepared.project_point(sample_origin);
+                let (step_x_x, step_x_y) = prepared.project_delta(sample_dx);
+                let (step_y_x, step_y_y) = prepared.project_delta(sample_dy);
+                for local_y in 0..local_height {
+                    let mut x = row_x;
+                    let mut y = row_y;
+                    for local_x in 0..local_width {
+                        let idx = usize_from_u32(local_y) * stride + usize_from_u32(local_x);
+                        let coverage_alpha = coverage_data[idx];
+                        if coverage_alpha != 0 {
+                            let t = prepared.sample(x, y);
+                            let color = sweep_lut[sweep_lut_index_256(gradient.extend, t)];
+                            let rgba = color.to_color_u8();
+                            pixels[idx] = tiny_skia::Color::from_rgba8(
+                                rgba.red(),
+                                rgba.green(),
+                                rgba.blue(),
+                                mul_div_255(rgba.alpha(), coverage_alpha),
+                            )
+                            .premultiply()
+                            .to_color_u8();
+                        }
+                        x += step_x_x;
+                        y += step_x_y;
+                    }
+                    row_x += step_y_x;
+                    row_y += step_y_y;
+                }
+            }
+            GradientKind::Radial(radial) => {
+                let prepared = prepare_two_point_radial(radial);
+                let radial_lut = build_original_gradient_lut_1024(gradient, opacity);
+                let (mut row_x, mut row_y) = prepared.project_point(sample_origin);
+                let (step_x_x, step_x_y) = prepared.project_delta(sample_dx);
+                let (step_y_x, step_y_y) = prepared.project_delta(sample_dy);
+                for local_y in 0..local_height {
+                    let mut x = row_x;
+                    let mut y = row_y;
+                    for local_x in 0..local_width {
+                        let idx = usize_from_u32(local_y) * stride + usize_from_u32(local_x);
+                        let coverage_alpha = coverage_data[idx];
+                        if coverage_alpha != 0 {
+                            let t = prepared.sample(x, y);
+                            let color = radial_lut[gradient_lut_index_1024(gradient.extend, t)];
+                            let rgba = color.to_color_u8();
+                            pixels[idx] = tiny_skia::Color::from_rgba8(
+                                rgba.red(),
+                                rgba.green(),
+                                rgba.blue(),
+                                mul_div_255(rgba.alpha(), coverage_alpha),
+                            )
+                            .premultiply()
+                            .to_color_u8();
+                        }
+                        x += step_x_x;
+                        y += step_x_y;
+                    }
+                    row_x += step_y_x;
+                    row_y += step_y_y;
+                }
+            }
+            GradientKind::Linear(_) => unreachable!("checked unsupported fallback kinds"),
+        }
+
+        self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
+        self.materialize_simple_clip_mask();
+        let clip_mask = self.clip.is_some().then_some(&self.mask);
+        self.pixmap.draw_pixmap(
+            x0,
+            y0,
+            pixmap.as_ref(),
+            &PixmapPaint {
+                opacity: 1.0,
+                blend_mode,
+                quality: FilterQuality::Nearest,
+            },
+            Transform::identity(),
+            clip_mask,
+        );
+        true
+    }
+
     fn skia_transform(&self) -> Transform {
         skia_transform(self.device_transform())
     }
@@ -1253,8 +1474,27 @@ impl Layer<'_> {
         stroke: &'s KurboStroke,
         brush_transform: Option<Affine>,
     ) {
+        self.stroke_with_brush_transform_and_mode(
+            shape,
+            brush,
+            stroke,
+            brush_transform,
+            1.0,
+            TinyBlendMode::SourceOver,
+        );
+    }
+
+    fn stroke_with_brush_transform_and_mode<'b, 's>(
+        &mut self,
+        shape: &impl Shape,
+        brush: impl Into<BrushRef<'b>>,
+        stroke: &'s KurboStroke,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) {
         let path = try_ret!(shape_to_path(shape));
-        let paint = try_ret!(brush_to_paint(brush, brush_transform));
+        let paint = try_ret!(brush_to_paint(brush, brush_transform, opacity, blend_mode));
         self.mark_stroke_bounds(shape, stroke);
         let line_cap = match stroke.end_cap {
             Cap::Butt => LineCap::Butt,
@@ -1295,6 +1535,25 @@ impl Layer<'_> {
         _blur_radius: f64,
         brush_transform: Option<Affine>,
     ) {
+        self.fill_with_brush_transform_and_mode(
+            shape,
+            brush,
+            _blur_radius,
+            brush_transform,
+            1.0,
+            TinyBlendMode::SourceOver,
+        );
+    }
+
+    fn fill_with_brush_transform_and_mode<'b>(
+        &mut self,
+        shape: &impl Shape,
+        brush: impl Into<BrushRef<'b>>,
+        _blur_radius: f64,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) {
         // FIXME: Handle _blur_radius
 
         let brush = brush.into();
@@ -1305,12 +1564,13 @@ impl Layer<'_> {
                     image_pixmap.as_ref(),
                     image_brush_spread_mode(&image),
                     image_quality_to_filter_quality(image.sampler.quality),
-                    image.sampler.alpha,
+                    image.sampler.alpha * opacity,
                     affine_to_skia(brush_transform.unwrap_or(Affine::IDENTITY)),
                 ),
+                blend_mode,
                 ..Default::default()
             };
-            self.mark_drawn_rect_inflated(shape.bounding_box(), self.device_transform(), 2.0);
+            self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
             if let Some(rect) = shape.as_rect() {
                 if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
                     let rect = try_ret!(to_skia_rect(rect));
@@ -1336,13 +1596,27 @@ impl Layer<'_> {
 
         if let Some(rect) = shape.as_rect()
             && let BrushRef::Solid(color) = brush
+            && blend_mode == TinyBlendMode::SourceOver
+            && opacity >= 1.0
             && self.try_fill_solid_rect_fast(rect, color)
         {
             return;
         }
 
-        let paint = try_ret!(brush_to_paint(brush, brush_transform));
-        self.mark_drawn_rect_inflated(shape.bounding_box(), self.device_transform(), 2.0);
+        if let BrushRef::Gradient(gradient) = brush
+            && self.try_fill_gradient_fallback(
+                shape,
+                gradient,
+                brush_transform,
+                opacity,
+                blend_mode,
+            )
+        {
+            return;
+        }
+
+        let paint = try_ret!(brush_to_paint(brush, brush_transform, opacity, blend_mode));
+        self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
         if let Some(rect) = shape.as_rect() {
             if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
                 let rect = try_ret!(to_skia_rect(rect));
@@ -1377,6 +1651,7 @@ pub type TinySkiaCpuTargetRenderer<'a> = TinySkiaTargetRenderer<'a>;
 pub struct TinySkiaRendererImpl<'a> {
     cache_color: CacheColor,
     transform: Affine,
+    mask_cache: VecDeque<CachedMask>,
     layers: Vec<Layer<'a>>,
 }
 
@@ -1408,6 +1683,7 @@ impl<'a> TinySkiaTargetRenderer<'a> {
             let mut inner = TinySkiaRendererImpl {
                 transform: Affine::IDENTITY,
                 cache_color: CacheColor(false),
+                mask_cache: VecDeque::new(),
                 layers: vec![Layer::new_root_borrowed(
                     target.buffer,
                     target.width,
@@ -1422,12 +1698,123 @@ impl<'a> TinySkiaTargetRenderer<'a> {
     }
 }
 
+fn translate_clip_path(clip: &ClipPath, dx: f64, dy: f64) -> ClipPath {
+    let path = clip
+        .path
+        .clone()
+        .transform(Transform::from_translate(f64_to_f32(dx), f64_to_f32(dy)))
+        .expect("translation should preserve clip path");
+    ClipPath {
+        path,
+        rect: translate_rect(clip.rect, dx, dy),
+        simple_rect: clip.simple_rect.map(|rect| translate_rect(rect, dx, dy)),
+    }
+}
+
 impl<'a> TinySkiaRendererImpl<'a> {
+    fn lookup_cached_mask(
+        &mut self,
+        scene: &Scene,
+        mode: MaskMode,
+        transform: Affine,
+        bounds: IntRect,
+    ) -> Option<Arc<[u8]>> {
+        let index = self
+            .mask_cache
+            .iter()
+            .position(|entry| entry.matches(scene, mode, transform, bounds))?;
+        let coverage = self.mask_cache.get(index)?.coverage.clone();
+        if index + 1 != self.mask_cache.len()
+            && let Some(entry) = self.mask_cache.remove(index)
+        {
+            self.mask_cache.push_back(entry);
+        }
+        Some(coverage)
+    }
+
+    fn store_cached_mask(
+        &mut self,
+        scene: &Scene,
+        mode: MaskMode,
+        transform: Affine,
+        bounds: IntRect,
+        coverage: Arc<[u8]>,
+    ) {
+        if let Some(index) = self
+            .mask_cache
+            .iter()
+            .position(|entry| entry.matches(scene, mode, transform, bounds))
+        {
+            let _ = self.mask_cache.remove(index);
+        }
+        self.mask_cache.push_back(CachedMask {
+            scene: scene.clone(),
+            mode,
+            transform,
+            bounds: (bounds.x(), bounds.y(), bounds.width(), bounds.height()),
+            coverage,
+        });
+        while self.mask_cache.len() > 16 {
+            let _ = self.mask_cache.pop_front();
+        }
+    }
+
+    fn realize_group_mask(
+        &mut self,
+        scene: &Scene,
+        mode: MaskMode,
+        transform: Affine,
+        bounds: IntRect,
+    ) -> Option<GroupMask> {
+        if let Some(coverage) = self.lookup_cached_mask(scene, mode, transform, bounds) {
+            return Some(GroupMask {
+                bounds,
+                coverage,
+            });
+        }
+        let pixmap = rasterize_scene_mask(scene, bounds, transform)?;
+        let coverage = coverage_from_mask_pixmap(pixmap.as_ref(), mode);
+        self.store_cached_mask(scene, mode, transform, bounds, coverage.clone());
+        Some(GroupMask {
+            bounds,
+            coverage,
+        })
+    }
+
+    fn clip_path_for_clip(&self, clip: ClipRef<'_>) -> Option<ClipPath> {
+        match clip {
+            ClipRef::Fill {
+                transform, shape, ..
+            } => self.clip_path_for_geometry(shape, transform),
+            ClipRef::Stroke {
+                transform,
+                shape,
+                stroke,
+            } => {
+                let shape_path = shape.to_path(0.1);
+                let stroked = kurbo_stroke_outline(
+                    shape_path.elements().iter().copied(),
+                    stroke,
+                    &StrokeOpts::default(),
+                    0.1,
+                );
+                let path = path_to_tiny_skia_path(&stroked)?.transform(affine_to_skia(transform))?;
+                Some(ClipPath {
+                    path,
+                    rect: transform.transform_rect_bbox(stroked.bounding_box()),
+                    simple_rect: None,
+                })
+            }
+        }
+    }
+
     fn clip_path_for_geometry(
         &self,
         shape: imaging::GeometryRef<'_>,
         transform: Affine,
     ) -> Option<ClipPath> {
+        let origin = self.current_layer().origin;
+        let transform = Affine::translate((-origin.x, -origin.y)) * transform;
         let path = match shape {
             imaging::GeometryRef::Rect(rect) => shape_to_path(&rect)?,
             imaging::GeometryRef::RoundedRect(rect) => shape_to_path(&rect)?,
@@ -1468,6 +1855,7 @@ impl<'a> TinySkiaRendererImpl<'a> {
         first_layer.mask.clear();
         first_layer.mask_valid = false;
         first_layer.group_mask = None;
+        first_layer.filters.clear();
     }
 
     fn brush_to_owned<'b>(&self, brush: impl Into<BrushRef<'b>>) -> Option<peniko::Brush> {
@@ -1481,6 +1869,12 @@ impl<'a> TinySkiaRendererImpl<'a> {
     fn current_layer_mut(&mut self) -> &mut Layer<'a> {
         self.layers
             .last_mut()
+            .expect("TinySkiaRenderer always has a root layer")
+    }
+
+    fn current_layer(&self) -> &Layer<'a> {
+        self.layers
+            .last()
             .expect("TinySkiaRenderer always has a root layer")
     }
 }
@@ -1498,6 +1892,7 @@ impl TinySkiaRendererImpl<'static> {
         Ok(Self {
             transform: Affine::IDENTITY,
             cache_color: CacheColor(false),
+            mask_cache: VecDeque::new(),
             layers: vec![main_layer],
         })
     }
@@ -1523,9 +1918,7 @@ fn rasterize_scene_pixmap(
     transform: Affine,
 ) -> Option<Arc<Pixmap>> {
     let mut renderer = TinySkiaRendererImpl::new_with_size(width, height).ok()?;
-    let mut transformed = Scene::new();
-    transformed.append_transformed(scene, transform);
-    imaging::record::replay(&transformed, &mut renderer);
+    imaging::record::replay_transformed(scene, &mut renderer, transform);
     let layer = renderer.layers.into_iter().next()?;
     match layer.pixmap {
         LayerPixmap::Owned(pixmap) => Some(Arc::new(pixmap)),
@@ -1535,28 +1928,19 @@ fn rasterize_scene_pixmap(
 
 fn rasterize_scene_mask(
     scene: &Scene,
-    width: u32,
-    height: u32,
+    bounds: IntRect,
     transform: Affine,
-    mode: MaskMode,
-) -> Option<GroupMask> {
-    let pixmap = rasterize_scene_pixmap(scene, width, height, transform)?;
-    Some(GroupMask {
-        pixmap: (*pixmap).clone(),
-        mode,
-    })
+) -> Option<Arc<Pixmap>> {
+    let width = bounds.width();
+    let height = bounds.height();
+    let origin = Affine::translate((-f64::from(bounds.x()), -f64::from(bounds.y())));
+    let pixmap = rasterize_scene_pixmap(scene, width, height, origin * transform)?;
+    Some(pixmap)
 }
 
 impl PaintSink for TinySkiaRendererImpl<'_> {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
-        let clip_path = match clip {
-            ClipRef::Fill {
-                transform, shape, ..
-            } => self.clip_path_for_geometry(shape, transform),
-            ClipRef::Stroke {
-                transform, shape, ..
-            } => self.clip_path_for_geometry(shape, transform),
-        };
+        let clip_path = self.clip_path_for_clip(clip);
         if let Some(clip_path) = clip_path {
             let layer = self.current_layer_mut();
             layer.clip_stack.push(clip_path.clone());
@@ -1573,12 +1957,7 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
 
     fn push_group(&mut self, group: GroupRef<'_>) {
         let clip = match group.clip {
-            Some(ClipRef::Fill {
-                transform, shape, ..
-            })
-            | Some(ClipRef::Stroke {
-                transform, shape, ..
-            }) => self.clip_path_for_geometry(shape, transform),
+            Some(clip) => self.clip_path_for_clip(clip),
             None => {
                 let rect = self.canvas_size().to_rect();
                 self.clip_path_for_geometry(imaging::GeometryRef::Rect(rect), Affine::IDENTITY)
@@ -1586,29 +1965,42 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
         };
 
         if let Some(clip) = clip {
-            let width = self.layers[0].pixmap.width();
-            let height = self.layers[0].pixmap.height();
-            let inherited_clips = self.current_layer_mut().effective_clips();
-            let group_mask = group.mask.and_then(|mask| {
-                rasterize_scene_mask(
-                    mask.mask.scene,
-                    width,
-                    height,
-                    mask.transform,
-                    mask.mask.mode,
-                )
+            let parent_origin = self.current_layer().origin;
+            let clip = translate_clip_path(&clip, parent_origin.x, parent_origin.y);
+            let inherited_clips = self.current_layer().effective_clips_in_root();
+            let mut group_bounds = clip.rect;
+            for inherited in &inherited_clips {
+                group_bounds = group_bounds.intersect(inherited.rect);
+            }
+            let canvas_bounds = self.canvas_size().to_rect();
+            group_bounds = group_bounds.intersect(canvas_bounds);
+            let Some(group_bounds) = rect_to_int_rect(group_bounds) else {
+                return;
+            };
+            let group_origin = Point::new(f64::from(group_bounds.x()), f64::from(group_bounds.y()));
+            let clip = translate_clip_path(&clip, -group_origin.x, -group_origin.y);
+            let inherited_clips: Vec<_> = inherited_clips
+                .iter()
+                .map(|clip| translate_clip_path(clip, -group_origin.x, -group_origin.y))
+                .collect();
+            let group_mask = group.mask.map(|mask| PendingGroupMask {
+                scene: mask.mask.scene.clone(),
+                transform: mask.transform,
+                mode: mask.mask.mode,
             });
             let Ok(mut child) = Layer::new_with_base_clip(
                 group.composite.blend,
                 group.composite.alpha,
                 clip,
-                width,
-                height,
+                group_origin,
+                group_bounds.width(),
+                group_bounds.height(),
             ) else {
                 return;
             };
             child.rebuild_clip_mask_with_extra_clips(&inherited_clips);
             child.group_mask = group_mask;
+            child.filters = group.filters.to_vec();
             self.layers.push(child);
         }
     }
@@ -1618,9 +2010,61 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
             return;
         }
         let mut child = self.layers.pop().expect("checked layer depth");
-        if let Some(group_mask) = child.group_mask.take() {
-            apply_group_mask(&mut child, &group_mask);
+        let mask_bounds = child.group_mask.as_ref().and_then(|_| group_mask_bounds(&child));
+
+        if child.filters.is_empty()
+            && let Some(group_mask) = child.group_mask.take()
+            && let Some(bounds) = mask_bounds
+            && let BlendStrategy::SinglePass(blend_mode) =
+                determine_blend_strategy(&child.blend_mode)
+            && let Some(local_bounds) = root_rect_to_local_int_rect(&child, bounds)
+            && let Some(mut localized_child) = clone_pixmap_region(child.pixmap.as_ref(), local_bounds)
+            && let Some(localized_mask) = self.realize_group_mask(
+                &group_mask.scene,
+                group_mask.mode,
+                group_mask.transform,
+                bounds,
+            )
+        {
+            let local_bounds = IntRect::from_xywh(
+                0,
+                0,
+                localized_mask.bounds.width(),
+                localized_mask.bounds.height(),
+            )
+            .expect("localized mask bounds must be valid");
+            apply_group_mask_to_pixmap(
+                &mut localized_child,
+                &GroupMask {
+                    bounds: local_bounds,
+                    coverage: localized_mask.coverage,
+                },
+            );
+            let parent = self.current_layer_mut();
+            draw_layer_pixmap(
+                &localized_child,
+                bounds.x(),
+                bounds.y(),
+                parent,
+                blend_mode,
+                child.alpha,
+            );
+            return;
         }
+
+        if let Some(group_mask) = child.group_mask.take() {
+            if let Some(bounds) = mask_bounds {
+                if let Some(localized_mask) = self.realize_group_mask(
+                    &group_mask.scene,
+                    group_mask.mode,
+                    group_mask.transform,
+                    bounds,
+                ) {
+                    apply_group_mask(&mut child, &localized_mask);
+                }
+            }
+        }
+        apply_group_filters(&mut child);
         let parent = self.current_layer_mut();
         apply_layer(&child, parent);
     }
@@ -1630,50 +2074,136 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
             return;
         };
         let blur_radius = 0.0;
-        match draw.shape {
+        if let BlendStrategy::SinglePass(blend_mode) = determine_blend_strategy(&draw.composite.blend)
+        {
+            let layer = self.current_layer_mut();
+            layer.transform = draw.transform;
+            match &draw.shape {
+                imaging::GeometryRef::Rect(rect) => layer.fill_with_brush_transform_and_mode(
+                    rect,
+                    &brush,
+                    blur_radius,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                ),
+                imaging::GeometryRef::RoundedRect(rect) => layer.fill_with_brush_transform_and_mode(
+                    rect,
+                    &brush,
+                    blur_radius,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                ),
+                imaging::GeometryRef::Path(path) => layer.fill_with_brush_transform_and_mode(
+                    path,
+                    &brush,
+                    blur_radius,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                ),
+                imaging::GeometryRef::OwnedPath(path) => layer.fill_with_brush_transform_and_mode(
+                    path,
+                    &brush,
+                    blur_radius,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                ),
+            }
+            return;
+        }
+
+        let transform = draw.transform;
+        let brush_transform = draw.brush_transform;
+        self.draw_with_composite(draw.composite, |layer| match &draw.shape {
             imaging::GeometryRef::Rect(rect) => {
-                let layer = self.current_layer_mut();
-                layer.transform = draw.transform;
-                layer.fill_with_brush_transform(&rect, &brush, blur_radius, draw.brush_transform);
+                layer.transform = transform;
+                layer.fill_with_brush_transform(rect, &brush, blur_radius, brush_transform);
             }
             imaging::GeometryRef::RoundedRect(rect) => {
-                let layer = self.current_layer_mut();
-                layer.transform = draw.transform;
-                layer.fill_with_brush_transform(&rect, &brush, blur_radius, draw.brush_transform);
+                layer.transform = transform;
+                layer.fill_with_brush_transform(rect, &brush, blur_radius, brush_transform);
             }
             imaging::GeometryRef::Path(path) => {
-                let layer = self.current_layer_mut();
-                layer.transform = draw.transform;
-                layer.fill_with_brush_transform(path, &brush, blur_radius, draw.brush_transform);
+                layer.transform = transform;
+                layer.fill_with_brush_transform(path, &brush, blur_radius, brush_transform);
             }
             imaging::GeometryRef::OwnedPath(path) => {
-                let layer = self.current_layer_mut();
-                layer.transform = draw.transform;
-                layer.fill_with_brush_transform(&path, &brush, blur_radius, draw.brush_transform);
+                layer.transform = transform;
+                layer.fill_with_brush_transform(path, &brush, blur_radius, brush_transform);
             }
-        }
+        });
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
-        let layer = self.current_layer_mut();
-        layer.transform = draw.transform;
-        match draw.shape {
+        if let BlendStrategy::SinglePass(blend_mode) = determine_blend_strategy(&draw.composite.blend)
+        {
+            let layer = self.current_layer_mut();
+            layer.transform = draw.transform;
+            match &draw.shape {
+                imaging::GeometryRef::Rect(rect) => layer.stroke_with_brush_transform_and_mode(
+                    rect,
+                    &brush,
+                    draw.stroke,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                ),
+                imaging::GeometryRef::RoundedRect(rect) => {
+                    layer.stroke_with_brush_transform_and_mode(
+                        rect,
+                        &brush,
+                        draw.stroke,
+                        draw.brush_transform,
+                        draw.composite.alpha,
+                        blend_mode,
+                    );
+                }
+                imaging::GeometryRef::Path(path) => layer.stroke_with_brush_transform_and_mode(
+                    path,
+                    &brush,
+                    draw.stroke,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                ),
+                imaging::GeometryRef::OwnedPath(path) => layer.stroke_with_brush_transform_and_mode(
+                    path,
+                    &brush,
+                    draw.stroke,
+                    draw.brush_transform,
+                    draw.composite.alpha,
+                    blend_mode,
+                ),
+            }
+            return;
+        }
+
+        let transform = draw.transform;
+        let brush_transform = draw.brush_transform;
+        self.draw_with_composite(draw.composite, |layer| match &draw.shape {
             imaging::GeometryRef::Rect(rect) => {
-                layer.stroke_with_brush_transform(&rect, &brush, draw.stroke, draw.brush_transform);
+                layer.transform = transform;
+                layer.stroke_with_brush_transform(rect, &brush, draw.stroke, brush_transform);
             }
             imaging::GeometryRef::RoundedRect(rect) => {
-                layer.stroke_with_brush_transform(&rect, &brush, draw.stroke, draw.brush_transform);
+                layer.transform = transform;
+                layer.stroke_with_brush_transform(rect, &brush, draw.stroke, brush_transform);
             }
             imaging::GeometryRef::Path(path) => {
-                layer.stroke_with_brush_transform(path, &brush, draw.stroke, draw.brush_transform);
+                layer.transform = transform;
+                layer.stroke_with_brush_transform(path, &brush, draw.stroke, brush_transform);
             }
-            imaging::GeometryRef::OwnedPath(ref path) => {
-                layer.stroke_with_brush_transform(path, &brush, draw.stroke, draw.brush_transform);
+            imaging::GeometryRef::OwnedPath(path) => {
+                layer.transform = transform;
+                layer.stroke_with_brush_transform(path, &brush, draw.stroke, brush_transform);
             }
-        }
+        });
     }
 
     fn glyph_run(
@@ -1681,13 +2211,37 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
         draw: GlyphRunRef<'_>,
         glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
     ) {
-        self.draw_glyphs(Point::ZERO, &draw, glyphs);
+        let cache_color = self.cache_color;
+        self.draw_with_composite(draw.composite, |layer| {
+            Self::draw_glyphs_into_layer(layer, cache_color, Point::ZERO, &draw, glyphs);
+        });
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
-        self.transform = draw.transform;
+        let width = self.layers[0].pixmap.width();
+        let height = self.layers[0].pixmap.height();
+        let inherited_clips = {
+            let layer = self.current_layer_mut();
+            layer.effective_clips()
+        };
+
+        let Ok(mut child) = Layer::new_root(width, height) else {
+            return;
+        };
+        child.blend_mode = draw.composite.blend;
+        child.alpha = draw.composite.alpha;
+        child.transform = draw.transform;
+        child.rebuild_clip_mask_with_extra_clips(&inherited_clips);
         let shape = draw.rect.to_rounded_rect(draw.radius);
-        self.fill(&shape, draw.color, draw.std_dev);
+        child.fill(&shape, draw.color, 0.0);
+        child.filters.push(Filter::Blur {
+            std_deviation_x: f64_to_f32(draw.std_dev),
+            std_deviation_y: f64_to_f32(draw.std_dev),
+        });
+        apply_group_filters(&mut child);
+
+        let parent = self.current_layer_mut();
+        apply_layer(&child, parent);
     }
 }
 
@@ -1711,7 +2265,7 @@ impl TinySkiaRendererImpl<'static> {
         self.reset_for_frame();
         source.paint_into(self);
         image.resize(width, height);
-        self.finish_into_rgba8_opaque(image.data.as_mut_slice(), usize_from_u32(width) * 4)
+        self.finish_into_rgba8(image.data.as_mut_slice(), usize_from_u32(width) * 4)
             .ok_or(Error::Internal(
                 "tiny-skia image backend did not produce an image",
             ))
@@ -2026,6 +2580,18 @@ fn blend_source_over(src: PremultipliedColorU8, dst: PremultipliedColorU8) -> Pr
     .expect("source-over premultiplied blend must remain premultiplied")
 }
 
+fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
+    if alpha == 0 {
+        return 0;
+    }
+    if alpha == u8::MAX {
+        return channel;
+    }
+
+    let value = (u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha);
+    u8::try_from(value.min(u32::from(u8::MAX))).expect("unpremultiplied channel must fit in u8")
+}
+
 impl TinySkiaRendererImpl<'_> {
     fn canvas_size(&self) -> Size {
         Size::new(
@@ -2034,18 +2600,42 @@ impl TinySkiaRendererImpl<'_> {
         )
     }
 
-    fn fill<'b>(&mut self, shape: &impl Shape, brush: impl Into<BrushRef<'b>>, blur_radius: f64) {
-        let Some(brush) = self.brush_to_owned(brush) else {
+    fn draw_with_composite(
+        &mut self,
+        composite: Composite,
+        draw: impl FnOnce(&mut Layer<'_>),
+    ) {
+        if composite == Composite::default() {
+            let transform = self.transform;
+            let layer = self.current_layer_mut();
+            layer.transform = transform;
+            draw(layer);
+            return;
+        }
+
+        let width = self.layers[0].pixmap.width();
+        let height = self.layers[0].pixmap.height();
+        let inherited_clips = {
+            let layer = self.current_layer_mut();
+            layer.effective_clips()
+        };
+
+        let Ok(mut child) = Layer::new_root(width, height) else {
             return;
         };
-        let transform = self.transform;
-        let layer = self.current_layer_mut();
-        layer.transform = transform;
-        layer.fill(shape, &brush, blur_radius);
+        child.blend_mode = composite.blend;
+        child.alpha = composite.alpha;
+        child.transform = self.transform;
+        child.rebuild_clip_mask_with_extra_clips(&inherited_clips);
+        draw(&mut child);
+
+        let parent = self.current_layer_mut();
+        apply_layer(&child, parent);
     }
 
-    fn draw_glyphs<'a>(
-        &mut self,
+    fn draw_glyphs_into_layer<'a>(
+        layer: &mut Layer<'_>,
+        cache_color: CacheColor,
         origin: Point,
         run: &GlyphRunRef<'a>,
         glyphs: impl Iterator<Item = imaging::record::Glyph> + 'a,
@@ -2096,7 +2686,7 @@ impl TinySkiaRendererImpl<'_> {
             });
 
             let cached = cache_glyph(GlyphRasterRequest {
-                cache_color: self.cache_color,
+                cache_color,
                 cache_key,
                 color: brush_color,
                 font_ref,
@@ -2110,7 +2700,7 @@ impl TinySkiaRendererImpl<'_> {
             });
 
             if let Some(cached) = cached {
-                self.current_layer_mut().render_pixmap_direct(
+                layer.render_pixmap_direct(
                     cached.pixmap.as_ref(),
                     new_x + cached.left,
                     new_y - cached.top,
@@ -2125,8 +2715,8 @@ impl TinySkiaRendererImpl<'_> {
         }
     }
 
-    fn finish_into_rgba8_opaque(&mut self, dst: &mut [u8], bytes_per_row: usize) -> Option<()> {
-        self.finish_into_opaque(dst, bytes_per_row, true)
+    fn finish_into_rgba8(&mut self, dst: &mut [u8], bytes_per_row: usize) -> Option<()> {
+        self.finish_into_unpremultiplied(dst, bytes_per_row, true)
     }
 
     fn finish_direct_rgba8_opaque(&mut self) -> Option<()> {
@@ -2147,7 +2737,7 @@ impl TinySkiaRendererImpl<'_> {
         self.cache_color = CacheColor(!self.cache_color.0);
     }
 
-    fn finish_into_opaque(
+    fn finish_into_unpremultiplied(
         &mut self,
         dst: &mut [u8],
         bytes_per_row: usize,
@@ -2171,10 +2761,14 @@ impl TinySkiaRendererImpl<'_> {
                 .chunks_exact(4)
                 .zip(dst_row[..width * 4].chunks_exact_mut(4))
             {
+                let alpha = src[3];
+                let red = unpremultiply_channel(src[0], alpha);
+                let green = unpremultiply_channel(src[1], alpha);
+                let blue = unpremultiply_channel(src[2], alpha);
                 if rgba {
-                    out.copy_from_slice(&[src[0], src[1], src[2], 0xff]);
+                    out.copy_from_slice(&[red, green, blue, alpha]);
                 } else {
-                    out.copy_from_slice(&[src[2], src[1], src[0], 0xff]);
+                    out.copy_from_slice(&[blue, green, red, alpha]);
                 }
             }
         }
@@ -2245,18 +2839,27 @@ fn path_to_tiny_skia_path(path: &BezPath) -> Option<Path> {
 fn brush_to_paint<'b>(
     brush: impl Into<BrushRef<'b>>,
     brush_transform: Option<Affine>,
+    opacity: f32,
+    blend_mode: TinyBlendMode,
 ) -> Option<Paint<'static>> {
     let shader_transform = affine_to_skia(brush_transform.unwrap_or(Affine::IDENTITY));
+    let opacity = opacity.clamp(0.0, 1.0);
     let shader = match brush.into() {
-        BrushRef::Solid(c) => Shader::SolidColor(to_color(c)),
+        BrushRef::Solid(c) => {
+            Shader::SolidColor(scale_tiny_skia_color_alpha(to_color(c), opacity))
+        }
         BrushRef::Gradient(g) => {
-            let stops = expand_gradient_stops(g);
+            let stops = expand_gradient_stops(g, opacity);
+            let tiny_stops = stops
+                .iter()
+                .map(|stop| GradientStop::new(stop.offset, stop.color))
+                .collect();
             let spread_mode = to_spread_mode(g.extend);
             match g.kind {
                 GradientKind::Linear(linear) => LinearGradient::new(
                     to_point(linear.start),
                     to_point(linear.end),
-                    stops,
+                    tiny_stops,
                     spread_mode,
                     shader_transform,
                 )?,
@@ -2271,7 +2874,7 @@ fn brush_to_paint<'b>(
                         to_point(start_center),
                         to_point(end_center),
                         end_radius,
-                        stops,
+                        tiny_stops,
                         spread_mode,
                         shader_transform,
                     )?
@@ -2283,6 +2886,7 @@ fn brush_to_paint<'b>(
     };
     Some(Paint {
         shader,
+        blend_mode,
         ..Default::default()
     })
 }
@@ -2316,7 +2920,13 @@ fn image_brush_spread_mode<T>(image: &peniko::ImageBrush<T>) -> SpreadMode {
 
 const GRADIENT_TOLERANCE: f32 = 0.01;
 
-fn expand_gradient_stops(gradient: &Gradient) -> Vec<GradientStop> {
+#[derive(Clone, Copy)]
+struct ExpandedGradientStop {
+    offset: f32,
+    color: tiny_skia::Color,
+}
+
+fn expand_gradient_stops(gradient: &Gradient, opacity: f32) -> Vec<ExpandedGradientStop> {
     if gradient.stops.is_empty() {
         return Vec::new();
     }
@@ -2324,10 +2934,10 @@ fn expand_gradient_stops(gradient: &Gradient) -> Vec<GradientStop> {
     if gradient.stops.len() == 1 {
         let stop = &gradient.stops[0];
         let color = stop.color.to_alpha_color::<Srgb>().convert::<Srgb>();
-        return vec![GradientStop::new(
-            stop.offset,
-            alpha_color_to_tiny_skia(color),
-        )];
+        return vec![ExpandedGradientStop {
+            offset: stop.offset,
+            color: scale_tiny_skia_color_alpha(alpha_color_to_tiny_skia(color), opacity),
+        }];
     }
 
     let mut expanded = Vec::new();
@@ -2339,11 +2949,13 @@ fn expand_gradient_stops(gradient: &Gradient) -> Vec<GradientStop> {
                 &mut expanded,
                 start.offset,
                 start.color.to_alpha_color::<Srgb>(),
+                opacity,
             );
             push_gradient_stop(
                 &mut expanded,
                 end.offset,
                 end.color.to_alpha_color::<Srgb>(),
+                opacity,
             );
             continue;
         }
@@ -2356,6 +2968,7 @@ fn expand_gradient_stops(gradient: &Gradient) -> Vec<GradientStop> {
             end.color,
             gradient.interpolation_cs,
             gradient.hue_direction,
+            opacity,
         );
     }
 
@@ -2363,17 +2976,19 @@ fn expand_gradient_stops(gradient: &Gradient) -> Vec<GradientStop> {
 }
 
 fn expand_gradient_segment(
-    expanded: &mut Vec<GradientStop>,
+    expanded: &mut Vec<ExpandedGradientStop>,
     start_offset: f32,
     start_color: DynamicColor,
     end_offset: f32,
     end_color: DynamicColor,
     interpolation_cs: ColorSpaceTag,
     hue_direction: HueDirection,
+    opacity: f32,
 ) {
-    let push_sample = |expanded: &mut Vec<GradientStop>, t: f32, color: color::AlphaColor<Srgb>| {
+    let push_sample =
+        |expanded: &mut Vec<ExpandedGradientStop>, t: f32, color: color::AlphaColor<Srgb>| {
         let offset = start_offset + (end_offset - start_offset) * t;
-        push_gradient_stop(expanded, offset, color);
+        push_gradient_stop(expanded, offset, color, opacity);
     };
 
     for (i, (t, color)) in color::gradient::<Srgb>(
@@ -2393,22 +3008,489 @@ fn expand_gradient_segment(
 }
 
 fn push_gradient_stop(
-    expanded: &mut Vec<GradientStop>,
+    expanded: &mut Vec<ExpandedGradientStop>,
     offset: f32,
     color: color::AlphaColor<Srgb>,
+    opacity: f32,
 ) {
-    let tiny_color = alpha_color_to_tiny_skia(color);
+    let tiny_color = scale_tiny_skia_color_alpha(alpha_color_to_tiny_skia(color), opacity);
     if let Some(previous) = expanded.last()
-        && previous == &GradientStop::new(offset, tiny_color)
+        && previous.offset == offset
+        && previous.color == tiny_color
     {
         return;
     }
-    expanded.push(GradientStop::new(offset, tiny_color));
+    expanded.push(ExpandedGradientStop {
+        offset,
+        color: tiny_color,
+    });
+}
+
+fn extend_gradient_t(extend: Extend, t: f32) -> f32 {
+    match extend {
+        Extend::Pad => t.clamp(0.0, 1.0),
+        Extend::Repeat => t.rem_euclid(1.0),
+        Extend::Reflect => {
+            let reflected = t.rem_euclid(2.0);
+            if reflected > 1.0 {
+                2.0 - reflected
+            } else {
+                reflected
+            }
+        }
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let value = f32::from(a) + (f32::from(b) - f32::from(a)) * t.clamp(0.0, 1.0);
+    opacity_to_u8(value / 255.0)
+}
+
+fn sample_expanded_gradient(stops: &[ExpandedGradientStop], extend: Extend, t: f32) -> tiny_skia::Color {
+    let t = extend_gradient_t(extend, t);
+    let Some(first) = stops.first() else {
+        return tiny_skia::Color::TRANSPARENT;
+    };
+    if t <= first.offset {
+        return first.color;
+    }
+
+    for window in stops.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        if t > end.offset {
+            continue;
+        }
+
+        if end.offset <= start.offset {
+            return end.color;
+        }
+
+        let local_t = (t - start.offset) / (end.offset - start.offset);
+        let start_rgba = start.color.to_color_u8();
+        let end_rgba = end.color.to_color_u8();
+        return tiny_skia::Color::from_rgba8(
+            lerp_u8(start_rgba.red(), end_rgba.red(), local_t),
+            lerp_u8(start_rgba.green(), end_rgba.green(), local_t),
+            lerp_u8(start_rgba.blue(), end_rgba.blue(), local_t),
+            lerp_u8(start_rgba.alpha(), end_rgba.alpha(), local_t),
+        );
+    }
+
+    stops.last().map(|stop| stop.color).unwrap_or(tiny_skia::Color::TRANSPARENT)
+}
+
+fn build_expanded_gradient_lut_256(
+    stops: &[ExpandedGradientStop],
+    extend: Extend,
+) -> [tiny_skia::Color; 256] {
+    let mut lut = [tiny_skia::Color::TRANSPARENT; 256];
+    for (i, color) in lut.iter_mut().enumerate() {
+        let t = (i as f32) / 255.0;
+        *color = sample_expanded_gradient(stops, extend, t);
+    }
+    lut
+}
+
+fn sweep_lut_index_256(extend: Extend, t: f32) -> usize {
+    let t = extend_gradient_t(extend, t);
+    let idx = (t.clamp(0.0, 1.0) * 255.0).round();
+    usize::try_from(f32_to_i32(idx)).expect("gradient LUT index must fit usize")
+}
+
+fn build_original_gradient_lut_1024(gradient: &Gradient, opacity: f32) -> [tiny_skia::Color; 1024] {
+    let mut lut = [tiny_skia::Color::TRANSPARENT; 1024];
+    for (i, color) in lut.iter_mut().enumerate() {
+        let t = (i as f32) / 1023.0;
+        *color = sample_original_gradient(gradient, opacity, t);
+    }
+    lut
+}
+
+fn gradient_lut_index_1024(extend: Extend, t: f32) -> usize {
+    let t = extend_gradient_t(extend, t);
+    let idx = (t.clamp(0.0, 1.0) * 1023.0).round();
+    usize::try_from(f32_to_i32(idx)).expect("gradient LUT index must fit usize")
+}
+
+struct PreparedSweep {
+    center_x: f32,
+    center_y: f32,
+    start_angle: f32,
+    inv_angle_delta: f32,
+    wrap: bool,
+}
+
+impl PreparedSweep {
+    fn new(sweep: peniko::SweepGradientPosition) -> Self {
+        let span = sweep.end_angle - sweep.start_angle;
+        let span_abs = span.abs();
+        let wrap = span_abs >= core::f32::consts::TAU - 1e-6;
+        let inv_angle_delta = if span_abs <= f32::EPSILON {
+            0.0
+        } else if wrap {
+            1.0 / span_abs
+        } else {
+            1.0 / span
+        };
+        Self {
+            center_x: f64_to_f32(sweep.center.x),
+            center_y: f64_to_f32(sweep.center.y),
+            start_angle: sweep.start_angle,
+            inv_angle_delta,
+            wrap,
+        }
+    }
+
+    fn project_point(&self, point: Point) -> (f32, f32) {
+        (
+            f64_to_f32(point.x) - self.center_x,
+            f64_to_f32(point.y) - self.center_y,
+        )
+    }
+
+    fn project_delta(&self, delta: Vec2) -> (f32, f32) {
+        (f64_to_f32(delta.x), f64_to_f32(delta.y))
+    }
+
+    fn sample(&self, x: f32, y: f32) -> f32 {
+        if self.inv_angle_delta == 0.0 {
+            return 0.0;
+        }
+        let angle = unit_angle_approx(x, y) * core::f32::consts::TAU;
+        if self.wrap {
+            (angle - self.start_angle).rem_euclid(core::f32::consts::TAU) * self.inv_angle_delta
+        } else {
+            (angle - self.start_angle) * self.inv_angle_delta
+        }
+    }
+}
+
+fn sample_original_gradient(gradient: &Gradient, opacity: f32, t: f32) -> tiny_skia::Color {
+    let t = extend_gradient_t(gradient.extend, t);
+    let Some(first) = gradient.stops.first() else {
+        return tiny_skia::Color::TRANSPARENT;
+    };
+    if t <= first.offset {
+        let color = first.color.to_alpha_color::<Srgb>().convert::<Srgb>();
+        let [r, g, b, a] = color.components;
+        let alpha = a * opacity.clamp(0.0, 1.0);
+        return tiny_skia::Color::from_rgba(
+            r.clamp(0.0, 1.0),
+            g.clamp(0.0, 1.0),
+            b.clamp(0.0, 1.0),
+            alpha.clamp(0.0, 1.0),
+        )
+        .expect("sampled gradient color must be valid");
+    }
+
+    for window in gradient.stops.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        if t > end.offset {
+            continue;
+        }
+
+        if end.offset <= start.offset {
+            let color = end.color.to_alpha_color::<Srgb>().convert::<Srgb>();
+            let [r, g, b, a] = color.components;
+            return tiny_skia::Color::from_rgba(
+                r.clamp(0.0, 1.0),
+                g.clamp(0.0, 1.0),
+                b.clamp(0.0, 1.0),
+                (a * opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0),
+            )
+            .expect("sampled gradient color must be valid");
+        }
+
+        let local_t = (t - start.offset) / (end.offset - start.offset);
+        let start = start.color.to_alpha_color::<Srgb>().convert::<Srgb>();
+        let end = end.color.to_alpha_color::<Srgb>().convert::<Srgb>();
+        let [sr, sg, sb, sa] = start.components;
+        let [er, eg, eb, ea] = end.components;
+        let opacity = opacity.clamp(0.0, 1.0);
+        let sa = sa * opacity;
+        let ea = ea * opacity;
+
+        let (r, g, b, a) = match gradient.interpolation_alpha_space {
+            InterpolationAlphaSpace::Premultiplied => {
+                let a = sa + (ea - sa) * local_t;
+                let rp = sr * sa + (er * ea - sr * sa) * local_t;
+                let gp = sg * sa + (eg * ea - sg * sa) * local_t;
+                let bp = sb * sa + (eb * ea - sb * sa) * local_t;
+                if a <= f32::EPSILON {
+                    (0.0, 0.0, 0.0, 0.0)
+                } else {
+                    (rp / a, gp / a, bp / a, a)
+                }
+            }
+            InterpolationAlphaSpace::Unpremultiplied => (
+                sr + (er - sr) * local_t,
+                sg + (eg - sg) * local_t,
+                sb + (eb - sb) * local_t,
+                sa + (ea - sa) * local_t,
+            ),
+        };
+
+        return tiny_skia::Color::from_rgba(
+            r.clamp(0.0, 1.0),
+            g.clamp(0.0, 1.0),
+            b.clamp(0.0, 1.0),
+            a.clamp(0.0, 1.0),
+        )
+        .expect("sampled gradient color must be valid");
+    }
+
+    let last = gradient
+        .stops
+        .last()
+        .expect("checked non-empty gradient stops")
+        .color
+        .to_alpha_color::<Srgb>()
+        .convert::<Srgb>();
+    let [r, g, b, a] = last.components;
+    tiny_skia::Color::from_rgba(
+        r.clamp(0.0, 1.0),
+        g.clamp(0.0, 1.0),
+        b.clamp(0.0, 1.0),
+        (a * opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0),
+    )
+    .expect("sampled gradient color must be valid")
+}
+
+fn unit_angle_approx(x: f32, y: f32) -> f32 {
+    let x_abs = x.abs();
+    let y_abs = y.abs();
+    let max_abs = x_abs.max(y_abs);
+    if max_abs <= f32::EPSILON {
+        return 0.0;
+    }
+
+    let slope = x_abs.min(y_abs) / max_abs;
+    let s = slope * slope;
+    let a = (-7.054_738_2e-3_f32).mul_add(s, 2.476_102e-2);
+    let b = a.mul_add(s, -5.185_397e-2);
+    let c = b.mul_add(s, 0.159_121_17);
+
+    let mut phi = slope * c;
+    if x_abs < y_abs {
+        phi = 0.25 - phi;
+    }
+    if x < 0.0 {
+        phi = 0.5 - phi;
+    }
+    if y < 0.0 {
+        phi = 1.0 - phi;
+    }
+    if phi.is_nan() { 0.0 } else { phi }
+}
+
+struct PreparedTwoPointRadial {
+    valid: bool,
+    x_coeff_x: f64,
+    x_coeff_y: f64,
+    x_bias: f64,
+    y_coeff_x: f64,
+    y_coeff_y: f64,
+    y_bias: f64,
+    f: f64,
+    one_minus_f: f64,
+    one_minus_f_abs: f64,
+    one_minus_f_signum: f64,
+    r1_normalized: f64,
+    swapped: bool,
+    near_one: bool,
+    x_prime_scale: f64,
+    y_prime_scale: f64,
+}
+
+impl PreparedTwoPointRadial {
+    fn project_point(&self, point: Point) -> (f64, f64) {
+        (
+            point.x * self.x_coeff_x + point.y * self.x_coeff_y + self.x_bias,
+            point.x * self.y_coeff_x + point.y * self.y_coeff_y + self.y_bias,
+        )
+    }
+
+    fn project_delta(&self, delta: Vec2) -> (f64, f64) {
+        (
+            delta.x * self.x_coeff_x + delta.y * self.x_coeff_y,
+            delta.x * self.y_coeff_x + delta.y * self.y_coeff_y,
+        )
+    }
+
+    fn sample(&self, x: f64, y: f64) -> f32 {
+        if !self.valid {
+            return 0.0;
+        }
+        let x_prime = x * self.x_prime_scale;
+        let y_prime = y * self.y_prime_scale;
+        if self.near_one {
+            if x_prime.abs() <= f64::EPSILON {
+                return 2.0;
+            }
+            let hat_x = self.one_minus_f_abs * x_prime;
+            let hat_y = self.one_minus_f_abs * y_prime;
+            let hat_x_t = (hat_x * hat_x + hat_y * hat_y) / hat_x;
+            if self.r1_normalized <= 1.0 && hat_x_t < 0.0 {
+                return 2.0;
+            }
+            let mut t = self.f + self.one_minus_f_signum * hat_x_t;
+            if self.swapped {
+                t = 1.0 - t;
+            }
+            return f64_to_f32(t);
+        }
+
+        let hat_x = self.one_minus_f_abs * x_prime;
+        let hat_y = self.one_minus_f_abs * y_prime;
+        let hat_x_t = if self.r1_normalized > 1.0 {
+            (hat_x * hat_x + hat_y * hat_y).sqrt() - hat_x / self.r1_normalized
+        } else {
+            let disc = hat_x * hat_x - hat_y * hat_y;
+            if disc < 0.0 {
+                return 2.0;
+            }
+            let root = disc.sqrt();
+            if self.swapped || self.one_minus_f < 0.0 {
+                -root - hat_x / self.r1_normalized
+            } else {
+                root - hat_x / self.r1_normalized
+            }
+        };
+
+        if self.r1_normalized <= 1.0 && hat_x_t < 0.0 {
+            return 2.0;
+        }
+
+        let mut t = self.f + self.one_minus_f_signum * hat_x_t;
+        if self.swapped {
+            t = 1.0 - t;
+        }
+        f64_to_f32(t)
+    }
+}
+
+fn prepare_two_point_radial(radial: RadialGradientPosition) -> PreparedTwoPointRadial {
+    let mut c0 = radial.start_center;
+    let mut c1 = radial.end_center;
+    let mut r0 = f64::from(radial.start_radius);
+    let mut r1 = f64::from(radial.end_radius);
+    let mut swapped = false;
+
+    if r1.abs() <= f64::EPSILON {
+        core::mem::swap(&mut c0, &mut c1);
+        core::mem::swap(&mut r0, &mut r1);
+        swapped = true;
+    }
+
+    let denom = r0 - r1;
+    if denom.abs() <= f64::EPSILON {
+        return PreparedTwoPointRadial {
+            valid: false,
+            x_coeff_x: 0.0,
+            x_coeff_y: 0.0,
+            x_bias: 0.0,
+            y_coeff_x: 0.0,
+            y_coeff_y: 0.0,
+            y_bias: 0.0,
+            f: 0.0,
+            one_minus_f: 1.0,
+            one_minus_f_abs: 1.0,
+            one_minus_f_signum: 1.0,
+            r1_normalized: 0.0,
+            swapped,
+            near_one: false,
+            x_prime_scale: 0.0,
+            y_prime_scale: 0.0,
+        };
+    }
+
+    let f = r0 / denom;
+    let one_minus_f = 1.0 - f;
+    let focal = Point::new(
+        c0.x + (c1.x - c0.x) * f,
+        c0.y + (c1.y - c0.y) * f,
+    );
+    let axis = c1 - focal;
+    let axis_len = axis.hypot();
+    if axis_len <= f64::EPSILON {
+        return PreparedTwoPointRadial {
+            valid: false,
+            x_coeff_x: 0.0,
+            x_coeff_y: 0.0,
+            x_bias: 0.0,
+            y_coeff_x: 0.0,
+            y_coeff_y: 0.0,
+            y_bias: 0.0,
+            f: 0.0,
+            one_minus_f: 1.0,
+            one_minus_f_abs: 1.0,
+            one_minus_f_signum: 1.0,
+            r1_normalized: 0.0,
+            swapped,
+            near_one: false,
+            x_prime_scale: 0.0,
+            y_prime_scale: 0.0,
+        };
+    }
+
+    let inv_len_sq = 1.0 / (axis_len * axis_len);
+    let r1_normalized = r1 / axis_len;
+    let near_one = (r1_normalized - 1.0).abs() <= 1e-6;
+    let (x_prime_scale, y_prime_scale) = if near_one {
+        (0.5, 0.5)
+    } else {
+        let r1_sq_minus_1 = r1_normalized * r1_normalized - 1.0;
+        (
+            r1_normalized / r1_sq_minus_1,
+            r1_sq_minus_1.abs().sqrt() / r1_sq_minus_1,
+        )
+    };
+    PreparedTwoPointRadial {
+        valid: true,
+        x_coeff_x: axis.x * inv_len_sq,
+        x_coeff_y: axis.y * inv_len_sq,
+        x_bias: -(focal.x * axis.x + focal.y * axis.y) * inv_len_sq,
+        y_coeff_x: axis.y * inv_len_sq,
+        y_coeff_y: -axis.x * inv_len_sq,
+        y_bias: (-focal.x * axis.y + focal.y * axis.x) * inv_len_sq,
+        f,
+        one_minus_f,
+        one_minus_f_abs: one_minus_f.abs(),
+        one_minus_f_signum: one_minus_f.signum(),
+        r1_normalized,
+        swapped,
+        near_one,
+        x_prime_scale,
+        y_prime_scale,
+    }
 }
 
 fn alpha_color_to_tiny_skia(color: color::AlphaColor<Srgb>) -> tiny_skia::Color {
     let color = color.to_rgba8();
     tiny_skia::Color::from_rgba8(color.r, color.g, color.b, color.a)
+}
+
+fn opacity_to_u8(opacity: f32) -> u8 {
+    let scaled = (opacity.clamp(0.0, 1.0) * 255.0).round();
+    if scaled <= 0.0 {
+        0
+    } else if scaled >= f32::from(u8::MAX) {
+        u8::MAX
+    } else {
+        u8::try_from(f32_to_i32(scaled)).expect("rounded opacity must fit in u8")
+    }
+}
+
+fn scale_tiny_skia_color_alpha(color: tiny_skia::Color, opacity: f32) -> tiny_skia::Color {
+    let rgba = color.to_color_u8();
+    tiny_skia::Color::from_rgba8(
+        rgba.red(),
+        rgba.green(),
+        rgba.blue(),
+        mul_div_255(rgba.alpha(), opacity_to_u8(opacity)),
+    )
 }
 
 fn to_spread_mode(extend: Extend) -> SpreadMode {
@@ -2503,22 +3585,11 @@ fn mix_to_tiny_blend_mode(mix: Mix) -> TinyBlendMode {
 }
 
 fn layer_composite_rect(layer: &Layer<'_>, parent: &Layer<'_>) -> Option<IntRect> {
-    let mut rect = Rect::from_origin_size(
-        Point::ZERO,
-        Size::new(layer.pixmap.width() as f64, layer.pixmap.height() as f64),
-    );
-
-    if let Some(draw_bounds) = layer.draw_bounds {
-        rect = rect.intersect(draw_bounds);
-    } else {
-        return None;
-    }
-
-    if let Some(layer_clip) = layer.clip {
+    let mut rect = layer.draw_bounds?;
+    if let Some(layer_clip) = layer.clip_in_root() {
         rect = rect.intersect(layer_clip);
     }
-
-    if let Some(parent_clip) = parent.clip {
+    if let Some(parent_clip) = parent.clip_in_root() {
         rect = rect.intersect(parent_clip);
     }
 
@@ -2529,6 +3600,22 @@ fn layer_composite_rect(layer: &Layer<'_>, parent: &Layer<'_>) -> Option<IntRect
     rect_to_int_rect(rect)
 }
 
+fn root_rect_to_local_int_rect(layer: &Layer<'_>, rect: IntRect) -> Option<IntRect> {
+    let root_rect = Rect::new(
+        f64::from(rect.x()),
+        f64::from(rect.y()),
+        f64::from(rect.x() + i32::try_from(rect.width()).expect("width fits i32")),
+        f64::from(rect.y() + i32::try_from(rect.height()).expect("height fits i32")),
+    );
+    let local = translate_rect(root_rect, -layer.origin.x, -layer.origin.y).intersect(
+        Rect::from_origin_size(
+            Point::ZERO,
+            Size::new(f64::from(layer.pixmap.width()), f64::from(layer.pixmap.height())),
+        ),
+    );
+    rect_to_int_rect(local)
+}
+
 fn draw_layer_pixmap(
     pixmap: &Pixmap,
     x: i32,
@@ -2537,12 +3624,19 @@ fn draw_layer_pixmap(
     blend_mode: TinyBlendMode,
     alpha: f32,
 ) {
-    parent.mark_drawn_device_rect(Rect::new(
+    parent.mark_drawn_local_rect(Rect::new(
         f64::from(x),
         f64::from(y),
         f64::from(x + i32::try_from(pixmap.width()).expect("pixmap width must fit in i32")),
         f64::from(y + i32::try_from(pixmap.height()).expect("pixmap height must fit in i32")),
     ));
+
+    if alpha == 1.0
+        && blend_mode == TinyBlendMode::SourceOver
+        && parent.blit_pixmap_source_over(pixmap, x, y)
+    {
+        return;
+    }
 
     let paint = PixmapPaint {
         opacity: alpha,
@@ -2562,25 +3656,24 @@ fn draw_layer_pixmap(
     );
 }
 
-fn draw_layer_region(
+fn draw_layer_region_at(
     parent: &mut Layer<'_>,
     pixmap: PixmapRef<'_>,
-    composite_rect: IntRect,
+    src_rect: IntRect,
+    x: i32,
+    y: i32,
     blend_mode: TinyBlendMode,
     alpha: f32,
 ) {
-    let Some(cropped) = pixmap.clone_rect(composite_rect) else {
+    let Some(cropped) = pixmap.clone_rect(src_rect) else {
         return;
     };
 
-    draw_layer_pixmap(
-        &cropped,
-        composite_rect.x(),
-        composite_rect.y(),
-        parent,
-        blend_mode,
-        alpha,
-    );
+    draw_layer_pixmap(&cropped, x, y, parent, blend_mode, alpha);
+}
+
+fn clone_pixmap_region(pixmap: PixmapRef<'_>, bounds: IntRect) -> Option<Pixmap> {
+    pixmap.clone_rect(bounds)
 }
 
 fn apply_alpha_mask_from_pixmap(target: &mut Pixmap, mask_source: PixmapRef<'_>) {
@@ -2588,50 +3681,521 @@ fn apply_alpha_mask_from_pixmap(target: &mut Pixmap, mask_source: PixmapRef<'_>)
     target.apply_mask(&mask);
 }
 
-fn mask_coverage(mask_source: &[u8], idx: usize, mode: MaskMode) -> u8 {
+fn coverage_from_mask_pixmap(pixmap: &Pixmap, mode: MaskMode) -> Arc<[u8]> {
     match mode {
-        MaskMode::Alpha => mask_source[idx * 4 + 3],
-        MaskMode::Luminance => {
-            let r = mask_source[idx * 4];
-            let g = mask_source[idx * 4 + 1];
-            let b = mask_source[idx * 4 + 2];
-            u8::try_from((u16::from(r) * 54 + u16::from(g) * 183 + u16::from(b) * 19 + 127) / 255)
-                .expect("luminance coverage must fit in u8")
+        MaskMode::Alpha => pixmap
+            .data()
+            .chunks_exact(4)
+            .map(|px| px[3])
+            .collect::<Vec<_>>()
+            .into(),
+        MaskMode::Luminance => pixmap
+            .data()
+            .chunks_exact(4)
+            .map(|px| {
+                let coverage =
+                    (u16::from(px[0]) * 54 + u16::from(px[1]) * 183 + u16::from(px[2]) * 19 + 127)
+                        / 255;
+                u8::try_from(coverage.min(u16::from(u8::MAX)))
+                    .expect("luminance coverage must fit in u8")
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    }
+}
+
+fn group_mask_bounds(layer: &Layer<'_>) -> Option<IntRect> {
+    let mut bounds = layer.draw_bounds?;
+    if let Some(clip) = layer.clip_in_root() {
+        bounds = bounds.intersect(clip);
+    }
+    let surface_bounds = Rect::from_origin_size(
+        layer.origin,
+        Size::new(
+            f64::from(layer.pixmap.width()),
+            f64::from(layer.pixmap.height()),
+        ),
+    );
+    bounds = bounds.intersect(surface_bounds);
+    if bounds.is_zero_area() {
+        return None;
+    }
+    rect_to_int_rect(bounds)
+}
+
+fn apply_group_mask_to_pixmap(target: &mut Pixmap, group_mask: &GroupMask) {
+    let mask_source = group_mask.coverage.as_ref();
+    let target_width = usize::try_from(target.width()).expect("pixmap width must fit in usize");
+    let target_bytes = target.data_mut();
+    let mask_width = usize::try_from(group_mask.bounds.width()).expect("bounds width must fit in usize");
+    let width = usize::try_from(group_mask.bounds.width()).expect("bounds width must fit in usize");
+    let height =
+        usize::try_from(group_mask.bounds.height()).expect("bounds height must fit in usize");
+    let origin_x = usize::try_from(group_mask.bounds.x()).expect("bounds x must fit in usize");
+    let origin_y = usize::try_from(group_mask.bounds.y()).expect("bounds y must fit in usize");
+
+    for y in 0..height {
+        let target_row = ((origin_y + y) * target_width + origin_x) * 4;
+        let mask_row = y * mask_width;
+        let target_row_bytes = &mut target_bytes[target_row..target_row + width * 4];
+        let mask_row_bytes = &mask_source[mask_row..mask_row + width];
+        for (pixel, &coverage) in target_row_bytes
+            .chunks_exact_mut(4)
+            .zip(mask_row_bytes.iter())
+        {
+            if coverage == 255 {
+                continue;
+            }
+            pixel[0] = mul_div_255(pixel[0], coverage);
+            pixel[1] = mul_div_255(pixel[1], coverage);
+            pixel[2] = mul_div_255(pixel[2], coverage);
+            pixel[3] = mul_div_255(pixel[3], coverage);
         }
     }
 }
 
 fn apply_group_mask(layer: &mut Layer<'_>, group_mask: &GroupMask) {
-    if group_mask.mode == MaskMode::Alpha {
-        apply_alpha_mask_from_pixmap(
-            match &mut layer.pixmap {
-                LayerPixmap::Owned(pixmap) => pixmap,
-                LayerPixmap::Borrowed(_) => return,
-            },
-            group_mask.pixmap.as_ref(),
-        );
-        return;
+    let target = match &mut layer.pixmap {
+        LayerPixmap::Owned(pixmap) => pixmap,
+        LayerPixmap::Borrowed(_) => return,
+    };
+    let local_bounds = IntRect::from_xywh(
+        group_mask.bounds.x() - round_to_i32(layer.origin.x),
+        group_mask.bounds.y() - round_to_i32(layer.origin.y),
+        group_mask.bounds.width(),
+        group_mask.bounds.height(),
+    )
+    .expect("group mask local bounds must be valid");
+
+    apply_group_mask_to_pixmap(
+        target,
+        &GroupMask {
+            bounds: local_bounds,
+            coverage: group_mask.coverage.clone(),
+        },
+    );
+}
+
+fn gaussian_box_radii(sigma: f32) -> Option<[i32; 3]> {
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return None;
     }
 
-    let mask_source = group_mask.pixmap.data();
-    let pixels = layer.pixmap.pixels_mut();
-    for (idx, pixel) in pixels.iter_mut().enumerate() {
-        let coverage = mask_coverage(mask_source, idx, group_mask.mode);
-        *pixel = scale_premultiplied_color(*pixel, coverage);
+    let n = 3.0_f64;
+    let sigma = f64::from(sigma);
+    let ideal_width = ((12.0 * sigma * sigma / n) + 1.0).sqrt();
+    let mut lower_width = ideal_width.floor() as i32;
+    if lower_width % 2 == 0 {
+        lower_width -= 1;
     }
+    let upper_width = lower_width + 2;
+    let m_ideal = (12.0 * sigma * sigma
+        - n * f64::from(lower_width * lower_width)
+        - 4.0 * n * f64::from(lower_width)
+        - 3.0 * n)
+        / (-4.0 * f64::from(lower_width) - 4.0);
+    let lower_count = m_ideal.round().clamp(0.0, n) as usize;
+
+    let mut radii = [0_i32; 3];
+    for (i, radius) in radii.iter_mut().enumerate() {
+        let width = if i < lower_count {
+            lower_width
+        } else {
+            upper_width
+        };
+        *radius = (width - 1) / 2;
+    }
+    Some(radii)
+}
+
+fn box_blur_pass(
+    src: &[PremultipliedColorU8],
+    width: usize,
+    height: usize,
+    radius: i32,
+    horizontal: bool,
+) -> Vec<PremultipliedColorU8> {
+    if radius <= 0 {
+        return src.to_vec();
+    }
+
+    let mut dst = vec![
+        PremultipliedColorU8::from_rgba(0, 0, 0, 0)
+            .expect("transparent premultiplied color is valid");
+        src.len()
+    ];
+    let window = u32::try_from(radius * 2 + 1).expect("window fits u32");
+    let width_i32 = i32::try_from(width).expect("width fits i32");
+    let height_i32 = i32::try_from(height).expect("height fits i32");
+
+    if horizontal {
+        for y in 0..height {
+            let row = y * width;
+            let mut sum_r = 0_u32;
+            let mut sum_g = 0_u32;
+            let mut sum_b = 0_u32;
+            let mut sum_a = 0_u32;
+
+            for sample_x in 0..=radius.min(width_i32 - 1) {
+                let px = src[row + usize::try_from(sample_x).expect("sample_x fits usize")];
+                sum_r += u32::from(px.red());
+                sum_g += u32::from(px.green());
+                sum_b += u32::from(px.blue());
+                sum_a += u32::from(px.alpha());
+            }
+
+            for x in 0..width {
+                let idx = row + x;
+                dst[idx] = PremultipliedColorU8::from_rgba(
+                    u8::try_from((sum_r + window / 2) / window).expect("r fits u8"),
+                    u8::try_from((sum_g + window / 2) / window).expect("g fits u8"),
+                    u8::try_from((sum_b + window / 2) / window).expect("b fits u8"),
+                    u8::try_from((sum_a + window / 2) / window).expect("a fits u8"),
+                )
+                .expect("box blur of premultiplied colors must remain premultiplied");
+
+                let x_i32 = i32::try_from(x).expect("x fits i32");
+                let remove_x = x_i32 - radius;
+                if remove_x >= 0 {
+                    let px = src[row + usize::try_from(remove_x).expect("remove_x fits usize")];
+                    sum_r -= u32::from(px.red());
+                    sum_g -= u32::from(px.green());
+                    sum_b -= u32::from(px.blue());
+                    sum_a -= u32::from(px.alpha());
+                }
+
+                let add_x = x_i32 + radius + 1;
+                if add_x < width_i32 {
+                    let px = src[row + usize::try_from(add_x).expect("add_x fits usize")];
+                    sum_r += u32::from(px.red());
+                    sum_g += u32::from(px.green());
+                    sum_b += u32::from(px.blue());
+                    sum_a += u32::from(px.alpha());
+                }
+            }
+        }
+    } else {
+        for x in 0..width {
+            let mut sum_r = 0_u32;
+            let mut sum_g = 0_u32;
+            let mut sum_b = 0_u32;
+            let mut sum_a = 0_u32;
+
+            for sample_y in 0..=radius.min(height_i32 - 1) {
+                let px = src[usize::try_from(sample_y).expect("sample_y fits usize") * width + x];
+                sum_r += u32::from(px.red());
+                sum_g += u32::from(px.green());
+                sum_b += u32::from(px.blue());
+                sum_a += u32::from(px.alpha());
+            }
+
+            for y in 0..height {
+                let idx = y * width + x;
+                dst[idx] = PremultipliedColorU8::from_rgba(
+                    u8::try_from((sum_r + window / 2) / window).expect("r fits u8"),
+                    u8::try_from((sum_g + window / 2) / window).expect("g fits u8"),
+                    u8::try_from((sum_b + window / 2) / window).expect("b fits u8"),
+                    u8::try_from((sum_a + window / 2) / window).expect("a fits u8"),
+                )
+                .expect("box blur of premultiplied colors must remain premultiplied");
+
+                let y_i32 = i32::try_from(y).expect("y fits i32");
+                let remove_y = y_i32 - radius;
+                if remove_y >= 0 {
+                    let px = src[usize::try_from(remove_y).expect("remove_y fits usize") * width
+                        + x];
+                    sum_r -= u32::from(px.red());
+                    sum_g -= u32::from(px.green());
+                    sum_b -= u32::from(px.blue());
+                    sum_a -= u32::from(px.alpha());
+                }
+
+                let add_y = y_i32 + radius + 1;
+                if add_y < height_i32 {
+                    let px =
+                        src[usize::try_from(add_y).expect("add_y fits usize") * width + x];
+                    sum_r += u32::from(px.red());
+                    sum_g += u32::from(px.green());
+                    sum_b += u32::from(px.blue());
+                    sum_a += u32::from(px.alpha());
+                }
+            }
+        }
+    }
+
+    dst
+}
+
+fn blur_pixmap(pixmap: &Pixmap, sigma_x: f32, sigma_y: f32) -> Option<Pixmap> {
+    let width = usize_from_u32(pixmap.width());
+    let height = usize_from_u32(pixmap.height());
+    let mut current = pixmap.pixels().to_vec();
+
+    if let Some(radii_x) = gaussian_box_radii(sigma_x) {
+        for radius in radii_x {
+            current = box_blur_pass(&current, width, height, radius, true);
+        }
+    }
+    if let Some(radii_y) = gaussian_box_radii(sigma_y) {
+        for radius in radii_y {
+            current = box_blur_pass(&current, width, height, radius, false);
+        }
+    }
+
+    let mut blurred = Pixmap::new(pixmap.width(), pixmap.height())?;
+    blurred.pixels_mut().copy_from_slice(&current);
+    Some(blurred)
+}
+
+fn offset_pixmap(pixmap: &Pixmap, dx: i32, dy: i32) -> Option<Pixmap> {
+    let mut shifted = Pixmap::new(pixmap.width(), pixmap.height())?;
+    shifted.draw_pixmap(
+        dx,
+        dy,
+        pixmap.as_ref(),
+        &PixmapPaint {
+            opacity: 1.0,
+            blend_mode: TinyBlendMode::SourceOver,
+            quality: FilterQuality::Nearest,
+        },
+        Transform::identity(),
+        None,
+    );
+    Some(shifted)
+}
+
+fn drop_shadow_pixmap(
+    pixmap: &Pixmap,
+    dx: i32,
+    dy: i32,
+    sigma_x: f32,
+    sigma_y: f32,
+    color: Color,
+) -> Option<Pixmap> {
+    let mut shadow = Pixmap::new(pixmap.width(), pixmap.height())?;
+    let tint = color.to_rgba8();
+    for (src, dst) in pixmap.pixels().iter().zip(shadow.pixels_mut()) {
+        let alpha = mul_div_255(src.alpha(), tint.a);
+        *dst = tiny_skia::Color::from_rgba8(tint.r, tint.g, tint.b, alpha)
+            .premultiply()
+            .to_color_u8();
+    }
+
+    let blurred = blur_pixmap(&shadow, sigma_x, sigma_y)?;
+    let mut combined = offset_pixmap(&blurred, dx, dy)?;
+    combined.draw_pixmap(
+        0,
+        0,
+        pixmap.as_ref(),
+        &PixmapPaint {
+            opacity: 1.0,
+            blend_mode: TinyBlendMode::SourceOver,
+            quality: FilterQuality::Nearest,
+        },
+        Transform::identity(),
+        None,
+    );
+    Some(combined)
+}
+
+fn translate_rect(rect: Rect, dx: f64, dy: f64) -> Rect {
+    Rect::new(rect.x0 + dx, rect.y0 + dy, rect.x1 + dx, rect.y1 + dy)
+}
+
+fn blur_bounds(rect: Rect, sigma_x: f32, sigma_y: f32) -> Rect {
+    let pad_x = (f64::from(sigma_x) * 3.0).ceil();
+    let pad_y = (f64::from(sigma_y) * 3.0).ceil();
+    Rect::new(
+        rect.x0 - pad_x,
+        rect.y0 - pad_y,
+        rect.x1 + pad_x,
+        rect.y1 + pad_y,
+    )
+}
+
+fn pixmap_region_bounds(pixmap: &Pixmap, rect: Rect) -> Option<IntRect> {
+    let bounds = rect.intersect(Rect::from_origin_size(
+        Point::ZERO,
+        Size::new(f64::from(pixmap.width()), f64::from(pixmap.height())),
+    ));
+    rect_to_int_rect(bounds)
+}
+
+fn draw_local_pixmap(
+    target_width: u32,
+    target_height: u32,
+    origin_x: i32,
+    origin_y: i32,
+    local: &Pixmap,
+) -> Option<Pixmap> {
+    let mut output = Pixmap::new(target_width, target_height)?;
+    let origin_x = usize::try_from(origin_x).expect("origin_x fits usize");
+    let origin_y = usize::try_from(origin_y).expect("origin_y fits usize");
+    let target_stride = usize_from_u32(target_width) * 4;
+    let local_stride = usize_from_u32(local.width()) * 4;
+    let local_height = usize_from_u32(local.height());
+    let src = local.data();
+    let dst = output.data_mut();
+
+    for row in 0..local_height {
+        let src_start = row * local_stride;
+        let src_end = src_start + local_stride;
+        let dst_start = (origin_y + row) * target_stride + origin_x * 4;
+        let dst_end = dst_start + local_stride;
+        dst[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
+    }
+    Some(output)
+}
+
+fn blur_pixmap_local(
+    pixmap: &Pixmap,
+    bounds: Option<Rect>,
+    sigma_x: f32,
+    sigma_y: f32,
+) -> Option<Pixmap> {
+    let Some(bounds) = bounds else {
+        return blur_pixmap(pixmap, sigma_x, sigma_y);
+    };
+    let region = pixmap_region_bounds(pixmap, blur_bounds(bounds, sigma_x, sigma_y))?;
+    let local = pixmap.clone_rect(region)?;
+    let blurred = blur_pixmap(&local, sigma_x, sigma_y)?;
+    draw_local_pixmap(pixmap.width(), pixmap.height(), region.x(), region.y(), &blurred)
+}
+
+fn drop_shadow_pixmap_local(
+    pixmap: &Pixmap,
+    bounds: Option<Rect>,
+    dx: i32,
+    dy: i32,
+    sigma_x: f32,
+    sigma_y: f32,
+    color: Color,
+) -> Option<Pixmap> {
+    let Some(bounds) = bounds else {
+        return drop_shadow_pixmap(pixmap, dx, dy, sigma_x, sigma_y, color);
+    };
+
+    let padded = blur_bounds(bounds, sigma_x, sigma_y);
+    let shadow_bounds = translate_rect(padded, f64::from(dx), f64::from(dy));
+    let region = pixmap_region_bounds(pixmap, bounds.union(shadow_bounds))?;
+    let local = pixmap.clone_rect(region)?;
+    let shadowed = drop_shadow_pixmap(&local, dx, dy, sigma_x, sigma_y, color)?;
+    draw_local_pixmap(pixmap.width(), pixmap.height(), region.x(), region.y(), &shadowed)
+}
+
+fn filter_output_bounds(bounds: Option<Rect>, filter: &Filter, pixmap: &Pixmap) -> Option<Rect> {
+    match *filter {
+        Filter::Flood { .. } => Some(Rect::from_origin_size(
+            Point::ZERO,
+            Size::new(f64::from(pixmap.width()), f64::from(pixmap.height())),
+        )),
+        Filter::Blur {
+            std_deviation_x,
+            std_deviation_y,
+        } => bounds.map(|rect| blur_bounds(rect, std_deviation_x, std_deviation_y)),
+        Filter::Offset { dx, dy } => {
+            let dx = f64::from(round_to_i32(f64::from(dx)));
+            let dy = f64::from(round_to_i32(f64::from(dy)));
+            bounds.map(|rect| translate_rect(rect, dx, dy))
+        }
+        Filter::DropShadow {
+            dx,
+            dy,
+            std_deviation_x,
+            std_deviation_y,
+            ..
+        } => {
+            let dx = f64::from(round_to_i32(f64::from(dx)));
+            let dy = f64::from(round_to_i32(f64::from(dy)));
+            bounds.map(|rect| {
+                let shadow = translate_rect(
+                    blur_bounds(rect, std_deviation_x, std_deviation_y),
+                    dx,
+                    dy,
+                );
+                rect.union(shadow)
+            })
+        }
+    }
+}
+
+fn filter_pixmap(pixmap: &Pixmap, bounds: Option<Rect>, filter: &Filter) -> Option<Pixmap> {
+    match *filter {
+        Filter::Flood { color } => {
+            let mut flooded = Pixmap::new(pixmap.width(), pixmap.height())?;
+            flooded.fill(to_color(color));
+            Some(flooded)
+        }
+        Filter::Blur {
+            std_deviation_x,
+            std_deviation_y,
+        } => blur_pixmap_local(pixmap, bounds, std_deviation_x, std_deviation_y),
+        Filter::DropShadow {
+            dx,
+            dy,
+            std_deviation_x,
+            std_deviation_y,
+            color,
+        } => drop_shadow_pixmap_local(
+            pixmap,
+            bounds,
+            round_to_i32(f64::from(dx)),
+            round_to_i32(f64::from(dy)),
+            std_deviation_x,
+            std_deviation_y,
+            color,
+        ),
+        Filter::Offset { dx, dy } => {
+            offset_pixmap(pixmap, round_to_i32(f64::from(dx)), round_to_i32(f64::from(dy)))
+        }
+    }
+}
+
+fn apply_group_filters(layer: &mut Layer<'_>) {
+    if layer.filters.is_empty() {
+        return;
+    }
+    let Some(pixmap) = (match &layer.pixmap {
+        LayerPixmap::Owned(pixmap) => Some(pixmap.clone()),
+        LayerPixmap::Borrowed(_) => None,
+    }) else {
+        return;
+    };
+
+    let mut current = pixmap;
+    let mut bounds = layer.draw_bounds;
+    for filter in &layer.filters {
+        let Some(next) = filter_pixmap(&current, bounds, filter) else {
+            continue;
+        };
+        bounds = filter_output_bounds(bounds, filter, &current);
+        current = next;
+    }
+
+    if let LayerPixmap::Owned(pixmap) = &mut layer.pixmap {
+        *pixmap = current;
+    }
+    layer.draw_bounds = bounds;
 }
 
 fn apply_layer(layer: &Layer<'_>, parent: &mut Layer<'_>) {
     let Some(composite_rect) = layer_composite_rect(layer, parent) else {
         return;
     };
+    let Some(layer_rect) = root_rect_to_local_int_rect(layer, composite_rect) else {
+        return;
+    };
+    let x = composite_rect.x() - round_to_i32(parent.origin.x);
+    let y = composite_rect.y() - round_to_i32(parent.origin.y);
 
     match determine_blend_strategy(&layer.blend_mode) {
         BlendStrategy::SinglePass(blend_mode) => {
-            draw_layer_region(
+            draw_layer_region_at(
                 parent,
                 layer.pixmap.as_ref(),
-                composite_rect,
+                layer_rect,
+                x,
+                y,
                 blend_mode,
                 layer.alpha,
             );
@@ -2640,30 +4204,34 @@ fn apply_layer(layer: &Layer<'_>, parent: &mut Layer<'_>) {
             first_pass,
             second_pass,
         } => {
-            let Some(original_parent) = parent.pixmap.clone_rect(composite_rect) else {
+            let parent_rect = IntRect::from_xywh(x, y, composite_rect.width(), composite_rect.height())
+                .expect("parent rect must be valid");
+            let Some(original_parent) = parent.pixmap.clone_rect(parent_rect) else {
                 return;
             };
-            let Some(coverage) = layer.pixmap.clone_rect(composite_rect) else {
+            let Some(coverage) = layer.pixmap.clone_rect(layer_rect) else {
                 return;
             };
 
-            draw_layer_region(
+            draw_layer_region_at(
                 parent,
                 layer.pixmap.as_ref(),
-                composite_rect,
+                layer_rect,
+                x,
+                y,
                 first_pass,
                 1.0,
             );
 
-            let Some(mut intermediate) = parent.pixmap.clone_rect(composite_rect) else {
+            let Some(mut intermediate) = parent.pixmap.clone_rect(parent_rect) else {
                 return;
             };
             apply_alpha_mask_from_pixmap(&mut intermediate, coverage.as_ref());
 
             draw_layer_pixmap(
                 &original_parent,
-                composite_rect.x(),
-                composite_rect.y(),
+                x,
+                y,
                 parent,
                 TinyBlendMode::Source,
                 1.0,
@@ -2671,8 +4239,8 @@ fn apply_layer(layer: &Layer<'_>, parent: &mut Layer<'_>) {
 
             draw_layer_pixmap(
                 &intermediate,
-                composite_rect.x(),
-                composite_rect.y(),
+                x,
+                y,
                 parent,
                 second_pass,
                 layer.alpha,
@@ -2709,6 +4277,7 @@ mod tests {
             pixmap: LayerPixmap::Owned(
                 Pixmap::new(width, height).expect("failed to create pixmap"),
             ),
+            origin: Point::ZERO,
             clip_stack: vec![],
             base_clip: None,
             clip: None,
@@ -2720,6 +4289,7 @@ mod tests {
             blend_mode: Mix::Normal.into(),
             alpha: 1.0,
             group_mask: None,
+            filters: Vec::new(),
         }
     }
 
@@ -2869,6 +4439,60 @@ mod tests {
 
         apply_layer(&parent, &mut root);
         assert_eq!(pixel_rgba(&root, 3, 3), (255, 0, 0, 255));
+    }
+
+    #[test]
+    fn blur_pixmap_spreads_alpha_outside_source_pixels() {
+        let mut pixmap = Pixmap::new(7, 7).expect("pixmap");
+        pixmap.fill_rect(
+            tiny_skia::Rect::from_xywh(3.0, 3.0, 1.0, 1.0).expect("rect"),
+            &Paint {
+                shader: Shader::SolidColor(tiny_skia::Color::BLACK),
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+
+        let blurred = blur_pixmap(&pixmap, 1.5, 1.5).expect("blurred pixmap");
+        let neighbor = blurred.pixel(2, 3).expect("neighbor pixel");
+        assert!(neighbor.alpha() > 0);
+    }
+
+    #[test]
+    fn apply_group_filters_expands_blur_beyond_original_draw_bounds() {
+        let mut layer = make_layer(32, 32);
+        layer.fill(&Rect::new(12.0, 12.0, 20.0, 20.0), Color::BLACK, 0.0);
+        layer.filters.push(Filter::Blur {
+            std_deviation_x: 3.0,
+            std_deviation_y: 3.0,
+        });
+
+        apply_group_filters(&mut layer);
+
+        let outside = pixel_rgba(&layer, 9, 16);
+        assert!(outside.3 > 0);
+        let bounds = layer.draw_bounds.expect("filtered draw bounds");
+        assert!(bounds.x0 < 12.0);
+        assert!(bounds.x1 > 20.0);
+    }
+
+    #[test]
+    fn unpremultiply_lookup_matches_exact_formula() {
+        for alpha in 0..=u8::MAX {
+            for channel in 0..=u8::MAX {
+                let expected = if alpha == 0 {
+                    0
+                } else if alpha == u8::MAX {
+                    channel
+                } else {
+                    let value =
+                        (u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha);
+                    u8::try_from(value.min(u32::from(u8::MAX))).expect("fits u8")
+                };
+                assert_eq!(unpremultiply_channel(channel, alpha), expected);
+            }
+        }
     }
 
     #[test]

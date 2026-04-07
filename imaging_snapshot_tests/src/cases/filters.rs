@@ -17,7 +17,7 @@ impl SnapshotCase for GmGroupBlurFilter {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "vello_cpu")
+        matches!(backend, "skia" | "tiny_skia" | "vello_cpu")
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
@@ -49,7 +49,7 @@ impl SnapshotCase for GmGroupDropShadow {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "vello_cpu")
+        matches!(backend, "skia" | "tiny_skia" | "vello_cpu")
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
@@ -82,7 +82,7 @@ impl SnapshotCase for GmBlurredRoundedRect {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "vello_cpu" | "vello")
+        matches!(backend, "skia" | "tiny_skia" | "vello_cpu" | "vello")
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
@@ -120,7 +120,7 @@ impl SnapshotCase for GmBlurredRoundedRectVariants {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "vello_cpu" | "vello")
+        matches!(backend, "skia" | "tiny_skia" | "vello_cpu" | "vello")
     }
 
     fn vello_max_diff_pixels(&self) -> u64 {
