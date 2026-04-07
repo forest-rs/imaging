@@ -3154,23 +3154,30 @@ fn draw_brushed_glyphs_into_layer<'a>(
     let Some(mask_bounds) = mask_layer.draw_bounds else {
         return;
     };
-    let Some(mask_rect) = rect_to_int_rect(mask_bounds) else {
+    let Some(mask_bounds) = rect_to_int_rect(mask_bounds) else {
         return;
     };
-    let Some(local_mask) = mask_layer.pixmap.clone_rect(mask_rect) else {
+    let Some(local_mask) = clone_pixmap_region(mask_layer.pixmap.as_ref(), mask_bounds) else {
         return;
     };
-
-    let mut content_layer = match Layer::new_root(mask_rect.width(), mask_rect.height()) {
+    let mut content_layer = match Layer::new_root(mask_bounds.width(), mask_bounds.height()) {
         Ok(layer) => layer,
         Err(_) => return,
     };
-    content_layer.origin = Point::new(f64::from(mask_rect.x()), f64::from(mask_rect.y()));
-    content_layer.transform = run.transform;
+    let canvas_rect = Rect::from_origin_size(
+        Point::ZERO,
+        Size::new(
+            f64::from(mask_bounds.width()),
+            f64::from(mask_bounds.height()),
+        ),
+    );
     content_layer.fill_with_brush_transform_and_mode(
-        &mask_bounds,
+        &canvas_rect,
         run.brush,
-        None,
+        Some(Affine::translate((
+            f64::from(mask_bounds.x()),
+            f64::from(mask_bounds.y()),
+        ))),
         1.0,
         TinyBlendMode::SourceOver,
     );
@@ -3181,26 +3188,16 @@ fn draw_brushed_glyphs_into_layer<'a>(
         },
         local_mask.as_ref(),
     );
-    content_layer.draw_bounds = Some(mask_bounds);
-    layer.draw_bounds = Some(
-        layer
-            .draw_bounds
-            .map(|bounds| bounds.union(mask_bounds))
-            .unwrap_or(mask_bounds),
-    );
-    let content_pixmap = match &content_layer.pixmap {
-        LayerPixmap::Owned(pixmap) => pixmap,
-        LayerPixmap::Borrowed(_) => return,
-    };
-    draw_layer_pixmap(
-        content_pixmap,
-        mask_rect.x() - round_to_i32(layer.origin.x),
-        mask_rect.y() - round_to_i32(layer.origin.y),
-        layer,
-        TinyBlendMode::SourceOver,
-        1.0,
-        true,
-    );
+    content_layer.origin = Point::new(f64::from(mask_bounds.x()), f64::from(mask_bounds.y()));
+    content_layer.draw_bounds = Some(Rect::new(
+        f64::from(mask_bounds.x()),
+        f64::from(mask_bounds.y()),
+        f64::from(mask_bounds.x())
+            + f64::from(i32::try_from(mask_bounds.width()).expect("width fits i32")),
+        f64::from(mask_bounds.y())
+            + f64::from(i32::try_from(mask_bounds.height()).expect("height fits i32")),
+    ));
+    apply_layer(&content_layer, layer);
 }
 
 fn draw_glyphs_into_layer<'a>(
@@ -3226,7 +3223,14 @@ fn draw_glyphs_into_layer<'a>(
             Color::from(color),
         ),
         _ => {
-            draw_brushed_glyphs_into_layer(caches, layer, cache_color, origin, run.clone(), &glyphs)
+            draw_brushed_glyphs_into_layer(
+                caches,
+                layer,
+                cache_color,
+                origin,
+                run.clone(),
+                &glyphs,
+            );
         }
     }
 }
