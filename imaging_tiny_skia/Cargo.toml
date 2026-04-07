@@ -1,0 +1,21 @@
+[package]
+name = "imaging_tiny_skia"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tiny-skia backend for the imaging command stream."
+readme = "README.md"
+publish = false
+
+[dependencies]
+imaging = { workspace = true }
+kurbo.workspace = true
+peniko = { workspace = true, features = ["std"] }
+rustc-hash = "2.1"
+swash = "0.2"
+tiny-skia = "0.11"
+
+[lints]
+workspace = true

@@ -4,6 +4,7 @@ members = [
     "imaging",
     "imaging_conformance",
     "imaging_skia",
+    "imaging_tiny_skia",
     "imaging_snapshot_tests",
     "imaging_vello",
     "imaging_vello_cpu",
@@ -26,6 +27,7 @@ repository = "https://github.com/forest-rs/imaging"
 [workspace.dependencies]
 imaging = { path = "imaging" }
 imaging_skia = { path = "imaging_skia" }
+imaging_tiny_skia = { path = "imaging_tiny_skia" }
 imaging_vello = { path = "imaging_vello" }
 imaging_vello_cpu = { path = "imaging_vello_cpu" }
 imaging_vello_hybrid = { path = "imaging_vello_hybrid" }
