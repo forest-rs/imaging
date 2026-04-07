@@ -1473,6 +1473,107 @@ impl<'a> Layer<'a> {
         true
     }
 
+    fn try_fill_image_fallback<T>(
+        &mut self,
+        shape: &impl Shape,
+        image: &peniko::ImageBrush<T>,
+        brush_transform: Option<Affine>,
+        opacity: f32,
+        blend_mode: TinyBlendMode,
+    ) -> bool
+    where
+        T: Borrow<ImageData>,
+    {
+        if !image_brush_has_mixed_extend(image) {
+            return false;
+        }
+        let Some(path) = shape_to_path(shape) else {
+            return false;
+        };
+        let Some(image_pixmap) = image_brush_pixmap(image) else {
+            return false;
+        };
+
+        let device_bounds = self
+            .device_transform()
+            .transform_rect_bbox(shape.bounding_box());
+        let device_bounds = self
+            .clip
+            .map_or(device_bounds, |clip| clip.intersect(device_bounds));
+        let Some(bounds) = rect_to_int_rect(device_bounds) else {
+            return true;
+        };
+        let x0 = bounds.x().max(0);
+        let y0 = bounds.y().max(0);
+        let x1 = (bounds.x() + i32::try_from(bounds.width()).expect("width fits in i32"))
+            .min(i32::try_from(self.pixmap.width()).expect("pixmap width fits in i32"));
+        let y1 = (bounds.y() + i32::try_from(bounds.height()).expect("height fits in i32"))
+            .min(i32::try_from(self.pixmap.height()).expect("pixmap height fits in i32"));
+        if x0 >= x1 || y0 >= y1 {
+            return true;
+        }
+
+        let local_width = u32::try_from(x1 - x0).expect("local width fits u32");
+        let local_height = u32::try_from(y1 - y0).expect("local height fits u32");
+        let mut coverage = match Mask::new(local_width, local_height) {
+            Some(mask) => mask,
+            None => return false,
+        };
+        coverage.fill_path(
+            &path,
+            FillRule::Winding,
+            true,
+            self.skia_transform()
+                .post_translate(-(x0 as f32), -(y0 as f32)),
+        );
+
+        let mut pixmap = match Pixmap::new(local_width, local_height) {
+            Some(pixmap) => pixmap,
+            None => return false,
+        };
+        let sample_transform = brush_transform.unwrap_or(Affine::IDENTITY).inverse();
+        let sample_origin =
+            sample_transform * Point::new(f64::from(x0) + 0.5, f64::from(y0) + 0.5);
+        let sample_dx = Vec2::new(sample_transform.as_coeffs()[0], sample_transform.as_coeffs()[1]);
+        let sample_dy = Vec2::new(sample_transform.as_coeffs()[2], sample_transform.as_coeffs()[3]);
+        let coverage_data = coverage.data();
+        let pixels = pixmap.pixels_mut();
+        let stride = usize_from_u32(local_width);
+        let alpha = opacity_to_u8(opacity);
+
+        let mut row_point = sample_origin;
+        for local_y in 0..local_height {
+            let mut point = row_point;
+            for local_x in 0..local_width {
+                let idx = usize_from_u32(local_y) * stride + usize_from_u32(local_x);
+                let coverage_alpha = coverage_data[idx];
+                if coverage_alpha != 0 {
+                    let sampled = sample_image_brush_at(&image_pixmap, image, point);
+                    pixels[idx] = scale_premultiplied_color(sampled, mul_div_255(alpha, coverage_alpha));
+                }
+                point += sample_dx;
+            }
+            row_point += sample_dy;
+        }
+
+        self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
+        self.materialize_simple_clip_mask();
+        let clip_mask = self.clip.is_some().then_some(&self.mask);
+        self.pixmap.draw_pixmap(
+            x0,
+            y0,
+            pixmap.as_ref(),
+            &PixmapPaint {
+                opacity: 1.0,
+                blend_mode,
+                quality: FilterQuality::Nearest,
+            },
+            Transform::identity(),
+            clip_mask,
+        );
+        true
+    }
+
     fn skia_transform(&self) -> Transform {
         skia_transform(self.device_transform())
     }
@@ -1576,6 +1677,15 @@ impl Layer<'_> {
     ) {
         let brush = brush.into();
         if let BrushRef::Image(image) = brush {
+            if self.try_fill_image_fallback(
+                shape,
+                &image,
+                brush_transform,
+                opacity,
+                blend_mode,
+            ) {
+                return;
+            }
             let image_pixmap = try_ret!(image_brush_pixmap(&image));
             let paint = Paint {
                 shader: Pattern::new(
@@ -2824,13 +2934,14 @@ fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     u8::try_from(value.min(u32::from(u8::MAX))).expect("unpremultiplied channel must fit in u8")
 }
 
-fn draw_glyphs_into_layer<'a>(
+fn draw_solid_color_glyphs_into_layer<'a>(
     caches: &mut RendererCaches,
     layer: &mut Layer<'_>,
     cache_color: CacheColor,
     origin: Point,
-    run: &GlyphRunRef<'a>,
-    glyphs: impl Iterator<Item = imaging::record::Glyph> + 'a,
+    run: GlyphRunRef<'a>,
+    glyphs: &[imaging::record::Glyph],
+    brush_color: Color,
 ) {
     let font = run.font;
     let text_transform = run.transform;
@@ -2843,10 +2954,6 @@ fn draw_glyphs_into_layer<'a>(
     };
     let transform = normalize_affine(text_transform, false) * Affine::scale(1.0 / oversample);
     let raster_origin = transform.inverse() * (text_transform * origin);
-    let brush_color = match &run.brush {
-        peniko::Brush::Solid(color) => Color::from(*color),
-        _ => return,
-    };
     let font_ref = match FontRef::from_index(font.data.data(), font.index as usize) {
         Some(f) => f,
         None => return,
@@ -2906,6 +3013,116 @@ fn draw_glyphs_into_layer<'a>(
                 },
             );
         }
+    }
+}
+
+fn draw_brushed_glyphs_into_layer<'a>(
+    caches: &mut RendererCaches,
+    layer: &mut Layer<'_>,
+    cache_color: CacheColor,
+    origin: Point,
+    run: GlyphRunRef<'a>,
+    glyphs: &[imaging::record::Glyph],
+) {
+    let width = layer.pixmap.width();
+    let height = layer.pixmap.height();
+    let mut mask_layer = match Layer::new_root(width, height) {
+        Ok(layer) => layer,
+        Err(_) => return,
+    };
+    let mask_run = GlyphRunRef {
+        brush: BrushRef::Solid(Color::WHITE),
+        ..run
+    };
+    draw_solid_color_glyphs_into_layer(
+        caches,
+        &mut mask_layer,
+        cache_color,
+        origin,
+        mask_run,
+        glyphs,
+        Color::WHITE,
+    );
+    let Some(mask_bounds) = mask_layer.draw_bounds else {
+        return;
+    };
+    let Some(mask_rect) = rect_to_int_rect(mask_bounds) else {
+        return;
+    };
+    let Some(local_mask) = mask_layer.pixmap.clone_rect(mask_rect) else {
+        return;
+    };
+
+    let mut content_layer = match Layer::new_root(mask_rect.width(), mask_rect.height()) {
+        Ok(layer) => layer,
+        Err(_) => return,
+    };
+    content_layer.origin = Point::new(f64::from(mask_rect.x()), f64::from(mask_rect.y()));
+    content_layer.transform = run.transform;
+    content_layer.fill_with_brush_transform_and_mode(
+        &mask_bounds,
+        run.brush,
+        None,
+        1.0,
+        TinyBlendMode::SourceOver,
+    );
+    apply_alpha_mask_from_pixmap(
+        match &mut content_layer.pixmap {
+            LayerPixmap::Owned(pixmap) => pixmap,
+            LayerPixmap::Borrowed(_) => return,
+        },
+        local_mask.as_ref(),
+    );
+    content_layer.draw_bounds = Some(mask_bounds);
+    layer.draw_bounds = Some(
+        layer.draw_bounds
+            .map(|bounds| bounds.union(mask_bounds))
+            .unwrap_or(mask_bounds),
+    );
+    let content_pixmap = match &content_layer.pixmap {
+        LayerPixmap::Owned(pixmap) => pixmap,
+        LayerPixmap::Borrowed(_) => return,
+    };
+    draw_layer_pixmap(
+        content_pixmap,
+        mask_rect.x() - round_to_i32(layer.origin.x),
+        mask_rect.y() - round_to_i32(layer.origin.y),
+        layer,
+        TinyBlendMode::SourceOver,
+        1.0,
+    );
+}
+
+fn draw_glyphs_into_layer<'a>(
+    caches: &mut RendererCaches,
+    layer: &mut Layer<'_>,
+    cache_color: CacheColor,
+    origin: Point,
+    run: &GlyphRunRef<'a>,
+    glyphs: impl Iterator<Item = imaging::record::Glyph> + 'a,
+) {
+    let glyphs: Vec<_> = glyphs.collect();
+    if glyphs.is_empty() {
+        return;
+    }
+    match run.brush {
+        BrushRef::Solid(color) => draw_solid_color_glyphs_into_layer(
+            caches,
+            layer,
+            cache_color,
+            origin,
+            run.clone(),
+            &glyphs,
+            Color::from(color),
+        ),
+        _ => draw_brushed_glyphs_into_layer(
+            caches,
+            layer,
+            cache_color,
+            origin,
+            run.clone(),
+            &glyphs,
+        ),
     }
 }
 
@@ -3377,13 +3594,106 @@ where
     realize_image_pixmap(image.image.borrow())
 }
 
+fn image_brush_has_mixed_extend<T>(image: &peniko::ImageBrush<T>) -> bool {
+    image.sampler.x_extend != image.sampler.y_extend
+}
+
 fn image_brush_spread_mode<T>(image: &peniko::ImageBrush<T>) -> SpreadMode {
-    let extend = if image.sampler.x_extend == image.sampler.y_extend {
-        image.sampler.x_extend
-    } else {
-        Extend::Pad
+    debug_assert!(
+        !image_brush_has_mixed_extend(image),
+        "mixed-axis image brushes must use the custom fallback path"
+    );
+    to_spread_mode(image.sampler.x_extend)
+}
+
+fn extend_image_axis(coord: f32, size: u32, extend: Extend) -> Option<f32> {
+    let size = size as f32;
+    if size <= 0.0 {
+        return None;
+    }
+    Some(match extend {
+        Extend::Pad => coord.clamp(0.0, size - 1.0),
+        Extend::Repeat => coord.rem_euclid(size),
+        Extend::Reflect => {
+            let period = size * 2.0;
+            let value = coord.rem_euclid(period);
+            if value < size { value } else { period - value - 1.0 }
+        }
+    })
+}
+
+fn premul_to_rgba_f32(color: PremultipliedColorU8) -> [f32; 4] {
+    [
+        f32::from(color.red()) / 255.0,
+        f32::from(color.green()) / 255.0,
+        f32::from(color.blue()) / 255.0,
+        f32::from(color.alpha()) / 255.0,
+    ]
+}
+
+fn sample_image_brush_at<T>(
+    pixmap: &Pixmap,
+    image: &peniko::ImageBrush<T>,
+    point: Point,
+) -> PremultipliedColorU8
+where
+    T: Borrow<ImageData>,
+{
+    let quality = image_quality_to_filter_quality(image.sampler.quality);
+    let opacity = opacity_to_u8(image.sampler.alpha);
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let sample = |x: f32, y: f32| -> PremultipliedColorU8 {
+        let Some(x) = extend_image_axis(x, width, image.sampler.x_extend) else {
+            return PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent is valid");
+        };
+        let Some(y) = extend_image_axis(y, height, image.sampler.y_extend) else {
+            return PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent is valid");
+        };
+        pixmap
+            .pixel(
+                u32::try_from(f32_to_i32(x.round())).expect("wrapped x must fit u32"),
+                u32::try_from(f32_to_i32(y.round())).expect("wrapped y must fit u32"),
+            )
+            .unwrap_or_else(|| tiny_skia::Color::TRANSPARENT.premultiply().to_color_u8())
     };
-    to_spread_mode(extend)
+
+    let color = match quality {
+        FilterQuality::Nearest => {
+            sample(f64_to_f32(point.x).floor(), f64_to_f32(point.y).floor())
+        }
+        FilterQuality::Bilinear => {
+            let x = f64_to_f32(point.x) - 0.5;
+            let y = f64_to_f32(point.y) - 0.5;
+            let x0 = x.floor();
+            let y0 = y.floor();
+            let tx = x - x0;
+            let ty = y - y0;
+            let c00 = premul_to_rgba_f32(sample(x0, y0));
+            let c10 = premul_to_rgba_f32(sample(x0 + 1.0, y0));
+            let c01 = premul_to_rgba_f32(sample(x0, y0 + 1.0));
+            let c11 = premul_to_rgba_f32(sample(x0 + 1.0, y0 + 1.0));
+            let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+            let mut rgba = [0.0; 4];
+            for i in 0..4 {
+                let top = lerp(c00[i], c10[i], tx);
+                let bottom = lerp(c01[i], c11[i], tx);
+                rgba[i] = lerp(top, bottom, ty);
+            }
+            tiny_skia::Color::from_rgba(
+                rgba[0].clamp(0.0, 1.0),
+                rgba[1].clamp(0.0, 1.0),
+                rgba[2].clamp(0.0, 1.0),
+                rgba[3].clamp(0.0, 1.0),
+            )
+            .expect("sampled image color must be valid")
+            .premultiply()
+            .to_color_u8()
+        }
+        FilterQuality::Bicubic => sample(f64_to_f32(point.x), f64_to_f32(point.y)),
+    };
+
+    scale_premultiplied_color(color, opacity)
 }
 
 const GRADIENT_TOLERANCE: f32 = 0.01;
@@ -4768,6 +5078,7 @@ fn skia_transform(affine: Affine) -> Transform {
 mod tests {
     use super::*;
     use imaging::{GroupRef, MaskMode, Painter, record::Scene};
+    use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
     use peniko::color::{ColorSpaceTag, HueDirection, palette::css};
 
     /// Creates a `Layer` directly without a window, for offscreen rendering.
@@ -4924,11 +5235,11 @@ mod tests {
     #[test]
     fn scaled_image_cache_is_used_for_rect_image_fills() {
         let image = ImageData {
-            data: peniko::Blob::new(Arc::new([
+            data: Blob::new(Arc::new([
                 255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
             ])),
-            format: peniko::ImageFormat::Rgba8,
-            alpha_type: peniko::ImageAlphaType::Alpha,
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
             width: 2,
             height: 2,
         };
@@ -4994,6 +5305,31 @@ mod tests {
             .1
             .clone();
         assert!(Arc::ptr_eq(&cached, &reused));
+    }
+
+    #[test]
+    fn mixed_axis_image_extend_does_not_collapse_to_pad() {
+        let image = ImageData {
+            data: Blob::new(Arc::new([
+                255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ])),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 2,
+            height: 2,
+        };
+        let brush = peniko::ImageBrush::new(image)
+            .with_quality(ImageQuality::Low)
+            .with_x_extend(Extend::Repeat)
+            .with_y_extend(Extend::Pad);
+
+        let mut layer = make_layer(6, 4);
+        layer.fill(&Rect::new(0.0, 0.0, 6.0, 4.0), &brush);
+
+        assert_eq!(pixel_rgba(&layer, 0, 0), (255, 0, 0, 255));
+        assert_eq!(pixel_rgba(&layer, 2, 0), (255, 0, 0, 255));
+        assert_eq!(pixel_rgba(&layer, 4, 0), (255, 0, 0, 255));
+        assert_eq!(pixel_rgba(&layer, 2, 3), (0, 0, 255, 255));
     }
 
     #[test]

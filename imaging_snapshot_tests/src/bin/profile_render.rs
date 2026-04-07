@@ -3,8 +3,10 @@
 
 //! Repeated render harness for CPU profiling snapshot backends.
 
+#[cfg(any(feature = "skia", feature = "tiny_skia", feature = "vello_cpu"))]
 use std::time::Instant;
 
+#[cfg(any(feature = "skia", feature = "tiny_skia", feature = "vello_cpu"))]
 use imaging_snapshot_tests::cases::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, build_scene, selected_cases_for_backend,
 };
@@ -16,6 +18,7 @@ use imaging_tiny_skia::TinySkiaRenderer;
 #[cfg(feature = "vello_cpu")]
 use imaging_vello_cpu::VelloCpuRenderer;
 
+#[cfg(any(feature = "skia", feature = "tiny_skia", feature = "vello_cpu"))]
 fn parse_loops() -> usize {
     std::env::var("IMAGING_PROFILE_LOOPS")
         .ok()
@@ -24,6 +27,13 @@ fn parse_loops() -> usize {
         .unwrap_or(400)
 }
 
+#[cfg(any(feature = "skia", feature = "tiny_skia", feature = "vello_cpu"))]
+fn image_checksum(data: &[u8]) -> u64 {
+    data.iter()
+        .fold(0_u64, |acc, &byte| acc.wrapping_add(u64::from(byte)))
+}
+
+#[cfg(any(feature = "skia", feature = "tiny_skia", feature = "vello_cpu"))]
 fn main() {
     let backend = std::env::var("IMAGING_PROFILE_BACKEND")
         .expect("set IMAGING_PROFILE_BACKEND to `skia`, `tiny_skia`, or `vello_cpu`");
@@ -38,24 +48,19 @@ fn main() {
     let scene = build_scene(case, f64::from(DEFAULT_WIDTH), f64::from(DEFAULT_HEIGHT));
 
     let start = Instant::now();
-    let mut checksum = 0_u64;
-
-    match backend.as_str() {
+    let checksum = match backend.as_str() {
         "skia" => {
             #[cfg(feature = "skia")]
             {
                 let mut renderer = SkiaRenderer::new();
+                let mut checksum = 0_u64;
                 for _ in 0..loops {
                     let image = renderer
                         .render_scene(&scene, DEFAULT_WIDTH, DEFAULT_HEIGHT)
                         .expect("render image");
-                    checksum = checksum.wrapping_add(
-                        image
-                            .data
-                            .iter()
-                            .fold(0_u64, |acc, &byte| acc.wrapping_add(u64::from(byte))),
-                    );
+                    checksum = checksum.wrapping_add(image_checksum(&image.data));
                 }
+                checksum
             }
             #[cfg(not(feature = "skia"))]
             {
@@ -67,17 +72,14 @@ fn main() {
             #[cfg(feature = "tiny_skia")]
             {
                 let mut renderer = TinySkiaRenderer::new();
+                let mut checksum = 0_u64;
                 for _ in 0..loops {
                     let image = renderer
                         .render_scene(&scene, u32::from(DEFAULT_WIDTH), u32::from(DEFAULT_HEIGHT))
                         .expect("render image");
-                    checksum = checksum.wrapping_add(
-                        image
-                            .data
-                            .iter()
-                            .fold(0_u64, |acc, &byte| acc.wrapping_add(u64::from(byte))),
-                    );
+                    checksum = checksum.wrapping_add(image_checksum(&image.data));
                 }
+                checksum
             }
             #[cfg(not(feature = "tiny_skia"))]
             {
@@ -89,17 +91,14 @@ fn main() {
             #[cfg(feature = "vello_cpu")]
             {
                 let mut renderer = VelloCpuRenderer::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+                let mut checksum = 0_u64;
                 for _ in 0..loops {
                     let image = renderer
                         .render_scene(&scene, DEFAULT_WIDTH, DEFAULT_HEIGHT)
                         .expect("render image");
-                    checksum = checksum.wrapping_add(
-                        image
-                            .data
-                            .iter()
-                            .fold(0_u64, |acc, &byte| acc.wrapping_add(u64::from(byte))),
-                    );
+                    checksum = checksum.wrapping_add(image_checksum(&image.data));
                 }
+                checksum
             }
             #[cfg(not(feature = "vello_cpu"))]
             {
@@ -108,7 +107,7 @@ fn main() {
             }
         }
         other => panic!("unsupported profiling backend `{other}`"),
-    }
+    };
 
     let elapsed = start.elapsed();
     eprintln!(
@@ -116,4 +115,9 @@ fn main() {
         case.name(),
         elapsed.as_millis(),
     );
+}
+
+#[cfg(not(any(feature = "skia", feature = "tiny_skia", feature = "vello_cpu")))]
+fn main() {
+    panic!("profile_render built without any CPU profiling backend feature");
 }
