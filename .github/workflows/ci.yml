@@ -52,6 +52,8 @@ env:
   FEATURES_DEPENDING_ON_STD: "std,default"
   RUST_ALL_FEATURES_EXCLUDE_PKGS: >-
     --exclude imaging_vello
+  RUST_TEST_EXCLUDE_PKGS: >-
+    --exclude imaging_snapshot_tests
 
 
 # Rationale
@@ -226,7 +228,11 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo nextest
-        run: cargo nextest run ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} --workspace --locked --all-features --no-fail-fast
+        run: cargo nextest run ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} ${{ env.RUST_TEST_EXCLUDE_PKGS }} --workspace --locked --all-features --no-fail-fast
+
+      - name: cargo nextest (imaging_snapshot_tests)
+        if: runner.os == 'macOS'
+        run: cargo nextest run -p imaging_snapshot_tests --locked --all-features --no-fail-fast
 
       - name: cargo nextest (imaging_vello, vello-0-8)
         run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-8 --no-fail-fast
