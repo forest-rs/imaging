@@ -161,16 +161,30 @@ struct GlyphKeyInput {
 
 impl GlyphCacheKey {
     fn new(input: GlyphKeyInput) -> (Self, f32, f32) {
+        const GLYPH_SUBPIXEL_BINS: f32 = 8.0;
         let font_size_bits = input.font_size.to_bits();
         let x_floor = input.x.floor();
-        let y_floor = input.y.floor();
+        let y_floor = if input.hint {
+            input.y.round()
+        } else {
+            input.y.floor()
+        };
         let x_fract = input.x - x_floor;
         let y_fract = input.y - y_floor;
-        // 4 subpixel bins per axis (matching old SubpixelBin behavior)
-        let x_bin = u8::try_from(f32_to_i32((x_fract * 4.0).min(3.0).round()))
-            .expect("x subpixel bin must fit in u8");
-        let y_bin = u8::try_from(f32_to_i32((y_fract * 4.0).min(3.0).round()))
-            .expect("y subpixel bin must fit in u8");
+        let max_bin = GLYPH_SUBPIXEL_BINS - 1.0;
+        // Use finer subpixel positioning so small text tracks Skia more closely.
+        let x_bin = u8::try_from(f32_to_i32(
+            (x_fract * GLYPH_SUBPIXEL_BINS).min(max_bin).round(),
+        ))
+        .expect("x subpixel bin must fit in u8");
+        let y_bin = if input.hint {
+            0
+        } else {
+            u8::try_from(f32_to_i32(
+                (y_fract * GLYPH_SUBPIXEL_BINS).min(max_bin).round(),
+            ))
+            .expect("y subpixel bin must fit in u8")
+        };
         let skew_bits = input.skew.unwrap_or(0.0).to_bits();
 
         (
@@ -185,8 +199,8 @@ impl GlyphCacheKey {
                 embolden: input.embolden,
                 skew_bits,
             },
-            x_floor + f32::from(x_bin) / 4.0,
-            y_floor + f32::from(y_bin) / 4.0,
+            x_floor,
+            y_floor,
         )
     }
 }
@@ -3204,21 +3218,6 @@ fn affine_scale_components(transform: Affine) -> (f64, f64, f64) {
     (scale_x, scale_y, uniform)
 }
 
-#[cfg(test)]
-fn scaled_embolden_strength(font_embolden: Vec2, raster_scale: f64) -> f32 {
-    f64_to_f32(font_embolden.x.abs().max(font_embolden.y.abs()) * raster_scale)
-}
-
-const MIN_TEXT_RASTER_SCALE: f64 = 2.0;
-
-fn effective_text_raster_scale(raster_scale: f64) -> f64 {
-    if raster_scale <= 0.0 {
-        raster_scale
-    } else {
-        raster_scale.max(MIN_TEXT_RASTER_SCALE)
-    }
-}
-
 fn usize_from_u32(value: u32) -> usize {
     usize::try_from(value).expect("u32 value must fit in usize")
 }
@@ -3448,7 +3447,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
     let font = run.font;
     let text_transform = run.transform;
     let (_, _, raster_scale) = affine_scale_components(text_transform);
-    let effective_raster_scale = effective_text_raster_scale(raster_scale);
+    let effective_raster_scale = raster_scale;
     let oversample = if raster_scale > 0.0 {
         effective_raster_scale / raster_scale
     } else {
@@ -3464,6 +3463,8 @@ fn draw_solid_color_glyphs_into_layer<'a>(
     let skew = run
         .glyph_transform
         .map(|transform| f64_to_f32(transform.as_coeffs()[0].atan().to_degrees()));
+    let embolden_strength = 0.0;
+    let embolden = false;
 
     for glyph in glyphs {
         let glyph_x = f64_to_f32(raster_origin.x + glyph.x as f64 * effective_raster_scale);
@@ -3481,7 +3482,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
             x: glyph_x,
             y: glyph_y,
             hint: run.hint,
-            embolden: false,
+            embolden,
             skew,
         });
 
@@ -3495,25 +3496,23 @@ fn draw_solid_color_glyphs_into_layer<'a>(
                 font_size: scaled_font_size,
                 hint: run.hint,
                 normalized_coords: run.normalized_coords,
-                embolden_strength: 0.0,
+                embolden_strength,
                 skew,
-                offset_x: new_x,
-                offset_y: new_y,
+                offset_x: new_x + f32::from(cache_key.x_bin) / 8.0,
+                offset_y: new_y + f32::from(cache_key.y_bin) / 8.0,
             },
         );
 
         if let Some(cached) = cached {
-            layer.render_pixmap_direct(
-                cached.pixmap.as_ref(),
-                new_x + cached.left,
-                new_y - cached.top,
-                transform,
-                if oversample > 1.0 {
-                    FilterQuality::Bilinear
-                } else {
+            let draw_x = new_x + cached.left;
+            let draw_y = new_y - cached.top;
+            let quality =
+                if integer_translation(transform, f64::from(draw_x), f64::from(draw_y)).is_some() {
                     FilterQuality::Nearest
-                },
-            );
+                } else {
+                    FilterQuality::Bilinear
+                };
+            layer.render_pixmap_direct(cached.pixmap.as_ref(), draw_x, draw_y, transform, quality);
         }
     }
 }
@@ -6129,12 +6128,22 @@ mod tests {
     }
 
     #[test]
-    fn text_raster_scale_has_two_x_floor() {
-        assert_eq!(effective_text_raster_scale(0.0), 0.0);
-        assert_eq!(effective_text_raster_scale(1.0), 2.0);
-        assert_eq!(effective_text_raster_scale(1.5), 2.0);
-        assert_eq!(effective_text_raster_scale(2.0), 2.0);
-        assert_eq!(effective_text_raster_scale(3.0), 3.0);
+    fn glyph_cache_key_preserves_subpixel_bins() {
+        let (cache_key, x, y) = GlyphCacheKey::new(GlyphKeyInput {
+            font_blob_id: 1,
+            font_index: 0,
+            glyph_id: 7,
+            font_size: 13.0,
+            x: 12.2,
+            y: 19.8,
+            hint: true,
+            embolden: false,
+            skew: None,
+        });
+        assert_eq!(cache_key.x_bin, 2);
+        assert_eq!(cache_key.y_bin, 0);
+        assert_eq!(x, 12.0);
+        assert_eq!(y, 20.0);
     }
 
     #[test]

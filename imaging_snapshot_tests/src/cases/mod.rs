@@ -116,6 +116,7 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &text::GmGlyphRunsGradientStroke,
     &text::GmGlyphRunsImageFill,
     &text::GmGlyphRunsImageStroke,
+    &text::GmTextEditorLorem,
     &svg::GmSvgLayeredCard,
     &svg::GmSvgLuminanceMask,
     &svg::GmSvgTextBanner,
