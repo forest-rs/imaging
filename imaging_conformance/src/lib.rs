@@ -1,33 +1,48 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Conformance tests for the `imaging` command semantics.
+//! Backend-neutral conformance helpers for `imaging`.
 //!
-//! This crate is intentionally `std`-using and `publish = false`. It exists to keep test-only
-//! dependencies out of the core `imaging` crate.
+//! This crate is intentionally for a small, curated set of semantic contract tests:
+//! behaviors we want to preserve even as internal representations and helper APIs are refactored.
+//! Examples include stack balancing, append/replay preservation, and context/diagnostic semantics.
+//!
+//! It is **not** intended to absorb every test that could be written against `imaging`.
+//! Implementation-adjacent regressions, helper edge cases, and module-local invariants should
+//! usually stay in the owning crate next to the code they exercise.
+//!
+//! The actual conformance specifications live in the integration tests under `tests/`, while this
+//! library module stays intentionally tiny and only provides shared assertions/helpers.
 
-#[cfg(test)]
-mod tests {
-    use imaging::{
-        ClipRef,
-        record::{Geometry, Group, Scene, ValidateError},
-    };
-    use kurbo::Rect;
+use imaging::{
+    diagnostics::DiagnosticKind,
+    record::{Scene, ValidateError},
+};
 
-    #[test]
-    fn smoke() {
-        let mut s = Scene::new();
-        s.push_clip(ClipRef::fill(Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0))).to_owned());
-        s.push_group(Group::default());
-        s.pop_group();
-        s.pop_clip();
-        assert_eq!(s.validate(), Ok(()));
+/// Assert that a recorded scene is structurally valid.
+pub fn assert_validate_ok(scene: &Scene) {
+    assert_eq!(
+        scene.validate(),
+        Ok(()),
+        "expected scene to validate successfully"
+    );
+}
 
-        let mut bad = Scene::new();
-        bad.pop_clip();
-        assert_eq!(
-            bad.validate(),
-            Err(ValidateError::UnbalancedPopClip { contexts: vec![] })
-        );
-    }
+/// Assert that a recorded scene fails validation with the expected error.
+pub fn assert_validate_err(scene: &Scene, expected: ValidateError) {
+    assert_eq!(
+        scene.validate(),
+        Err(expected),
+        "expected scene to fail validation with the specified error"
+    );
+}
+
+/// Collect just the diagnostic kinds produced for a scene.
+#[must_use]
+pub fn diagnostic_kinds(scene: &Scene) -> Vec<DiagnosticKind> {
+    scene
+        .diagnose()
+        .into_iter()
+        .map(|diagnostic| diagnostic.kind)
+        .collect()
 }
