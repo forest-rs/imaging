@@ -22,17 +22,17 @@ gpu = [
 imaging = { features = ["std"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
-skia-safe = { version = "0.90.0" }
+skia-safe = { version = "0.93.1" }
 wgpu = { optional = true, version = "28.0.0" }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 foreign-types-shared = { version = "0.3", optional = true }
 oaty = "0.1"
-skia-safe = { version = "0.90.0", features = ["metal"] }
+skia-safe = { version = "0.93.1", features = ["metal"] }
 
 [target.'cfg(windows)'.dependencies]
 ash = { version = "0.38.0", optional = true }
-skia-safe = { version = "0.90.0", features = ["d3d", "vulkan"] }
+skia-safe = { version = "0.93.1", features = ["d3d", "vulkan"] }
 windows = { version = "0.62.0", optional = true, features = [
     "Win32",
     "Win32_Graphics",
@@ -43,7 +43,7 @@ windows = { version = "0.62.0", optional = true, features = [
 
 [target.'cfg(not(any(target_os = "macos", target_os = "ios", windows)))'.dependencies]
 ash = { version = "0.38.0", optional = true }
-skia-safe = { version = "0.90.0", features = ["vulkan"] }
+skia-safe = { version = "0.93.1", features = ["vulkan"] }
 
 [lints]
 workspace = true

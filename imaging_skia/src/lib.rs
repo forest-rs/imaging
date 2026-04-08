@@ -1477,7 +1477,7 @@ fn geometry_to_sk_path(geom: GeometryRef<'_>, tolerance: f64) -> Option<sk::Path
 }
 
 fn bez_to_sk_path(bez: &kurbo::BezPath) -> Option<sk::Path> {
-    let mut path = sk::Path::new();
+    let mut path = sk::PathBuilder::new();
     for el in bez.elements() {
         match el {
             kurbo::PathEl::MoveTo(p) => {
@@ -1504,7 +1504,7 @@ fn bez_to_sk_path(bez: &kurbo::BezPath) -> Option<sk::Path> {
             }
         }
     }
-    Some(path)
+    Some(path.detach())
 }
 
 fn tile_mode_from_extend(extend: peniko::Extend) -> sk::TileMode {
@@ -1622,7 +1622,7 @@ fn brush_to_paint(
                 peniko::GradientKind::Linear(line) => {
                     let p0 = sk::Point::new(f64_to_f32(line.start.x), f64_to_f32(line.start.y));
                     let p1 = sk::Point::new(f64_to_f32(line.end.x), f64_to_f32(line.end.y));
-                    if let Some(shader) = sk::Shader::linear_gradient_with_interpolation(
+                    if let Some(shader) = sk::gradient_shader::linear_with_interpolation(
                         (p0, p1),
                         (&colors[..], None),
                         &pos[..],
@@ -1643,7 +1643,7 @@ fn brush_to_paint(
                         sk::Point::new(f64_to_f32(rad.end_center.x), f64_to_f32(rad.end_center.y));
                     let end_radius = rad.end_radius;
 
-                    if let Some(shader) = sk::Shader::two_point_conical_gradient_with_interpolation(
+                    if let Some(shader) = sk::gradient_shader::two_point_conical_with_interpolation(
                         (start_center, start_radius),
                         (end_center, end_radius),
                         (&colors[..], None),
@@ -1661,7 +1661,7 @@ fn brush_to_paint(
                     // `peniko` uses radians; Skia uses degrees for sweep gradient angles.
                     let start = rad_to_deg(sweep.start_angle);
                     let end = rad_to_deg(sweep.end_angle);
-                    if let Some(shader) = sk::Shader::sweep_gradient_with_interpolation(
+                    if let Some(shader) = sk::gradient_shader::sweep_with_interpolation(
                         center,
                         (&colors[..], None),
                         Some(&pos[..]),
