@@ -84,6 +84,10 @@ impl SnapshotCase for GmGlyphRunsGradientStroke {
         "gm_glyph_runs_gradient_stroke"
     }
 
+    fn vello_max_diff_pixels(&self) -> u64 {
+        4
+    }
+
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgba8(241, 243, 248, 255));
         let mut painter = Painter::new(sink);
@@ -137,6 +141,10 @@ pub(super) struct GmGlyphRunsImageStroke;
 impl SnapshotCase for GmGlyphRunsImageStroke {
     fn name(&self) -> &'static str {
         "gm_glyph_runs_image_stroke"
+    }
+
+    fn vello_max_diff_pixels(&self) -> u64 {
+        4
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {

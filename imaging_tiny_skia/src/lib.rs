@@ -258,6 +258,18 @@ fn cache_glyph(caches: &mut RendererCaches, request: GlyphRasterRequest<'_>) -> 
         return opt_glyph;
     }
 
+    cache_glyph_miss(caches, request, c.to_u32(), now)
+}
+
+#[cold]
+#[inline(never)]
+fn cache_glyph_miss(
+    caches: &mut RendererCaches,
+    request: GlyphRasterRequest<'_>,
+    color_key: u32,
+    now: Instant,
+) -> Option<Arc<Glyph>> {
+    let c = request.color.to_rgba8();
     let mut scaler = caches
         .scale_context
         .builder(request.font_ref)
@@ -295,7 +307,6 @@ fn cache_glyph(caches: &mut RendererCaches, request: GlyphRasterRequest<'_>) -> 
         let padded_width = image.placement.width.checked_add(pad * 2)?;
         let padded_height = image.placement.height.checked_add(pad * 2)?;
         let mut pixmap = Pixmap::new(padded_width, padded_height)?;
-
         match image.content {
             Content::Mask => {
                 let width = image.placement.width as usize;
@@ -336,7 +347,7 @@ fn cache_glyph(caches: &mut RendererCaches, request: GlyphRasterRequest<'_>) -> 
     };
 
     caches.glyph_cache.insert(
-        (request.cache_key, c.to_u32()),
+        (request.cache_key, color_key),
         GlyphCacheEntry {
             cache_color: request.cache_color,
             glyph: result.clone(),
@@ -1133,13 +1144,7 @@ impl<'a> Layer<'a> {
             Ok(value) => value,
             Err(_) => return false,
         };
-        let mask_width = match usize::try_from(self.mask.width()) {
-            Ok(value) => value,
-            Err(_) => return false,
-        };
         let src_pixels = pixmap.pixels();
-        let use_mask = self.clip.is_some() && self.simple_clip.is_none();
-        let mask = use_mask.then_some(self.mask.data());
         let dst_pixels = self.pixmap.pixels_mut();
 
         let x0 = match usize::try_from(x0) {
@@ -1159,41 +1164,21 @@ impl<'a> Layer<'a> {
             Err(_) => return false,
         };
 
-        for dst_y in y0..y1 {
-            let dst_y_i32 = match i32::try_from(dst_y) {
+        if self.clip.is_some() && self.simple_clip.is_none() {
+            let mask_width = match usize::try_from(self.mask.width()) {
                 Ok(value) => value,
                 Err(_) => return false,
             };
-            let src_y = match usize::try_from(dst_y_i32.saturating_sub(draw_y)) {
-                Ok(value) => value,
-                Err(_) => return false,
-            };
-            let dst_row = dst_y * dst_width;
-            let src_row = src_y * src_width;
-            let mask_row = dst_y * mask_width;
-
-            for dst_x in x0..x1 {
-                let dst_x_i32 = match i32::try_from(dst_x) {
-                    Ok(value) => value,
-                    Err(_) => return false,
-                };
-                let src_x = match usize::try_from(dst_x_i32.saturating_sub(draw_x)) {
-                    Ok(value) => value,
-                    Err(_) => return false,
-                };
-                let src = src_pixels[src_row + src_x];
-                let coverage = mask.map_or(255, |mask| mask[mask_row + dst_x]);
-                if coverage == 0 || src.alpha() == 0 {
-                    continue;
-                }
-
-                let src = scale_premultiplied_color(src, coverage);
-                let dst = dst_pixels[dst_row + dst_x];
-                dst_pixels[dst_row + dst_x] = blend_source_over(src, dst);
-            }
+            let mask = self.mask.data();
+            return blit_pixmap_source_over_masked(
+                src_pixels, dst_pixels, mask, src_width, dst_width, mask_width, draw_x, draw_y, x0,
+                y0, x1, y1,
+            );
         }
 
-        true
+        blit_pixmap_source_over_unmasked(
+            src_pixels, dst_pixels, src_width, dst_width, draw_x, draw_y, x0, y0, x1, y1,
+        )
     }
 
     fn blit_bounds(
@@ -3302,12 +3287,23 @@ fn round_to_i32(value: f64) -> i32 {
     f64_to_i32(value.round())
 }
 
-fn glyph_skew_x(transform: Affine) -> Option<f32> {
-    let [_, b, c, d, e, f] = transform.as_coeffs();
+#[derive(Clone, Copy)]
+struct GlyphTransformComponents {
+    font_size_scale: f64,
+    scale_x: f64,
+    skew_x_degrees: f32,
+}
+
+fn glyph_transform_components(transform: Affine) -> Option<GlyphTransformComponents> {
+    let [a, b, c, d, e, f] = transform.as_coeffs();
     if b != 0.0 || e != 0.0 || f != 0.0 || d <= 0.0 {
         return None;
     }
-    Some(f64_to_f32((c / d).atan().to_degrees()))
+    Some(GlyphTransformComponents {
+        font_size_scale: d,
+        scale_x: a / d,
+        skew_x_degrees: f64_to_f32((c / d).atan().to_degrees()),
+    })
 }
 
 fn normalize_affine(transform: Affine, include_translation: bool) -> Affine {
@@ -3396,6 +3392,44 @@ fn mul_div_255(value: u8, factor: u8) -> u8 {
         .expect("scaled 8-bit value must fit in u8")
 }
 
+const PACKED_RB_MASK: u32 = 0x00ff_00ff;
+const PACKED_BIAS: u32 = 0x0080_0080;
+
+#[cfg(target_endian = "little")]
+const PACKED_ALPHA_SHIFT: u32 = 24;
+
+#[cfg(target_endian = "big")]
+const PACKED_ALPHA_SHIFT: u32 = 0;
+
+#[inline(always)]
+fn mul_div_255_packed(packed: u32, factor: u32) -> u32 {
+    let product = packed.wrapping_mul(factor).wrapping_add(PACKED_BIAS);
+    product
+        .wrapping_add((product >> 8) & PACKED_RB_MASK)
+        .wrapping_shr(8)
+        & PACKED_RB_MASK
+}
+
+#[inline(always)]
+fn scale_packed_premultiplied_color(pixel: u32, alpha: u32) -> u32 {
+    let rb = mul_div_255_packed(pixel & PACKED_RB_MASK, alpha);
+    let ga = mul_div_255_packed((pixel >> 8) & PACKED_RB_MASK, alpha) << 8;
+    rb | ga
+}
+
+#[inline(always)]
+fn blend_source_over_packed(src: u32, dst: u32) -> u32 {
+    let src_alpha = src >> PACKED_ALPHA_SHIFT;
+    if src_alpha == 255 {
+        return src;
+    }
+    if src_alpha == 0 {
+        return dst;
+    }
+
+    src.wrapping_add(scale_packed_premultiplied_color(dst, 255 - src_alpha))
+}
+
 fn scale_premultiplied_color(color: PremultipliedColorU8, alpha: u8) -> PremultipliedColorU8 {
     if alpha == 255 {
         return color;
@@ -3410,25 +3444,118 @@ fn scale_premultiplied_color(color: PremultipliedColorU8, alpha: u8) -> Premulti
     .expect("scaled premultiplied color must remain premultiplied")
 }
 
-fn blend_source_over(src: PremultipliedColorU8, dst: PremultipliedColorU8) -> PremultipliedColorU8 {
-    if src.alpha() == 255 {
-        return src;
-    }
-    if src.alpha() == 0 {
-        return dst;
+#[inline(always)]
+fn blit_pixmap_source_over_unmasked(
+    src_pixels: &[PremultipliedColorU8],
+    dst_pixels: &mut [PremultipliedColorU8],
+    src_width: usize,
+    dst_width: usize,
+    draw_x: i32,
+    draw_y: i32,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> bool {
+    let src_pixels = bytemuck::cast_slice::<PremultipliedColorU8, u32>(src_pixels);
+    let dst_pixels = bytemuck::cast_slice_mut::<PremultipliedColorU8, u32>(dst_pixels);
+    let row_len = x1 - x0;
+    let src_x0 = match usize::try_from(match i32::try_from(x0) {
+        Ok(value) => value.saturating_sub(draw_x),
+        Err(_) => return false,
+    }) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    for dst_y in y0..y1 {
+        let dst_y_i32 = match i32::try_from(dst_y) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let src_y = match usize::try_from(dst_y_i32.saturating_sub(draw_y)) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let src_row_start = src_y * src_width + src_x0;
+        let dst_row_start = dst_y * dst_width + x0;
+        let src_row = &src_pixels[src_row_start..src_row_start + row_len];
+        let dst_row = &mut dst_pixels[dst_row_start..dst_row_start + row_len];
+
+        for i in 0..row_len {
+            let src = src_row[i];
+            let src_alpha = src >> PACKED_ALPHA_SHIFT;
+            if src_alpha == 0 {
+                continue;
+            }
+            if src_alpha == 255 {
+                dst_row[i] = src;
+                continue;
+            }
+            dst_row[i] = blend_source_over_packed(src, dst_row[i]);
+        }
     }
 
-    let inv_alpha = 255 - src.alpha();
-    PremultipliedColorU8::from_rgba(
-        src.red().saturating_add(mul_div_255(dst.red(), inv_alpha)),
-        src.green()
-            .saturating_add(mul_div_255(dst.green(), inv_alpha)),
-        src.blue()
-            .saturating_add(mul_div_255(dst.blue(), inv_alpha)),
-        src.alpha()
-            .saturating_add(mul_div_255(dst.alpha(), inv_alpha)),
-    )
-    .expect("source-over premultiplied blend must remain premultiplied")
+    true
+}
+
+#[inline(always)]
+fn blit_pixmap_source_over_masked(
+    src_pixels: &[PremultipliedColorU8],
+    dst_pixels: &mut [PremultipliedColorU8],
+    mask: &[u8],
+    src_width: usize,
+    dst_width: usize,
+    mask_width: usize,
+    draw_x: i32,
+    draw_y: i32,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> bool {
+    let src_pixels = bytemuck::cast_slice::<PremultipliedColorU8, u32>(src_pixels);
+    let dst_pixels = bytemuck::cast_slice_mut::<PremultipliedColorU8, u32>(dst_pixels);
+    let row_len = x1 - x0;
+    let src_x0 = match usize::try_from(match i32::try_from(x0) {
+        Ok(value) => value.saturating_sub(draw_x),
+        Err(_) => return false,
+    }) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    for dst_y in y0..y1 {
+        let dst_y_i32 = match i32::try_from(dst_y) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let src_y = match usize::try_from(dst_y_i32.saturating_sub(draw_y)) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let src_row_start = src_y * src_width + src_x0;
+        let dst_row_start = dst_y * dst_width + x0;
+        let mask_row_start = dst_y * mask_width + x0;
+        let src_row = &src_pixels[src_row_start..src_row_start + row_len];
+        let dst_row = &mut dst_pixels[dst_row_start..dst_row_start + row_len];
+        let mask_row = &mask[mask_row_start..mask_row_start + row_len];
+
+        for i in 0..row_len {
+            let coverage = mask_row[i];
+            let src = src_row[i];
+            if coverage == 0 || (src >> PACKED_ALPHA_SHIFT) == 0 {
+                continue;
+            }
+
+            let src = scale_packed_premultiplied_color(src, u32::from(coverage));
+            if (src >> PACKED_ALPHA_SHIFT) == 255 {
+                dst_row[i] = src;
+                continue;
+            }
+            dst_row[i] = blend_source_over_packed(src, dst_row[i]);
+        }
+    }
+
+    true
 }
 
 fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
@@ -3461,21 +3588,26 @@ fn draw_solid_color_glyphs_into_layer<'a>(
     } else {
         1.0
     };
-    let transform = normalize_affine(text_transform, false) * Affine::scale(1.0 / oversample);
-    let raster_origin = transform.inverse() * (text_transform * origin);
+    let glyph_transform = run.glyph_transform.and_then(glyph_transform_components);
+    let glyph_scale_x = glyph_transform.map_or(1.0, |transform| transform.scale_x);
+    let base_transform = normalize_affine(text_transform, false) * Affine::scale(1.0 / oversample);
+    let draw_transform = base_transform * Affine::scale_non_uniform(glyph_scale_x, 1.0);
+    let raster_origin = base_transform.inverse() * (text_transform * origin);
     let font_ref = match FontRef::from_index(font.data.data(), font.index as usize) {
         Some(f) => f,
         None => return,
     };
     let font_blob_id = font.data.id();
-    let skew = run.glyph_transform.and_then(glyph_skew_x);
+    let skew = glyph_transform.map(|transform| transform.skew_x_degrees);
     let embolden_strength = 0.0;
     let embolden = false;
+    let glyph_font_size_scale = glyph_transform.map_or(1.0, |transform| transform.font_size_scale);
+    let scaled_font_size =
+        run.font_size * f64_to_f32(effective_raster_scale * glyph_font_size_scale);
 
     for glyph in glyphs {
         let glyph_x = f64_to_f32(raster_origin.x + glyph.x as f64 * effective_raster_scale);
         let glyph_y = f64_to_f32(raster_origin.y + glyph.y as f64 * effective_raster_scale);
-        let scaled_font_size = run.font_size * f64_to_f32(effective_raster_scale);
         let glyph_id = match u16::try_from(glyph.id) {
             Ok(value) => value,
             Err(_) => continue,
@@ -3512,13 +3644,29 @@ fn draw_solid_color_glyphs_into_layer<'a>(
         if let Some(cached) = cached {
             let draw_x = new_x + cached.left;
             let draw_y = new_y - cached.top;
-            let quality =
-                if integer_translation(transform, f64::from(draw_x), f64::from(draw_y)).is_some() {
-                    FilterQuality::Nearest
-                } else {
-                    FilterQuality::Bilinear
-                };
-            layer.render_pixmap_direct(cached.pixmap.as_ref(), draw_x, draw_y, transform, quality);
+            let transformed_draw_x = if glyph_scale_x != 0.0 {
+                draw_x / f64_to_f32(glyph_scale_x)
+            } else {
+                draw_x
+            };
+            let quality = if integer_translation(
+                draw_transform,
+                f64::from(transformed_draw_x),
+                f64::from(draw_y),
+            )
+            .is_some()
+            {
+                FilterQuality::Nearest
+            } else {
+                FilterQuality::Bilinear
+            };
+            layer.render_pixmap_direct(
+                cached.pixmap.as_ref(),
+                transformed_draw_x,
+                draw_y,
+                draw_transform,
+                quality,
+            );
         }
     }
 }
@@ -6128,9 +6276,13 @@ mod tests {
     }
 
     #[test]
-    fn glyph_skew_x_uses_affine_c_over_d() {
-        let skew = glyph_skew_x(Affine::skew(0.28, 0.0)).expect("horizontal skew is supported");
-        assert!((skew - 15.642247).abs() < 1e-4);
+    fn glyph_transform_components_match_skia_semantics() {
+        let transform = Affine::new([1.2, 0.0, 0.28, 1.5, 0.0, 0.0]);
+        let components =
+            glyph_transform_components(transform).expect("horizontal scale/skew is supported");
+        assert!((components.font_size_scale - 1.5).abs() < 1e-6);
+        assert!((components.scale_x - 0.8).abs() < 1e-6);
+        assert!((components.skew_x_degrees - 10.573523).abs() < 1e-4);
     }
 
     #[test]

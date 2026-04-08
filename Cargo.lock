@@ -1088,6 +1088,7 @@ dependencies = [
 name = "imaging_tiny_skia"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "imaging",
  "kurbo",
  "peniko",
@@ -2309,7 +2310,6 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
- "png 0.17.16",
  "tiny-skia-path 0.11.4",
 ]
 
@@ -2321,6 +2321,7 @@ checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
 dependencies = [
  "arrayref",
  "bytemuck",
+ "libm",
  "strict-num",
 ]
 

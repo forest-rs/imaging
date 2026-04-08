@@ -9,13 +9,27 @@ description = "tiny-skia backend for the imaging command stream."
 readme = "README.md"
 publish = false
 
+[features]
+default = ["std"]
+std = [
+    "imaging/std",
+    "peniko/std",
+    "tiny-skia/std",
+]
+libm = [
+    "imaging/libm",
+    "peniko/libm",
+    "tiny-skia/no-std-float",
+]
+
 [dependencies]
+bytemuck = { default-features = false, version = "1.24" }
 imaging = { workspace = true }
 kurbo.workspace = true
-peniko = { features = ["std"], workspace = true }
+peniko.workspace = true
 rustc-hash = "2.1"
 swash = "0.2"
-tiny-skia = "0.11"
+tiny-skia = { version = "0.11", default-features = false, features = ["simd"] }
 
 [lints]
 workspace = true
