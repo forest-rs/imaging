@@ -38,7 +38,7 @@ skia-safe = { version = "0.93.1", features = [
     # gl/svg/textlayout are enabled merely to match precompiled skia requirements
     "gl",
     "svg",
-    "textlayout"
+    "textlayout",
 ] }
 windows = { version = "0.62.0", optional = true, features = [
     "Win32",
