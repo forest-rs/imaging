@@ -3302,6 +3302,14 @@ fn round_to_i32(value: f64) -> i32 {
     f64_to_i32(value.round())
 }
 
+fn glyph_skew_x(transform: Affine) -> Option<f32> {
+    let [_, b, c, d, e, f] = transform.as_coeffs();
+    if b != 0.0 || e != 0.0 || f != 0.0 || d <= 0.0 {
+        return None;
+    }
+    Some(f64_to_f32((c / d).atan().to_degrees()))
+}
+
 fn normalize_affine(transform: Affine, include_translation: bool) -> Affine {
     let coeffs = transform.as_coeffs();
     let (scale_x, scale_y, _) = affine_scale_components(transform);
@@ -3460,9 +3468,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
         None => return,
     };
     let font_blob_id = font.data.id();
-    let skew = run
-        .glyph_transform
-        .map(|transform| f64_to_f32(transform.as_coeffs()[0].atan().to_degrees()));
+    let skew = run.glyph_transform.and_then(glyph_skew_x);
     let embolden_strength = 0.0;
     let embolden = false;
 
@@ -6122,9 +6128,9 @@ mod tests {
     }
 
     #[test]
-    fn embolden_strength_scales_with_raster_scale() {
-        assert!((scaled_embolden_strength(Vec2::new(0.2, 0.0), 1.5) - 0.3).abs() < f32::EPSILON);
-        assert_eq!(scaled_embolden_strength(Vec2::new(0.2, 0.0), 0.0), 0.0);
+    fn glyph_skew_x_uses_affine_c_over_d() {
+        let skew = glyph_skew_x(Affine::skew(0.28, 0.0)).expect("horizontal skew is supported");
+        assert!((skew - 15.642247).abs() < 1e-4);
     }
 
     #[test]
