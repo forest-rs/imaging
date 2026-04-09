@@ -143,7 +143,7 @@ struct GlyphCacheKey {
     x_bin: u8,
     y_bin: u8,
     hint: bool,
-    embolden: bool,
+    embolden_strength_bits: u32,
     skew_bits: u32,
 }
 
@@ -155,7 +155,7 @@ struct GlyphKeyInput {
     x: f32,
     y: f32,
     hint: bool,
-    embolden: bool,
+    embolden_strength: f32,
     skew: Option<f32>,
 }
 
@@ -196,7 +196,7 @@ impl GlyphCacheKey {
                 x_bin,
                 y_bin,
                 hint: input.hint,
-                embolden: input.embolden,
+                embolden_strength_bits: input.embolden_strength.to_bits(),
                 skew_bits,
             },
             x_floor,
@@ -3599,8 +3599,8 @@ fn draw_solid_color_glyphs_into_layer<'a>(
     };
     let font_blob_id = font.data.id();
     let skew = glyph_transform.map(|transform| transform.skew_x_degrees);
-    let embolden_strength = 0.0;
-    let embolden = false;
+    // swash exposes isotropic emboldening, so preserve the strongest requested axis.
+    let embolden_strength = f64_to_f32(run.font_embolden.x.max(run.font_embolden.y).max(0.0));
     let glyph_font_size_scale = glyph_transform.map_or(1.0, |transform| transform.font_size_scale);
     let scaled_font_size =
         run.font_size * f64_to_f32(effective_raster_scale * glyph_font_size_scale);
@@ -3620,7 +3620,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
             x: glyph_x,
             y: glyph_y,
             hint: run.hint,
-            embolden,
+            embolden_strength,
             skew,
         });
 
@@ -6295,7 +6295,7 @@ mod tests {
             x: 12.2,
             y: 19.8,
             hint: true,
-            embolden: false,
+            embolden_strength: 0.0,
             skew: None,
         });
         assert_eq!(cache_key.x_bin, 2);
