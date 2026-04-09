@@ -77,6 +77,43 @@ impl SnapshotCase for GmGlyphRunsGradientFill {
     }
 }
 
+pub(super) struct GmGlyphRunsEmbolden;
+
+impl SnapshotCase for GmGlyphRunsEmbolden {
+    fn name(&self) -> &'static str {
+        "gm_glyph_runs_embolden"
+    }
+
+    fn supports_backend(&self, backend: &str) -> bool {
+        backend == "tiny_skia"
+    }
+
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
+        background(sink, width, height, Color::from_rgba8(244, 240, 233, 255));
+        let mut painter = Painter::new(sink);
+
+        let font = test_font();
+        let base_glyphs = glyphs_for_text(&font, 36.0, "regular");
+        let emboldened_glyphs = glyphs_for_text(&font, 36.0, "embolden");
+        let fill_style = Style::Fill(Fill::NonZero);
+
+        painter
+            .glyphs(&font, &Brush::Solid(Color::from_rgba8(39, 44, 52, 255)))
+            .transform(Affine::translate((20.0, height * 0.38)))
+            .font_size(36.0)
+            .hint(true)
+            .draw(&fill_style, &base_glyphs);
+
+        painter
+            .glyphs(&font, &Brush::Solid(Color::from_rgba8(171, 76, 33, 255)))
+            .transform(Affine::translate((20.0, height * 0.7)))
+            .font_size(36.0)
+            .font_embolden(kurbo::Vec2::new(1.5, 0.5))
+            .hint(true)
+            .draw(&fill_style, &emboldened_glyphs);
+    }
+}
+
 pub(super) struct GmGlyphRunsGradientStroke;
 
 impl SnapshotCase for GmGlyphRunsGradientStroke {

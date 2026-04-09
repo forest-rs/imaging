@@ -112,6 +112,7 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &blends::GmBlendGrid,
     &strokes::GmStrokes,
     &text::GmGlyphRuns,
+    &text::GmGlyphRunsEmbolden,
     &text::GmGlyphRunsGradientFill,
     &text::GmGlyphRunsGradientStroke,
     &text::GmGlyphRunsImageFill,
