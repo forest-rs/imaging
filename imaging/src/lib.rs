@@ -127,6 +127,9 @@ pub use paint::{
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
 pub use render::{ImageRenderer, RenderSource, TextureRenderer};
 
+pub use kurbo;
+pub use peniko;
+
 /// Run a painter closure inside a labeled context scope using the call-site source location.
 ///
 /// This is shorthand for:
