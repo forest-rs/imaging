@@ -792,6 +792,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 glyph_transform: None,
                 font_size: -1.0,
+                font_embolden: kurbo::Vec2::ZERO,
                 hint: false,
                 normalized_coords: &[],
                 style: &style,

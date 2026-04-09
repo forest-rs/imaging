@@ -8,7 +8,7 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 
-use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
 use peniko::{Brush, Fill, FontData, Style};
 
 use crate::{
@@ -253,6 +253,8 @@ pub struct GlyphRun {
     pub glyph_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
+    /// Synthetic embolden amount applied to glyph outlines in X/Y device units.
+    pub font_embolden: Vec2,
     /// Whether glyph hinting is enabled.
     pub hint: bool,
     /// Normalized variation coordinates for variable fonts.
@@ -276,6 +278,7 @@ impl GlyphRun {
             transform: Affine::IDENTITY,
             glyph_transform: None,
             font_size: 16.0,
+            font_embolden: Vec2::ZERO,
             hint: false,
             normalized_coords: Vec::new(),
             style: Style::Fill(Fill::NonZero),
@@ -838,6 +841,7 @@ mod tests {
             transform: Affine::IDENTITY,
             glyph_transform: None,
             font_size: 12.0,
+            font_embolden: Vec2::ZERO,
             hint: false,
             normalized_coords: Vec::new(),
             style: Style::Fill(Fill::NonZero),
