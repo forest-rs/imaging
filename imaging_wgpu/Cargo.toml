@@ -1,0 +1,24 @@
+[package]
+name = "imaging_wgpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wgpu texture rendering traits for imaging backends."
+publish = false
+
+[features]
+default = []
+# Normal consumers should enable exactly one version feature. If both are enabled by a
+# workspace-wide `--all-features` build, the crate exports `wgpu-28` deterministically.
+wgpu-27 = ["dep:wgpu_27"]
+wgpu-28 = ["dep:wgpu_28"]
+
+[dependencies]
+imaging = { features = ["std"], workspace = true }
+wgpu_27 = { default-features = false, features = ["std"], optional = true, package = "wgpu", version = "27.0.1" }
+wgpu_28 = { default-features = false, features = ["std"], optional = true, package = "wgpu", version = "28.0.0" }
+
+[lints]
+workspace = true

@@ -36,6 +36,16 @@ impl core::fmt::Debug for GaneshBackend {
 }
 
 impl GaneshBackend {
+    pub(crate) const CANDIDATE_TEXTURE_FORMATS: &'static [wgpu::TextureFormat] = &[
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        wgpu::TextureFormat::Rgb10a2Unorm,
+        wgpu::TextureFormat::Rgba16Unorm,
+        wgpu::TextureFormat::Rgba16Float,
+    ];
+
     pub(crate) fn from_wgpu(
         adapter: &wgpu::Adapter,
         device: &wgpu::Device,
@@ -90,8 +100,51 @@ impl GaneshBackend {
         }
     }
 
+    pub(crate) fn supported_texture_formats(&self) -> Vec<wgpu::TextureFormat> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Self::Metal(_) => Self::CANDIDATE_TEXTURE_FORMATS
+                .iter()
+                .copied()
+                .filter(|format| MetalBackend::supports_texture_format(*format).is_ok())
+                .collect(),
+            #[cfg(windows)]
+            Self::Dx12(_) => Self::CANDIDATE_TEXTURE_FORMATS
+                .iter()
+                .copied()
+                .filter(|format| crate::d3d::supports_texture_format(*format).is_ok())
+                .collect(),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            Self::Vulkan(_) => Self::CANDIDATE_TEXTURE_FORMATS
+                .iter()
+                .copied()
+                .filter(|format| crate::vulkan::supports_texture_format(*format).is_ok())
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn can_wrap_texture_format(
+        &self,
+        texture_format: wgpu::TextureFormat,
+    ) -> Result<(), Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Self::Metal(_) => MetalBackend::supports_texture_format(texture_format),
+            #[cfg(windows)]
+            Self::Dx12(_) => crate::d3d::supports_texture_format(texture_format),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            Self::Vulkan(_) => crate::vulkan::supports_texture_format(texture_format),
+        }
+    }
+
     pub(crate) fn flush_surface(&mut self, surface: &mut sk::Surface) {
         self.direct_context()
             .flush_and_submit_surface(surface, sk::gpu::SyncCpu::No);
+    }
+
+    pub(crate) fn flush_surface_for_readback(&mut self, surface: &mut sk::Surface) {
+        self.direct_context()
+            .flush_and_submit_surface(surface, sk::gpu::SyncCpu::Yes);
     }
 }

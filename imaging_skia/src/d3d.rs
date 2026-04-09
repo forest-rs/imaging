@@ -101,6 +101,11 @@ impl Dx12Backend {
     }
 }
 
+pub(crate) fn supports_texture_format(texture_format: wgpu::TextureFormat) -> Result<(), Error> {
+    let _ = dxgi_format_for_wgpu_texture_format(texture_format)?;
+    Ok(())
+}
+
 fn dxgi_format_for_wgpu_texture_format(
     texture_format: wgpu::TextureFormat,
 ) -> Result<DXGI_FORMAT, Error> {

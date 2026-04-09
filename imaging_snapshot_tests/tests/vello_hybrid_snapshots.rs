@@ -106,7 +106,7 @@ fn native_scene_sink_supports_image_brushes_with_renderer() {
             width: 2,
             height: 2,
         }));
-        let mut sink = VelloHybridSceneSink::with_renderer(&mut scene, renderer.target_renderer());
+        let mut sink = VelloHybridSceneSink::with_renderer(&mut scene, &mut renderer);
         let mut painter = Painter::new(&mut sink);
         painter.fill_rect(Rect::new(0.0, 0.0, 32.0, 32.0), &brush);
         sink.finish().expect("finish native scene sink");

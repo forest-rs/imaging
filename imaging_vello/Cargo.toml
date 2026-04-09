@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 imaging = { features = ["std"], workspace = true }
+imaging_wgpu = { default-features = false, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 vello_07 = { default-features = true, optional = true, package = "vello", version = "0.7.0" }
@@ -18,8 +19,8 @@ vello_08 = { default-features = true, optional = true, package = "vello", versio
 
 [features]
 default = ["vello-0-8"]
-vello-0-7 = ["dep:vello_07"]
-vello-0-8 = ["dep:vello_08"]
+vello-0-7 = ["dep:vello_07", "imaging_wgpu/wgpu-27"]
+vello-0-8 = ["dep:vello_08", "imaging_wgpu/wgpu-28"]
 
 [dev-dependencies]
 pollster = "0.4.0"

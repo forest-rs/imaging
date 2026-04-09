@@ -4,6 +4,8 @@
 use imaging::RgbaImage;
 use std::sync::mpsc;
 
+use crate::initialize_texture_for_wgpu;
+
 #[derive(Debug)]
 pub(crate) enum ReadbackError {
     DevicePoll,
@@ -23,13 +25,16 @@ pub(crate) struct ScratchTexture {
 impl ScratchTexture {
     pub(crate) fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
         label: &'static str,
     ) -> Self {
+        let texture = create_texture(device, width, height, format, label);
+        initialize_texture_for_wgpu(device, queue, &texture);
         Self {
-            texture: create_texture(device, width, height, format, label),
+            texture,
             width,
             height,
             format,
@@ -50,6 +55,10 @@ impl ScratchTexture {
     pub(crate) fn texture(&self) -> &wgpu::Texture {
         &self.texture
     }
+
+    pub(crate) const fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
 }
 
 pub(crate) fn read_texture_into(
@@ -60,7 +69,29 @@ pub(crate) fn read_texture_into(
     height: u32,
     image: &mut RgbaImage,
 ) -> Result<(), ReadbackError> {
+    image.resize(width, height);
+    read_texture_into_target(
+        device,
+        queue,
+        texture,
+        width,
+        height,
+        image.data.as_mut_slice(),
+        usize::try_from(width).expect("image width should fit in usize") * 4,
+    )
+}
+
+pub(crate) fn read_texture_into_target(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    data: &mut [u8],
+    bytes_per_row_out: usize,
+) -> Result<(), ReadbackError> {
     let width_bytes = width * 4;
+    let width_bytes_usize = width_bytes as usize;
     let bytes_per_row = width_bytes.div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("imaging_skia readback"),
@@ -108,13 +139,11 @@ pub(crate) fn read_texture_into(
         .map_err(|_| ReadbackError::BufferMap)?;
 
     let mapped = slice.get_mapped_range();
-    let width_bytes = width_bytes as usize;
-    image.resize(width, height);
     for (row, out_row) in mapped
         .chunks_exact(bytes_per_row as usize)
-        .zip(image.data.chunks_exact_mut(width_bytes))
+        .zip(data.chunks_exact_mut(bytes_per_row_out))
     {
-        out_row.copy_from_slice(&row[..width_bytes]);
+        out_row[..width_bytes_usize].copy_from_slice(&row[..width_bytes_usize]);
     }
     drop(mapped);
     readback.unmap();
@@ -139,7 +168,9 @@ fn create_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }

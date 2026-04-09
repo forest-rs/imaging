@@ -5,7 +5,7 @@
 
 #![cfg(feature = "skia")]
 
-use imaging_skia::SkiaRenderer;
+use imaging_skia::SkiaCpuRenderer;
 use imaging_snapshot_tests::cases::{DEFAULT_HEIGHT, DEFAULT_WIDTH, build_scene};
 
 mod common;
@@ -17,7 +17,7 @@ fn render_case(case: &dyn imaging_snapshot_tests::cases::SnapshotCase) -> imagin
     let h = f64::from(height);
 
     let scene = build_scene(case, w, h);
-    let mut renderer = SkiaRenderer::new();
+    let mut renderer = SkiaCpuRenderer::new();
     renderer
         .render_scene(&scene, width, height)
         .expect("render image")

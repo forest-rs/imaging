@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 imaging = { features = ["std"], workspace = true }
+imaging_wgpu = { default-features = false, features = ["wgpu-28"], workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 vello_common = { default-features = true, version = "0.0.7" }

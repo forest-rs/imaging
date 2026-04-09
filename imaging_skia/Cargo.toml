@@ -12,6 +12,8 @@ publish = false
 [features]
 default = []
 gpu = [
+    "dep:imaging_wgpu",
+    "imaging_wgpu/wgpu-28",
     "dep:foreign-types-shared",
     "dep:wgpu",
     "dep:ash",
@@ -20,6 +22,7 @@ gpu = [
 
 [dependencies]
 imaging = { features = ["std"], workspace = true }
+imaging_wgpu = { default-features = false, optional = true, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 skia-safe = { version = "0.93.1" }

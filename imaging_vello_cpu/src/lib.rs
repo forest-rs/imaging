@@ -65,11 +65,16 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
     MaskMode, PaintSink, RgbaImage, StrokeRef,
     record::{Scene, ValidateError, replay, replay_transformed},
-    render::{ImageRenderer, RenderSource},
+    render::{
+        ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
+        RenderContentError, RenderSource, RenderUnsupportedError,
+    },
 };
 use kurbo::{Affine, Rect, Shape as _};
 use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
@@ -91,6 +96,14 @@ pub enum Error {
     /// An internal invariant was violated.
     Internal(&'static str),
 }
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl core::error::Error for Error {}
 
 /// Renderer that executes `imaging` commands using `vello_cpu`.
 #[derive(Debug)]
@@ -224,15 +237,55 @@ impl VelloCpuRenderer {
             return Err(Error::Internal("unbalanced group stack"));
         }
 
-        let mut pixmap = Pixmap::new(self.width, self.height);
-        self.ctx.flush();
-        self.ctx.render_to_pixmap(&mut pixmap);
-
         image.resize(u32::from(self.width), u32::from(self.height));
-        let unpremul = pixmap.take_unpremultiplied();
-        for (pixel, rgba) in unpremul.iter().zip(image.data.chunks_exact_mut(4)) {
-            rgba.copy_from_slice(&[pixel.r, pixel.g, pixel.b, pixel.a]);
+        self.ctx.flush();
+        self.ctx.render_to_buffer(
+            image.data.as_mut_slice(),
+            self.width,
+            self.height,
+            Self::render_settings().render_mode,
+        );
+        unpremultiply_rgba8_in_place(image.data.as_mut_slice());
+        Ok(())
+    }
+
+    fn finish_into_target(&mut self, target: ImageBufferTarget<'_>) -> Result<(), Error> {
+        if let Some(err) = self.error.take() {
+            return Err(err);
         }
+        if self.clip_depth != 0 {
+            return Err(Error::Internal("unbalanced clip stack"));
+        }
+        if self.group_depth != 0 {
+            return Err(Error::Internal("unbalanced group stack"));
+        }
+        if target.width != u32::from(self.width) || target.height != u32::from(self.height) {
+            return Err(Error::Internal(
+                "image target dimensions do not match renderer output",
+            ));
+        }
+        let width_bytes = usize::from(self.width) * 4;
+        if target.bytes_per_row != width_bytes {
+            return Err(Error::Internal(
+                "image target row stride must be tightly packed",
+            ));
+        }
+        let required_len = target
+            .bytes_per_row
+            .checked_mul(usize::from(self.height))
+            .expect("image target byte length should fit in usize");
+        if target.data.len() < required_len {
+            return Err(Error::Internal("image target buffer is too small"));
+        }
+
+        self.ctx.flush();
+        self.ctx.render_to_buffer(
+            &mut target.data[..required_len],
+            self.width,
+            self.height,
+            Self::render_settings().render_mode,
+        );
+        unpremultiply_rgba8_in_place(&mut target.data[..required_len]);
         Ok(())
     }
 
@@ -485,21 +538,47 @@ impl VelloCpuRenderer {
 }
 
 impl ImageRenderer for VelloCpuRenderer {
-    type Error = Error;
+    fn supported_image_formats(&self) -> Vec<ImageBufferFormat> {
+        vec![ImageBufferFormat::Rgba8Unorm]
+    }
 
-    fn render_source_into<S: RenderSource + ?Sized>(
+    fn render_source_into(
         &mut self,
-        source: &mut S,
-        width: u32,
-        height: u32,
-        image: &mut RgbaImage,
-    ) -> Result<(), Self::Error> {
-        let (width, height) = Self::checked_size(width, height)?;
-        source.validate().map_err(Error::InvalidScene)?;
+        source: &mut dyn RenderSource,
+        target: ImageBufferTarget<'_>,
+    ) -> Result<(), ImageRendererError> {
+        if target.format != ImageBufferFormat::Rgba8Unorm {
+            return Err(ImageRendererError::Target(
+                ImageTargetError::UnsupportedTargetFormat,
+            ));
+        }
+        let (width, height) =
+            Self::checked_size(target.width, target.height).map_err(map_image_renderer_error)?;
+        source
+            .validate()
+            .map_err(Error::InvalidScene)
+            .map_err(map_image_renderer_error)?;
         self.resize(width, height);
         self.reset();
         source.paint_into(self);
-        self.finish_into(image)
+        self.finish_into_target(target)
+            .map_err(map_image_renderer_error)
+    }
+}
+
+fn map_image_renderer_error(error: Error) -> ImageRendererError {
+    match error {
+        Error::InvalidScene(error) => {
+            ImageRendererError::Content(RenderContentError::InvalidScene(error))
+        }
+        Error::UnsupportedImageBrush => {
+            ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        }
+        Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
+        Error::Internal("render width too large" | "render height too large") => {
+            ImageRendererError::Target(ImageTargetError::DimensionsTooLarge)
+        }
+        other => ImageRendererError::backend(other),
     }
 }
 
@@ -510,6 +589,30 @@ impl ImageRenderer for VelloCpuRenderer {
 )]
 fn f64_to_f32(v: f64) -> f32 {
     v as f32
+}
+
+fn unpremultiply_rgba8_in_place(bytes: &mut [u8]) {
+    for rgba in bytes.chunks_exact_mut(4) {
+        let alpha = rgba[3];
+        if alpha == 0 || alpha == u8::MAX {
+            continue;
+        }
+        rgba[0] = unpremultiply_channel(rgba[0], alpha);
+        rgba[1] = unpremultiply_channel(rgba[1], alpha);
+        rgba[2] = unpremultiply_channel(rgba[2], alpha);
+    }
+}
+
+fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
+    if alpha == 0 {
+        return 0;
+    }
+    if alpha == u8::MAX {
+        return channel;
+    }
+
+    let value = (u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha);
+    u8::try_from(value.min(u32::from(u8::MAX))).expect("unpremultiplied channel must fit in u8")
 }
 
 impl PaintSink for VelloCpuRenderer {
