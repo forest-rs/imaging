@@ -36,7 +36,14 @@ impl HybridImageRegistry {
         queue: &'a wgpu::Queue,
         mut encoder: wgpu::CommandEncoder,
     ) -> HybridImageUploadSession<'a> {
+        // We evict excess images at the start of the session,
+        // as opposed to keeping a strict limit during resolving.
+        // This is because our current goal is to avoid the AtlasLimitReached crash,
+        // and the exact memory usage isn't as important. While doing it at resolve time
+        // can lead to situations where we evict something from the same session,
+        // which would mean dangling image references in draw calls.
         self.evict_to_budget(renderer, device, queue, &mut encoder);
+
         HybridImageUploadSession {
             registry: self,
             renderer,
