@@ -47,13 +47,16 @@ impl HybridImageRegistry {
         }
     }
 
-    fn touch(&mut self, index: usize) {
+    /// Returns the new index of the touched entry.
+    fn touch(&mut self, index: usize) -> usize {
         if index + 1 == self.live.len() {
-            return;
+            return index;
         }
         if let Some(image) = self.live.remove(index) {
             self.live.push_back(image);
+            return self.live.len() - 1;
         }
+        index
     }
 
     fn evict_to_budget(
@@ -101,7 +104,7 @@ impl HybridImageUploadSession<'_> {
         let image = if let Some(image) = self.pending.iter().find(|ri| ri.key == key).copied() {
             image
         } else if let Some(index) = self.registry.live.iter().position(|ri| ri.key == key) {
-            self.registry.touch(index);
+            let index = self.registry.touch(index);
             self.registry.live.get(index).copied().unwrap()
         } else {
             let image_source = ImageSource::from_peniko_image_data(&brush.image);
