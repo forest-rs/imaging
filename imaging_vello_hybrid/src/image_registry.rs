@@ -206,9 +206,13 @@ impl ImageKey {
 
 #[cfg(test)]
 mod tests {
-    use super::ImageKey;
+    use crate::image_registry::HybridImageRegistry;
+
+    use super::{ImageKey, RegisteredImage};
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+    use std::collections::VecDeque;
     use std::sync::Arc;
+    use vello_common::paint::ImageId;
 
     fn image(bytes: [u8; 16]) -> ImageData {
         ImageData {
@@ -236,5 +240,47 @@ mod tests {
 
         a.format = ImageFormat::Bgra8;
         assert_ne!(ImageKey::derive(&a), ImageKey::derive(&b));
+    }
+
+    #[test]
+    fn image_touch() {
+        let a = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
+        let b = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
+
+        let bytes_used = a.data.len() + b.data.len();
+
+        let a_key = ImageKey::derive(&a);
+        let b_key = ImageKey::derive(&b);
+
+        let a_ri = RegisteredImage {
+            key: a_key,
+            id: ImageId::new(0),
+            may_have_opacities: true,
+            bytes: a.data.len(),
+        };
+        let b_ri = RegisteredImage {
+            key: b_key,
+            id: ImageId::new(1),
+            may_have_opacities: true,
+            bytes: b.data.len(),
+        };
+
+        let mut live = VecDeque::new();
+        live.push_back(a_ri);
+        live.push_back(b_ri);
+
+        let mut registry = HybridImageRegistry {
+            live,
+            max_bytes: 1000 * 1000 * 1000,
+            bytes_used,
+        };
+
+        // Touching the last entry is a no-op
+        assert_eq!(registry.touch(1), 1);
+        assert_eq!(registry.live.get(1).unwrap().id, ImageId::new(1));
+
+        // Touching the first entry moves it to the end
+        assert_eq!(registry.touch(0), 1);
+        assert_eq!(registry.live.get(1).unwrap().id, ImageId::new(0));
     }
 }
