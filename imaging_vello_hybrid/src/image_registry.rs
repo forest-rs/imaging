@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn image_touch() {
         let a = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
-        let b = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
+        let b = image([13, 12, 11, 10, 2, 3, 4, 5, 6, 7, 8, 9, 4, 3, 2, 1]);
 
         let bytes_used = a.data.len() + b.data.len();
 
