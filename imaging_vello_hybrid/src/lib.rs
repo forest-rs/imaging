@@ -267,7 +267,7 @@ impl VelloHybridRendererState {
             device,
             queue,
             tolerance: 0.1,
-            image_registry: HybridImageRegistry::new(),
+            image_registry: HybridImageRegistry::default(),
         }
     }
 
