@@ -184,7 +184,7 @@ fn validate_target_layout(
     Ok(())
 }
 
-fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+pub(crate) fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("imaging_vello target"),
         size: wgpu::Extent3d {

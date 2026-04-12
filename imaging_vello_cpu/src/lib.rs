@@ -575,6 +575,19 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
             ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
         }
         Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
+        Error::Internal("image target dimensions do not match renderer output") => {
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target dimensions do not match renderer output",
+            ))
+        }
+        Error::Internal("image target row stride must be tightly packed") => {
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target row stride must be tightly packed",
+            ))
+        }
+        Error::Internal("image target buffer is too small") => {
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        }
         Error::Internal("render width too large" | "render height too large") => {
             ImageRendererError::Target(ImageTargetError::DimensionsTooLarge)
         }
@@ -760,7 +773,10 @@ impl PaintSink for VelloCpuRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::Painter;
+    use imaging::{
+        Painter,
+        render::{ImageBufferTarget, ImageTargetError},
+    };
     use kurbo::Rect;
     use peniko::Color;
 
@@ -893,5 +909,77 @@ mod tests {
         let image = renderer.render_source(&mut source, 48, 48).unwrap();
         assert_eq!(image.width, 48);
         assert_eq!(image.height, 48);
+    }
+
+    #[test]
+    fn render_source_into_rejects_short_row_stride_as_target_error() {
+        let mut renderer = VelloCpuRenderer::new(4, 4);
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 4.0, 4.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+
+        let mut data = vec![0; 4 * 4 * 4];
+        let mut source = &scene;
+        let error = ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut data,
+                width: 4,
+                height: 4,
+                bytes_per_row: 12,
+                format: ImageBufferFormat::Rgba8Unorm,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target row stride must be tightly packed",
+            ))
+        ));
+    }
+
+    #[test]
+    fn render_source_into_rejects_short_buffer_as_target_error() {
+        let mut renderer = VelloCpuRenderer::new(4, 4);
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 4.0, 4.0),
+                    Color::from_rgb8(0x2a, 0x6f, 0xdb),
+                )
+                .draw();
+        }
+
+        let mut data = vec![0; 15];
+        let mut source = &scene;
+        let error = ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut data,
+                width: 4,
+                height: 4,
+                bytes_per_row: 16,
+                format: ImageBufferFormat::Rgba8Unorm,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        ));
     }
 }

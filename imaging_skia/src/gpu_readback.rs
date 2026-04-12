@@ -150,7 +150,7 @@ pub(crate) fn read_texture_into_target(
     Ok(())
 }
 
-fn create_texture(
+pub(crate) fn create_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
