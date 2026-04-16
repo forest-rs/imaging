@@ -1057,6 +1057,7 @@ dependencies = [
  "ash",
  "foreign-types-shared",
  "imaging",
+ "imaging_wgpu",
  "kurbo",
  "oaty",
  "peniko",
@@ -1102,6 +1103,7 @@ name = "imaging_vello"
 version = "0.0.1"
 dependencies = [
  "imaging",
+ "imaging_wgpu",
  "kurbo",
  "peniko",
  "pollster",
@@ -1125,11 +1127,21 @@ name = "imaging_vello_hybrid"
 version = "0.0.1"
 dependencies = [
  "imaging",
+ "imaging_wgpu",
  "kurbo",
  "peniko",
  "pollster",
  "vello_common",
  "vello_hybrid",
+ "wgpu 28.0.0",
+]
+
+[[package]]
+name = "imaging_wgpu"
+version = "0.0.1"
+dependencies = [
+ "imaging",
+ "wgpu 27.0.1",
  "wgpu 28.0.0",
 ]
 

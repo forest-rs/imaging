@@ -9,6 +9,7 @@ members = [
     "imaging_vello",
     "imaging_vello_cpu",
     "imaging_vello_hybrid",
+    "imaging_wgpu",
     "imaging_wind_tunnel",
     "svg_imaging",
     "velato_imaging",
@@ -31,6 +32,7 @@ imaging_tiny_skia = { path = "imaging_tiny_skia" }
 imaging_vello = { path = "imaging_vello" }
 imaging_vello_cpu = { path = "imaging_vello_cpu" }
 imaging_vello_hybrid = { path = "imaging_vello_hybrid" }
+imaging_wgpu = { default-features = false, path = "imaging_wgpu" }
 svg_imaging = { path = "svg_imaging" }
 velato_imaging = { path = "velato_imaging" }
 

@@ -74,4 +74,16 @@ impl MetalBackend {
         )
         .ok_or(Error::CreateGpuSurface)
     }
+
+    pub(crate) fn supports_texture_format(
+        texture_format: wgpu::TextureFormat,
+    ) -> Result<(), Error> {
+        match texture_format {
+            wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Rgb10a2Unorm
+            | wgpu::TextureFormat::Rgba16Float => Ok(()),
+            _ => Err(Error::UnsupportedGpuTextureFormat),
+        }
+    }
 }

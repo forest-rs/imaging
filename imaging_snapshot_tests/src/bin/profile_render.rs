@@ -12,7 +12,7 @@ use imaging_snapshot_tests::cases::{
 };
 
 #[cfg(feature = "skia")]
-use imaging_skia::SkiaRenderer;
+use imaging_skia::SkiaCpuRenderer;
 #[cfg(feature = "tiny_skia")]
 use imaging_tiny_skia::TinySkiaRenderer;
 #[cfg(feature = "vello_cpu")]
@@ -52,7 +52,7 @@ fn main() {
         "skia" => {
             #[cfg(feature = "skia")]
             {
-                let mut renderer = SkiaRenderer::new();
+                let mut renderer = SkiaCpuRenderer::new();
                 let mut checksum = 0_u64;
                 for _ in 0..loops {
                     let image = renderer

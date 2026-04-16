@@ -29,7 +29,7 @@ kurbo.workspace = true
 peniko.workspace = true
 rustc-hash = "2.1"
 swash = "0.2"
-tiny-skia = { version = "0.11", default-features = false, features = ["simd"] }
+tiny-skia = { default-features = false, features = ["simd"], version = "0.11" }
 
 [lints]
 workspace = true

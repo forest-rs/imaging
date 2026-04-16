@@ -19,7 +19,10 @@ use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, RgbaImage, StrokeRef,
     record::{Scene, ValidateError},
-    render::{ImageRenderer, RenderSource},
+    render::{
+        ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
+        RenderContentError, RenderSource,
+    },
 };
 use kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke as KurboStroke, Vec2};
 use peniko::{
@@ -62,6 +65,14 @@ pub enum Error {
     /// An internal invariant was violated.
     Internal(&'static str),
 }
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl core::error::Error for Error {}
 
 /// Byte channel ordering for caller-owned CPU targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1981,20 +1992,20 @@ impl Layer<'_> {
     }
 }
 
-/// CPU copy renderer for the `imaging` command stream.
-pub type TinySkiaRenderer = TinySkiaRendererImpl<'static>;
-/// CPU copy renderer alias for [`TinySkiaRenderer`].
-pub type TinySkiaCpuCopyRenderer = TinySkiaRenderer;
-/// CPU target renderer alias for [`TinySkiaTargetRenderer`].
-pub type TinySkiaCpuTargetRenderer<'a> = TinySkiaTargetRenderer<'a>;
-
-/// Core tiny-skia renderer state.
-pub struct TinySkiaRendererImpl<'a> {
+/// CPU renderer for the `imaging` command stream.
+pub struct TinySkiaRenderer {
     caches: RendererCaches,
     cache_color: CacheColor,
+}
+
+/// Short-lived render session that owns per-frame layers and clip/group state.
+pub struct TinySkiaRender<'renderer, 'target> {
+    caches: &'renderer mut RendererCaches,
+    cache_color: CacheColor,
+    cache_color_out: &'renderer mut CacheColor,
     transform: Affine,
     mask_cache: VecDeque<CachedMask>,
-    layers: Vec<Layer<'a>>,
+    layers: Vec<Layer<'target>>,
     group_frames: Vec<GroupFrame>,
 }
 
@@ -2004,45 +2015,50 @@ enum GroupFrame {
     Isolated,
 }
 
-/// tiny-skia renderer that draws directly into a caller-owned CPU target.
-pub struct TinySkiaTargetRenderer<'a> {
-    inner: TinySkiaRendererImpl<'a>,
-}
-
-impl core::fmt::Debug for TinySkiaRendererImpl<'_> {
+impl core::fmt::Debug for TinySkiaRenderer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("TinySkiaRendererImpl")
-            .finish_non_exhaustive()
+        f.debug_struct("TinySkiaRenderer").finish_non_exhaustive()
     }
 }
 
-impl core::fmt::Debug for TinySkiaTargetRenderer<'_> {
+impl core::fmt::Debug for TinySkiaRender<'_, '_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("TinySkiaTargetRenderer")
-            .finish_non_exhaustive()
+        f.debug_struct("TinySkiaRender").finish_non_exhaustive()
     }
 }
 
-impl<'a> TinySkiaTargetRenderer<'a> {
-    /// Create a temporary CPU target renderer bound to a caller-provided buffer.
-    pub fn new_target(target: CpuBufferTarget<'a>) -> Result<Self> {
+impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
+    fn new(renderer: &'renderer mut TinySkiaRenderer, root: Layer<'target>) -> Self {
+        let TinySkiaRenderer {
+            caches,
+            cache_color,
+        } = renderer;
+        let cache_color_value = *cache_color;
+        Self {
+            caches,
+            cache_color: cache_color_value,
+            cache_color_out: cache_color,
+            transform: Affine::IDENTITY,
+            mask_cache: VecDeque::new(),
+            layers: vec![root],
+            group_frames: Vec::new(),
+        }
+    }
+
+    /// Create a render session bound directly to a caller-provided buffer.
+    pub fn new_target(
+        renderer: &'renderer mut TinySkiaRenderer,
+        target: CpuBufferTarget<'target>,
+    ) -> Result<Self> {
         if target.format == CpuBufferFormat::RGBA8_OPAQUE
             && target.bytes_per_row == target.width as usize * 4
         {
-            let mut inner = TinySkiaRendererImpl {
-                caches: RendererCaches::new(),
-                transform: Affine::IDENTITY,
-                cache_color: CacheColor(false),
-                mask_cache: VecDeque::new(),
-                layers: vec![Layer::new_root_borrowed(
-                    target.buffer,
-                    target.width,
-                    target.height,
-                )?],
-                group_frames: Vec::new(),
-            };
+            let mut inner = Self::new(
+                renderer,
+                Layer::new_root_borrowed(target.buffer, target.width, target.height)?,
+            );
             inner.clear_root_layer();
-            return Ok(Self { inner });
+            return Ok(inner);
         }
 
         Err(Error::UnsupportedTargetFormat)
@@ -2081,7 +2097,7 @@ fn translate_clip_paths_in_place(clips: &mut [ClipPath], dx: f64, dy: f64) {
     }
 }
 
-impl<'a> TinySkiaRendererImpl<'a> {
+impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn simple_inherited_clips(clips: &[ClipPath]) -> Vec<ClipPath> {
         clips
             .iter()
@@ -2422,16 +2438,16 @@ impl<'a> TinySkiaRendererImpl<'a> {
         }
     }
 
-    fn current_layer_mut(&mut self) -> &mut Layer<'a> {
+    fn current_layer_mut(&mut self) -> &mut Layer<'target> {
         self.layers
             .last_mut()
-            .expect("TinySkiaRenderer always has a root layer")
+            .expect("TinySkiaRender always has a root layer")
     }
 
-    fn current_layer(&self) -> &Layer<'a> {
+    fn current_layer(&self) -> &Layer<'target> {
         self.layers
             .last()
-            .expect("TinySkiaRenderer always has a root layer")
+            .expect("TinySkiaRender always has a root layer")
     }
 
     fn new_composite_child_layer(
@@ -2493,7 +2509,7 @@ impl<'a> TinySkiaRendererImpl<'a> {
             return false;
         };
         if !render_cached_image_rect(
-            &mut self.caches,
+            self.caches,
             self.cache_color,
             &mut child,
             image,
@@ -2737,41 +2753,40 @@ impl<'a> TinySkiaRendererImpl<'a> {
     }
 }
 
-impl TinySkiaRendererImpl<'static> {
-    /// Create the default CPU copy renderer.
+impl TinySkiaRenderer {
+    /// Create the default CPU renderer.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_size(1, 1).expect("1x1 tiny-skia surface should always initialize")
-    }
-
-    /// Create the default CPU copy renderer with an explicit initial surface size.
-    pub fn new_with_size(width: u32, height: u32) -> Result<Self> {
-        let main_layer = Layer::new_root(width, height)?;
-        Ok(Self {
+        Self {
             caches: RendererCaches::new(),
-            transform: Affine::IDENTITY,
             cache_color: CacheColor(false),
-            mask_cache: VecDeque::new(),
-            layers: vec![main_layer],
-            group_frames: Vec::new(),
-        })
+        }
     }
 
-    /// Reset the renderer for a new frame and resize the internal surface if needed.
-    pub fn begin(&mut self, width: u32, height: u32) {
-        if width != self.layers[0].pixmap.width() || height != self.layers[0].pixmap.height() {
-            self.layers[0] = Layer::new_root(width, height).expect("unable to create layer");
-        }
-        assert!(
-            self.layers.len() == 1,
-            "TinySkiaRenderer must contain only the root layer at frame start"
-        );
-        assert!(
-            self.group_frames.is_empty(),
-            "TinySkiaRenderer must not have open groups at frame start"
-        );
-        self.transform = Affine::IDENTITY;
-        self.clear_root_layer();
+    /// Create the default CPU renderer.
+    pub fn new_with_size(_width: u32, _height: u32) -> Result<Self> {
+        Ok(Self::new())
+    }
+
+    /// Create a render session backed by an internal tiny-skia pixmap.
+    pub fn begin(&mut self, width: u32, height: u32) -> Result<TinySkiaRender<'_, 'static>> {
+        let mut render = TinySkiaRender::new(self, Layer::new_root(width, height)?);
+        render.clear_root_layer();
+        Ok(render)
+    }
+
+    /// Create a render session bound directly to a caller-provided buffer.
+    pub fn begin_target<'target>(
+        &mut self,
+        target: CpuBufferTarget<'target>,
+    ) -> Result<TinySkiaRender<'_, 'target>> {
+        TinySkiaRender::new_target(self, target)
+    }
+}
+
+impl Default for TinySkiaRenderer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2781,9 +2796,10 @@ fn rasterize_scene_pixmap(
     height: u32,
     transform: Affine,
 ) -> Option<Arc<Pixmap>> {
-    let mut renderer = TinySkiaRendererImpl::new_with_size(width, height).ok()?;
-    imaging::record::replay_transformed(scene, &mut renderer, transform);
-    let layer = renderer.layers.into_iter().next()?;
+    let mut renderer = TinySkiaRenderer::new();
+    let mut render = renderer.begin(width, height).ok()?;
+    imaging::record::replay_transformed(scene, &mut render, transform);
+    let layer = render.layers.into_iter().next()?;
     match layer.pixmap {
         LayerPixmap::Owned(pixmap) => Some(Arc::new(pixmap)),
         LayerPixmap::Borrowed(_) => None,
@@ -2798,7 +2814,7 @@ fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Op
     Some(pixmap)
 }
 
-impl PaintSink for TinySkiaRendererImpl<'_> {
+impl PaintSink for TinySkiaRender<'_, '_> {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         let clip_path = self.clip_path_for_clip(clip);
         if let Some(clip_path) = clip_path {
@@ -2865,7 +2881,7 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
             return;
         };
         if let peniko::Brush::Image(image) = &brush {
-            let Some(image_pixmap) = cache_image_pixmap(&mut self.caches, self.cache_color, image)
+            let Some(image_pixmap) = cache_image_pixmap(self.caches, self.cache_color, image)
             else {
                 return;
             };
@@ -2939,7 +2955,7 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
             return;
         };
         if let peniko::Brush::Image(image) = &brush {
-            let Some(image_pixmap) = cache_image_pixmap(&mut self.caches, self.cache_color, image)
+            let Some(image_pixmap) = cache_image_pixmap(self.caches, self.cache_color, image)
             else {
                 return;
             };
@@ -3026,7 +3042,7 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
             return;
         };
         draw_glyphs_into_layer(
-            &mut self.caches,
+            self.caches,
             &mut child,
             cache_color,
             Point::ZERO,
@@ -3068,13 +3084,7 @@ impl PaintSink for TinySkiaRendererImpl<'_> {
     }
 }
 
-impl TinySkiaRendererImpl<'static> {
-    fn set_size(&mut self, size: Size) {
-        Self::begin(self, f64_to_u32(size.width), f64_to_u32(size.height));
-    }
-
-    fn reset_for_frame(&mut self) {}
-
+impl TinySkiaRenderer {
     /// Render any [`RenderSource`] into a caller-provided image buffer.
     pub fn render_source_into<S: RenderSource + ?Sized>(
         &mut self,
@@ -3084,11 +3094,11 @@ impl TinySkiaRendererImpl<'static> {
         image: &mut RgbaImage,
     ) -> Result<()> {
         source.validate().map_err(Error::InvalidScene)?;
-        self.set_size(Size::new(width as f64, height as f64));
-        self.reset_for_frame();
-        source.paint_into(self);
+        let mut render = self.begin(width, height)?;
+        source.paint_into(&mut render);
         image.resize(width, height);
-        self.finish_into_rgba8(image.data.as_mut_slice(), usize_from_u32(width) * 4)
+        render
+            .finish_into_rgba8(image.data.as_mut_slice(), usize_from_u32(width) * 4)
             .ok_or(Error::Internal(
                 "tiny-skia image backend did not produce an image",
             ))
@@ -3125,27 +3135,68 @@ impl TinySkiaRendererImpl<'static> {
     }
 }
 
-impl Default for TinySkiaRendererImpl<'static> {
-    fn default() -> Self {
-        Self::new()
+impl ImageRenderer for TinySkiaRenderer {
+    fn supported_image_formats(&self) -> Vec<ImageBufferFormat> {
+        vec![ImageBufferFormat::Rgba8Unorm]
     }
-}
 
-impl ImageRenderer for TinySkiaRendererImpl<'static> {
-    type Error = Error;
-
-    fn render_source_into<S: RenderSource + ?Sized>(
+    fn render_source_into(
         &mut self,
-        source: &mut S,
-        width: u32,
-        height: u32,
-        image: &mut RgbaImage,
-    ) -> Result<()> {
-        TinySkiaRendererImpl::render_source_into(self, source, width, height, image)
+        source: &mut dyn RenderSource,
+        target: ImageBufferTarget<'_>,
+    ) -> Result<(), ImageRendererError> {
+        if target.format != ImageBufferFormat::Rgba8Unorm {
+            return Err(ImageRendererError::Target(
+                ImageTargetError::UnsupportedTargetFormat,
+            ));
+        }
+        source
+            .validate()
+            .map_err(Error::InvalidScene)
+            .map_err(map_image_renderer_error)?;
+        let width_bytes = usize_from_u32(target.width) * 4;
+        if target.bytes_per_row < width_bytes {
+            return Err(ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target row stride is smaller than the rendered width",
+            )));
+        }
+        let required_len = target
+            .bytes_per_row
+            .checked_mul(usize_from_u32(target.height))
+            .expect("image target byte length should fit in usize");
+        if target.data.len() < required_len {
+            return Err(ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target buffer is too small for the requested dimensions",
+            )));
+        }
+        let mut render = self
+            .begin(target.width, target.height)
+            .map_err(map_image_renderer_error)?;
+        source.paint_into(&mut render);
+        render
+            .finish_into_rgba8(target.data, target.bytes_per_row)
+            .ok_or(ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "tiny-skia image backend did not produce an image",
+            )))
     }
 }
 
-impl<'a> TinySkiaTargetRenderer<'a> {
+fn map_image_renderer_error(error: Error) -> ImageRendererError {
+    match error {
+        Error::InvalidScene(error) => {
+            ImageRendererError::Content(RenderContentError::InvalidScene(error))
+        }
+        Error::UnsupportedTargetFormat => {
+            ImageRendererError::Target(ImageTargetError::UnsupportedTargetFormat)
+        }
+        Error::InvalidTargetBuffer => {
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        }
+        other => ImageRendererError::backend(other),
+    }
+}
+
+impl TinySkiaRenderer {
     /// Validate whether the renderer can draw directly into the provided target shape.
     pub fn supports_target_info(target: &CpuBufferTargetInfo) -> Result<()> {
         if target.format == CpuBufferFormat::RGBA8_OPAQUE
@@ -3156,28 +3207,28 @@ impl<'a> TinySkiaTargetRenderer<'a> {
         Err(Error::UnsupportedTargetFormat)
     }
 
-    /// Rebind the target renderer to a different caller-owned pixel buffer.
-    pub fn set_target(&mut self, target: CpuBufferTarget<'a>) -> Result<()> {
-        *self = Self::new_target(target)?;
-        Ok(())
-    }
-
-    /// Render any [`RenderSource`] into the currently bound caller-owned target.
-    pub fn render_source<S: RenderSource + ?Sized>(&mut self, source: &mut S) -> Result<()> {
+    /// Render any [`RenderSource`] directly into a caller-owned pixel buffer.
+    pub fn render_source_into_target<S: RenderSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        target: CpuBufferTarget<'_>,
+    ) -> Result<()> {
         source.validate().map_err(Error::InvalidScene)?;
-        self.inner.clear_root_layer();
-        source.paint_into(&mut self.inner);
-        self.inner
-            .finish_direct_rgba8_opaque()
-            .ok_or(Error::Internal(
-                "tiny-skia target renderer did not produce a frame",
-            ))
+        let mut render = self.begin_target(target)?;
+        source.paint_into(&mut render);
+        render.finish_direct_rgba8_opaque().ok_or(Error::Internal(
+            "tiny-skia bound target renderer did not produce a frame",
+        ))
     }
 
-    /// Render a recorded scene into the currently bound caller-owned target.
-    pub fn render_scene(&mut self, scene: &Scene) -> Result<()> {
+    /// Render a recorded scene directly into a caller-owned pixel buffer.
+    pub fn render_scene_into_target(
+        &mut self,
+        scene: &Scene,
+        target: CpuBufferTarget<'_>,
+    ) -> Result<()> {
         let mut source = scene;
-        self.render_source(&mut source)
+        self.render_source_into_target(&mut source, target)
     }
 }
 
@@ -3782,7 +3833,7 @@ fn draw_glyphs_into_layer<'a>(
     }
 }
 
-impl TinySkiaRendererImpl<'_> {
+impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn canvas_size(&self) -> Size {
         Size::new(
             self.layers[0].pixmap.width() as f64,
@@ -3835,6 +3886,7 @@ impl TinySkiaRendererImpl<'_> {
             .glyph_cache
             .retain(|_, entry| should_retain_glyph_entry(entry, self.cache_color, now));
         self.cache_color = CacheColor(!self.cache_color.0);
+        *self.cache_color_out = self.cache_color;
     }
 
     fn finish_into_unpremultiplied(
@@ -5942,16 +5994,16 @@ mod tests {
     #[test]
     fn rect_clip_avoids_materializing_mask() {
         let mut renderer = TinySkiaRenderer::new_with_size(8, 8).expect("renderer");
-        renderer.begin(8, 8);
+        let mut render = renderer.begin(8, 8).expect("render");
 
-        PaintSink::push_clip(&mut renderer, ClipRef::fill(Rect::new(2.0, 2.0, 6.0, 6.0)));
-        PaintSink::push_clip(&mut renderer, ClipRef::fill(Rect::new(3.0, 1.0, 7.0, 5.0)));
+        PaintSink::push_clip(&mut render, ClipRef::fill(Rect::new(2.0, 2.0, 6.0, 6.0)));
+        PaintSink::push_clip(&mut render, ClipRef::fill(Rect::new(3.0, 1.0, 7.0, 5.0)));
         PaintSink::fill(
-            &mut renderer,
+            &mut render,
             FillRef::new(Rect::new(0.0, 0.0, 8.0, 8.0), Color::from_rgb8(255, 0, 0)),
         );
 
-        let root = &renderer.layers[0];
+        let root = &render.layers[0];
         assert!(root.clip_mask_is_empty());
         assert_eq!(pixel_rgba(root, 2, 2), (0, 0, 0, 0));
         assert_eq!(pixel_rgba(root, 3, 2), (255, 0, 0, 255));
@@ -6197,7 +6249,7 @@ mod tests {
     #[test]
     fn path_clip_does_not_fall_back_to_bounding_box() {
         let mut renderer = TinySkiaRenderer::new_with_size(8, 8).expect("renderer");
-        renderer.begin(8, 8);
+        let mut render = renderer.begin(8, 8).expect("render");
 
         let mut clip = BezPath::new();
         clip.move_to((4.0, 0.0));
@@ -6206,14 +6258,14 @@ mod tests {
         clip.line_to((0.0, 4.0));
         clip.close_path();
 
-        PaintSink::push_clip(&mut renderer, ClipRef::fill(clip));
+        PaintSink::push_clip(&mut render, ClipRef::fill(clip));
         PaintSink::fill(
-            &mut renderer,
+            &mut render,
             FillRef::new(Rect::new(0.0, 0.0, 8.0, 8.0), Color::from_rgb8(255, 0, 0)),
         );
-        PaintSink::pop_clip(&mut renderer);
+        PaintSink::pop_clip(&mut render);
 
-        let root = &renderer.layers[0];
+        let root = &render.layers[0];
         assert_eq!(pixel_rgba(root, 0, 0), (0, 0, 0, 0));
         assert_eq!(pixel_rgba(root, 7, 7), (0, 0, 0, 0));
         assert_eq!(pixel_rgba(root, 4, 4), (255, 0, 0, 255));
@@ -6393,28 +6445,29 @@ mod tests {
     #[test]
     fn default_group_with_clip_does_not_isolate() {
         let mut renderer = TinySkiaRenderer::new_with_size(16, 16).expect("renderer");
+        let mut render = renderer.begin(16, 16).expect("render");
         let clip = ClipRef::fill(imaging::GeometryRef::Rect(Rect::new(2.0, 2.0, 14.0, 14.0)));
 
-        renderer.push_group(GroupRef::new().with_clip(clip));
+        render.push_group(GroupRef::new().with_clip(clip));
 
-        assert_eq!(renderer.layers.len(), 1);
+        assert_eq!(render.layers.len(), 1);
         assert_eq!(
-            renderer.group_frames,
+            render.group_frames,
             vec![GroupFrame::Direct { pushed_clip: true }]
         );
-        assert_eq!(renderer.current_layer().clip_stack.len(), 1);
+        assert_eq!(render.current_layer().clip_stack.len(), 1);
 
-        renderer.pop_group();
+        render.pop_group();
 
-        assert!(renderer.group_frames.is_empty());
-        assert_eq!(renderer.layers.len(), 1);
-        assert!(renderer.current_layer().clip_stack.is_empty());
+        assert!(render.group_frames.is_empty());
+        assert_eq!(render.layers.len(), 1);
+        assert!(render.current_layer().clip_stack.is_empty());
     }
 
     #[test]
-    fn target_renderer_supports_only_packed_rgba8_targets() {
+    fn renderer_supports_only_packed_rgba8_bound_targets() {
         assert!(
-            TinySkiaTargetRenderer::supports_target_info(&CpuBufferTargetInfo {
+            TinySkiaRenderer::supports_target_info(&CpuBufferTargetInfo {
                 width: 2,
                 height: 2,
                 bytes_per_row: 8,
@@ -6424,7 +6477,7 @@ mod tests {
         );
 
         assert!(
-            TinySkiaTargetRenderer::supports_target_info(&CpuBufferTargetInfo {
+            TinySkiaRenderer::supports_target_info(&CpuBufferTargetInfo {
                 width: 2,
                 height: 2,
                 bytes_per_row: 8,
@@ -6434,7 +6487,7 @@ mod tests {
         );
 
         assert!(
-            TinySkiaTargetRenderer::supports_target_info(&CpuBufferTargetInfo {
+            TinySkiaRenderer::supports_target_info(&CpuBufferTargetInfo {
                 width: 2,
                 height: 2,
                 bytes_per_row: 16,
@@ -6448,11 +6501,11 @@ mod tests {
     fn render_scene_replays_masked_group_content() {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = TinySkiaRenderer::new_with_size(64, 64).expect("renderer");
-        renderer.begin(64, 64);
+        let mut render = renderer.begin(64, 64).expect("render");
 
-        imaging::record::replay(&scene, &mut renderer);
+        imaging::record::replay(&scene, &mut render);
 
-        let root = &renderer.layers[0];
+        let root = &render.layers[0];
         assert_eq!(pixel_rgba(root, 4, 4), (0, 0, 0, 0));
         let center = pixel_rgba(root, 16, 16);
         assert!(center.0 > 0 || center.1 > 0 || center.2 > 0);

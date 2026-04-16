@@ -125,7 +125,9 @@ pub use paint::{
     MaskRef, PaintSink, SourceLocationRef, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
-pub use render::{ImageRenderer, RenderSource, TextureRenderer};
+pub use render::{
+    ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, RenderSource,
+};
 
 pub use kurbo;
 pub use peniko;

@@ -118,6 +118,11 @@ impl VulkanBackend {
     }
 }
 
+pub(crate) fn supports_texture_format(texture_format: wgpu::TextureFormat) -> Result<(), Error> {
+    let _ = vk_format_for_wgpu_texture_format(texture_format)?;
+    Ok(())
+}
+
 fn create_gr_context(
     _entry: &ash::Entry,
     instance: ash::vk::Instance,

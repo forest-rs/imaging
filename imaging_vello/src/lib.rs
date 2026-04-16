@@ -7,11 +7,10 @@
 //! and renders them to GPU targets or RGBA8 image data using `vello` + `wgpu`.
 //!
 //! Semantic [`imaging::record::Scene`] values can be lowered to native Vello scenes through
-//! [`VelloTargetRenderer::encode_scene`] or [`VelloRenderer::encode_scene`].
+//! [`VelloRenderer::encode_scene`].
 //!
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
-//! presentation targets, then pass those handles into [`VelloTargetRenderer`] or
-//! [`VelloRenderer`].
+//! presentation targets, then pass those handles into [`VelloRenderer`].
 //!
 //! Enable exactly one backend compatibility feature:
 //!
@@ -20,8 +19,7 @@
 //!
 //! # Render A Recorded Scene
 //!
-//! Record commands into [`imaging::record::Scene`], then render them with [`VelloRenderer`] or
-//! [`VelloTargetRenderer`].
+//! Record commands into [`imaging::record::Scene`], then render them with [`VelloRenderer`].
 //!
 //! ```no_run
 //! use imaging::{Painter, record};
@@ -77,8 +75,7 @@
 //!
 //! # Render A Native `vello::Scene`
 //!
-//! If you already have a native Vello scene, hand it directly to [`VelloRenderer`] for image
-//! output or [`VelloTargetRenderer`] for caller-owned target rendering.
+//! If you already have a native Vello scene, hand it directly to [`VelloRenderer`].
 //!
 //! ```no_run
 //! use imaging::Painter;
@@ -124,7 +121,11 @@ compile_error!("Enable one of `vello-0-7` or `vello-0-8`.");
 
 use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
-use imaging::render::{ImageRenderer, RenderSource, TextureRenderer};
+use imaging::render::{
+    GpuReadbackError, ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError,
+    ImageTargetError, RenderContentError, RenderSource, RenderUnsupportedError,
+};
+use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError, TextureViewTarget};
 use kurbo::Rect;
 
 #[cfg(feature = "vello-0-7")]
@@ -134,7 +135,9 @@ pub use vello_08 as vello;
 
 pub use crate::vello::wgpu;
 use crate::vello::{AaConfig, RenderParams};
-use crate::wgpu_support::{OffscreenTarget, ReadbackError, read_texture_into};
+use crate::wgpu_support::{
+    OffscreenTarget, ReadbackError, create_texture, read_texture_into, read_texture_into_target,
+};
 
 pub use scene_sink::VelloSceneSink;
 
@@ -165,6 +168,14 @@ pub enum Error {
     Internal(&'static str),
 }
 
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl core::error::Error for Error {}
+
 struct VelloRendererState {
     renderer: vello::Renderer,
     device: wgpu::Device,
@@ -173,44 +184,9 @@ struct VelloRendererState {
 
 /// Renderer that executes `imaging` commands into caller-owned texture views using `vello` +
 /// `wgpu`.
-pub struct VelloTargetRenderer {
-    state: VelloRendererState,
-}
-
-/// Image/readback convenience wrapper around [`VelloTargetRenderer`].
-///
-/// Use [`VelloTargetRenderer`] when the host application already owns the destination texture
-/// view.
 pub struct VelloRenderer {
-    target_renderer: VelloTargetRenderer,
+    state: VelloRendererState,
     target: Option<OffscreenTarget>,
-}
-
-/// Caller-owned texture target used with [`imaging::TextureRenderer`] on [`VelloTargetRenderer`].
-#[derive(Copy, Clone, Debug)]
-pub struct TextureTarget<'a> {
-    view: &'a wgpu::TextureView,
-    width: u32,
-    height: u32,
-}
-
-impl<'a> TextureTarget<'a> {
-    /// Create a texture target wrapper for a caller-owned texture view and dimensions.
-    #[must_use]
-    pub fn new(view: &'a wgpu::TextureView, width: u32, height: u32) -> Self {
-        Self {
-            view,
-            width,
-            height,
-        }
-    }
-}
-
-impl core::fmt::Debug for VelloTargetRenderer {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VelloTargetRenderer")
-            .finish_non_exhaustive()
-    }
 }
 
 impl core::fmt::Debug for VelloRenderer {
@@ -284,11 +260,12 @@ impl VelloRendererState {
     }
 }
 
-impl VelloTargetRenderer {
+impl VelloRenderer {
     /// Create a renderer bound to an existing `wgpu` device and queue.
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, Error> {
         Ok(Self {
             state: VelloRendererState::new(device, queue)?,
+            target: None,
         })
     }
 
@@ -322,62 +299,73 @@ impl VelloTargetRenderer {
         self.state
             .render_to_view(scene, texture_view, width, height)
     }
+
+    fn ensure_target(&mut self, width: u16, height: u16) -> &OffscreenTarget {
+        let target = self.target.get_or_insert_with(|| {
+            OffscreenTarget::new(&self.state.device, u32::from(width), u32::from(height))
+        });
+        target.resize(&self.state.device, u32::from(width), u32::from(height));
+        target
+    }
 }
 
-impl TextureRenderer for VelloTargetRenderer {
-    type Error = Error;
-    type TextureTarget<'a> = TextureTarget<'a>;
+fn supported_texture_formats() -> Vec<wgpu::TextureFormat> {
+    vec![wgpu::TextureFormat::Rgba8Unorm]
+}
 
-    fn render_source_to_texture<'a, S: RenderSource + ?Sized>(
+fn supported_image_formats() -> Vec<ImageBufferFormat> {
+    vec![ImageBufferFormat::Rgba8Unorm]
+}
+
+impl TextureRenderer for VelloRenderer {
+    type TextureTarget = TextureViewTarget;
+    type Texture = wgpu::Texture;
+
+    fn supported_texture_formats(&self) -> Vec<wgpu::TextureFormat> {
+        supported_texture_formats()
+    }
+
+    fn render_source_into_texture(
         &mut self,
-        source: &mut S,
-        target: Self::TextureTarget<'a>,
-    ) -> Result<(), Self::Error> {
-        let native = self.encode_source(source, target.width, target.height)?;
-        self.render_to_texture_view(&native, target.view, target.width, target.height)
+        source: &mut dyn RenderSource,
+        target: TextureViewTarget,
+    ) -> Result<(), TextureRendererError> {
+        let native = self
+            .encode_source(source, target.width, target.height)
+            .map_err(map_texture_renderer_error)?;
+        self.render_to_texture_view(&native, &target.view, target.width, target.height)
+            .map_err(map_texture_renderer_error)
+    }
+
+    fn render_source_texture(
+        &mut self,
+        source: &mut dyn RenderSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Self::Texture, TextureRendererError> {
+        let native = self
+            .encode_source(source, width, height)
+            .map_err(map_texture_renderer_error)?;
+        let (target_width, target_height) =
+            VelloRendererState::checked_size(width, height).map_err(map_texture_renderer_error)?;
+        let texture = create_texture(
+            &self.state.device,
+            u32::from(target_width),
+            u32::from(target_height),
+        );
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.render_to_texture_view(
+            &native,
+            &texture_view,
+            u32::from(target_width),
+            u32::from(target_height),
+        )
+        .map_err(map_texture_renderer_error)?;
+        Ok(texture)
     }
 }
 
 impl VelloRenderer {
-    /// Create an image renderer bound to an existing `wgpu` device and queue.
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, Error> {
-        Ok(Self {
-            target_renderer: VelloTargetRenderer::new(device, queue)?,
-            target: None,
-        })
-    }
-
-    /// Access the target renderer used by this image renderer.
-    pub fn target_renderer(&mut self) -> &mut VelloTargetRenderer {
-        &mut self.target_renderer
-    }
-
-    /// Lower a semantic [`imaging::record::Scene`] into a native [`crate::vello::Scene`].
-    pub fn encode_scene(
-        &self,
-        scene: &Scene,
-        width: u32,
-        height: u32,
-    ) -> Result<vello::Scene, Error> {
-        self.target_renderer.encode_scene(scene, width, height)
-    }
-
-    fn ensure_target(&mut self, width: u16, height: u16) -> &OffscreenTarget {
-        let target = self.target.get_or_insert_with(|| {
-            OffscreenTarget::new(
-                &self.target_renderer.state.device,
-                u32::from(width),
-                u32::from(height),
-            )
-        });
-        target.resize(
-            &self.target_renderer.state.device,
-            u32::from(width),
-            u32::from(height),
-        );
-        target
-    }
-
     /// Render a native [`crate::vello::Scene`] into an RGBA8 image (unpremultiplied).
     pub fn render_into(
         &mut self,
@@ -391,15 +379,10 @@ impl VelloRenderer {
         let target_texture = target.texture().clone();
         let target_width = target.width();
         let target_height = target.height();
-        self.target_renderer.render_to_texture_view(
-            scene,
-            &texture_view,
-            target_width,
-            target_height,
-        )?;
+        self.render_to_texture_view(scene, &texture_view, target_width, target_height)?;
         readback_into(
-            &self.target_renderer.state.device,
-            &self.target_renderer.state.queue,
+            &self.state.device,
+            &self.state.queue,
             &target_texture,
             width,
             height,
@@ -421,18 +404,37 @@ impl VelloRenderer {
 }
 
 impl ImageRenderer for VelloRenderer {
-    type Error = Error;
+    fn supported_image_formats(&self) -> Vec<ImageBufferFormat> {
+        supported_image_formats()
+    }
 
-    fn render_source_into<S: RenderSource + ?Sized>(
+    fn render_source_into(
         &mut self,
-        source: &mut S,
-        width: u32,
-        height: u32,
-        image: &mut RgbaImage,
-    ) -> Result<(), Self::Error> {
-        let native = self.target_renderer.encode_source(source, width, height)?;
-        let (width, height) = VelloRendererState::checked_size(width, height)?;
-        self.render_into(&native, width, height, image)
+        source: &mut dyn RenderSource,
+        target: ImageBufferTarget<'_>,
+    ) -> Result<(), ImageRendererError> {
+        if target.format != ImageBufferFormat::Rgba8Unorm {
+            return Err(ImageRendererError::Target(
+                ImageTargetError::UnsupportedTargetFormat,
+            ));
+        }
+        let texture = <Self as TextureRenderer>::render_source_texture(
+            self,
+            source,
+            target.width,
+            target.height,
+        )
+        .map_err(map_texture_to_image_error)?;
+        read_texture_into_target(
+            &self.state.device,
+            &self.state.queue,
+            &texture,
+            target.width,
+            target.height,
+            target.data,
+            target.bytes_per_row,
+        )
+        .map_err(map_readback_image_error)
     }
 }
 
@@ -460,16 +462,110 @@ fn map_readback_error(err: ReadbackError) -> Error {
         ReadbackError::DevicePoll => Error::Internal("device poll failed"),
         ReadbackError::CallbackDropped => Error::Internal("map_async callback dropped"),
         ReadbackError::BufferMap => Error::Internal("buffer map failed"),
+        ReadbackError::InvalidTargetStride => Error::Internal("image target row stride too small"),
+        ReadbackError::InvalidTargetBuffer => Error::Internal("image target buffer too small"),
+    }
+}
+
+fn map_texture_renderer_error(error: Error) -> TextureRendererError {
+    match error {
+        Error::InvalidScene(error) => {
+            TextureRendererError::Content(RenderContentError::InvalidScene(error))
+        }
+        Error::UnsupportedImageBrush => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        }
+        Error::UnsupportedFilter => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::Filter)
+        }
+        Error::UnsupportedMask => TextureRendererError::Unsupported(RenderUnsupportedError::Mask),
+        Error::UnsupportedGlyphBlend => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::Glyph)
+        }
+        Error::UnsupportedBlurredRoundedRectBlend => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::BlurredRoundedRect)
+        }
+        Error::UnbalancedLayerStack => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::UnbalancedLayerStack)
+        }
+        Error::Internal("render width too large" | "render height too large") => {
+            TextureRendererError::Target(TextureTargetError::DimensionsTooLarge)
+        }
+        other => TextureRendererError::backend(other),
+    }
+}
+
+fn map_texture_to_image_error(error: TextureRendererError) -> ImageRendererError {
+    match error {
+        TextureRendererError::Content(error) => ImageRendererError::Content(error),
+        TextureRendererError::Target(error) => match error {
+            TextureTargetError::InvalidTarget(message) => {
+                ImageRendererError::Target(ImageTargetError::InvalidTarget(message))
+            }
+            TextureTargetError::DimensionsTooLarge => {
+                ImageRendererError::Target(ImageTargetError::DimensionsTooLarge)
+            }
+            TextureTargetError::UnsupportedTextureFormat => {
+                ImageRendererError::Target(ImageTargetError::UnsupportedTargetFormat)
+            }
+            TextureTargetError::CreateGpuContext(message) => {
+                ImageRendererError::Target(ImageTargetError::InvalidTarget(message))
+            }
+            TextureTargetError::CreateGpuSurface => {
+                ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                    "backend could not wrap the texture as a GPU render surface",
+                ))
+            }
+            TextureTargetError::UnsupportedGpuBackend => {
+                ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                    "no supported GPU backend was available for the supplied wgpu setup",
+                ))
+            }
+        },
+        TextureRendererError::Unsupported(error) => ImageRendererError::Unsupported(error),
+        TextureRendererError::Backend(error) => ImageRendererError::Backend(error),
+    }
+}
+
+fn map_readback_image_error(error: ReadbackError) -> ImageRendererError {
+    match error {
+        ReadbackError::DevicePoll => ImageRendererError::Readback(GpuReadbackError::DevicePoll),
+        ReadbackError::CallbackDropped => {
+            ImageRendererError::Readback(GpuReadbackError::CallbackDropped)
+        }
+        ReadbackError::BufferMap => ImageRendererError::Readback(GpuReadbackError::BufferMap),
+        ReadbackError::InvalidTargetStride => {
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target row stride is smaller than the rendered width",
+            ))
+        }
+        ReadbackError::InvalidTargetBuffer => {
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::Painter;
+    use imaging::{
+        Painter,
+        render::{ImageBufferTarget, ImageTargetError},
+    };
     use kurbo::Rect;
     use peniko::Color;
     use pollster::block_on;
+
+    fn solid_scene(color: Color, width: f64, height: f64) -> Scene {
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(Rect::new(0.0, 0.0, width, height), color)
+                .draw();
+        }
+        scene
+    }
 
     fn try_init_device_and_queue() -> Result<(wgpu::Device, wgpu::Queue), ()> {
         block_on(async {
@@ -535,9 +631,35 @@ mod tests {
         }
 
         let mut source = &scene;
-        let image = renderer.render_source(&mut source, 40, 40).unwrap();
+        let image = ImageRenderer::render_source(&mut renderer, &mut source, 40, 40).unwrap();
         assert_eq!(image.width, 40);
         assert_eq!(image.height, 40);
+    }
+
+    #[test]
+    fn invalid_target_stride_maps_to_image_target_error() {
+        assert!(matches!(
+            map_readback_image_error(ReadbackError::InvalidTargetStride),
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target row stride is smaller than the rendered width",
+            ))
+        ));
+    }
+
+    #[test]
+    fn invalid_target_buffer_maps_to_image_target_error() {
+        assert!(matches!(
+            map_readback_image_error(ReadbackError::InvalidTargetBuffer),
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        ));
+    }
+
+    #[test]
+    fn supported_image_formats_are_rgba8_only() {
+        assert_eq!(
+            supported_image_formats(),
+            vec![ImageBufferFormat::Rgba8Unorm]
+        );
     }
 
     #[test]
@@ -545,7 +667,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloTargetRenderer::new(device.clone(), queue).unwrap();
+        let mut renderer = VelloRenderer::new(device.clone(), queue).unwrap();
 
         let mut scene = Scene::new();
         {
@@ -584,7 +706,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloTargetRenderer::new(device.clone(), queue).unwrap();
+        let mut renderer = VelloRenderer::new(device.clone(), queue).unwrap();
 
         let mut scene = Scene::new();
         {
@@ -613,9 +735,104 @@ mod tests {
         });
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut source = &scene;
-        renderer
-            .render_source_to_texture(&mut source, TextureTarget::new(&texture_view, 24, 24))
-            .unwrap();
+        TextureRenderer::render_source_into_texture(
+            &mut renderer,
+            &mut source,
+            TextureViewTarget::new(&texture_view, 24, 24),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn render_source_texture_returns_independent_texture() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloRenderer::new(device.clone(), queue.clone()).unwrap();
+
+        let first_scene = solid_scene(Color::from_rgb8(0xff, 0x00, 0x00), 8.0, 8.0);
+        let second_scene = solid_scene(Color::from_rgb8(0x00, 0xff, 0x00), 8.0, 8.0);
+
+        let mut first_source = &first_scene;
+        let first_texture =
+            TextureRenderer::render_source_texture(&mut renderer, &mut first_source, 8, 8).unwrap();
+
+        let mut second_source = &second_scene;
+        let _second_texture =
+            TextureRenderer::render_source_texture(&mut renderer, &mut second_source, 8, 8)
+                .unwrap();
+
+        let mut image = RgbaImage::new(8, 8);
+        read_texture_into(&device, &queue, &first_texture, 8, 8, &mut image).unwrap();
+        assert_eq!(&image.data[..4], &[0xff, 0x00, 0x00, 0xff]);
+    }
+
+    #[test]
+    fn render_source_into_rejects_short_row_stride_as_target_error() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloRenderer::new(device, queue).unwrap();
+        let scene = solid_scene(Color::from_rgb8(0x2a, 0x6f, 0xdb), 4.0, 4.0);
+        let mut data = vec![0; 4 * 4 * 4];
+        let mut source = &scene;
+
+        let error = ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut data,
+                width: 4,
+                height: 4,
+                bytes_per_row: 12,
+                format: ImageBufferFormat::Rgba8Unorm,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(
+                "image target row stride is smaller than the rendered width",
+            ))
+        ));
+    }
+
+    #[test]
+    fn render_source_into_rejects_short_buffer_as_target_error() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloRenderer::new(device, queue).unwrap();
+        let scene = solid_scene(Color::from_rgb8(0x2a, 0x6f, 0xdb), 4.0, 4.0);
+        let mut data = vec![0; 15];
+        let mut source = &scene;
+
+        let error = ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut data,
+                width: 4,
+                height: 4,
+                bytes_per_row: 4 * 4,
+                format: ImageBufferFormat::Rgba8Unorm,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        ));
+    }
+
+    #[test]
+    fn supported_texture_formats_are_rgba8_only() {
+        assert_eq!(
+            supported_texture_formats(),
+            vec![wgpu::TextureFormat::Rgba8Unorm]
+        );
     }
 
     #[test]

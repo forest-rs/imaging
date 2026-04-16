@@ -9,7 +9,17 @@ pub(crate) enum ReadbackError {
     DevicePoll,
     CallbackDropped,
     BufferMap,
+    InvalidTargetStride,
+    InvalidTargetBuffer,
 }
+
+impl core::fmt::Display for ReadbackError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl core::error::Error for ReadbackError {}
 
 #[derive(Debug)]
 pub(crate) struct OffscreenTarget {
@@ -69,7 +79,30 @@ pub(crate) fn read_texture_into(
     height: u32,
     image: &mut RgbaImage,
 ) -> Result<(), ReadbackError> {
+    image.resize(width, height);
+    read_texture_into_target(
+        device,
+        queue,
+        texture,
+        width,
+        height,
+        image.data.as_mut_slice(),
+        usize::try_from(width).expect("image width should fit in usize") * 4,
+    )
+}
+
+pub(crate) fn read_texture_into_target(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    data: &mut [u8],
+    bytes_per_row_out: usize,
+) -> Result<(), ReadbackError> {
     let width_bytes = width * 4;
+    let width_bytes_usize = width_bytes as usize;
+    validate_target_layout(width, height, data.len(), bytes_per_row_out)?;
     let bytes_per_row = width_bytes.div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("imaging_vello_hybrid readback"),
@@ -117,13 +150,11 @@ pub(crate) fn read_texture_into(
         .map_err(|_| ReadbackError::BufferMap)?;
 
     let mapped = slice.get_mapped_range();
-    let width_bytes = width_bytes as usize;
-    image.resize(width, height);
     for (row, out_row) in mapped
         .chunks_exact(bytes_per_row as usize)
-        .zip(image.data.chunks_exact_mut(width_bytes))
+        .zip(data.chunks_exact_mut(bytes_per_row_out))
     {
-        out_row.copy_from_slice(&row[..width_bytes]);
+        out_row[..width_bytes_usize].copy_from_slice(&row[..width_bytes_usize]);
     }
     drop(mapped);
     readback.unmap();
@@ -151,7 +182,39 @@ pub(crate) fn unpremultiply_rgba8_in_place(bytes: &mut [u8]) {
     }
 }
 
-fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+pub(crate) fn unpremultiply_rgba8_target(data: &mut [u8], width: u32, bytes_per_row: usize) {
+    let width_bytes = usize::try_from(width)
+        .expect("image width should fit in usize")
+        .checked_mul(4)
+        .expect("image row bytes should fit in usize");
+    for row in data.chunks_exact_mut(bytes_per_row) {
+        unpremultiply_rgba8_in_place(&mut row[..width_bytes]);
+    }
+}
+
+fn validate_target_layout(
+    width: u32,
+    height: u32,
+    data_len: usize,
+    bytes_per_row_out: usize,
+) -> Result<(), ReadbackError> {
+    let width_bytes = usize::try_from(width)
+        .expect("image width should fit in usize")
+        .checked_mul(4)
+        .expect("image row bytes should fit in usize");
+    if bytes_per_row_out < width_bytes {
+        return Err(ReadbackError::InvalidTargetStride);
+    }
+    let required_len = bytes_per_row_out
+        .checked_mul(usize::try_from(height).expect("image height should fit in usize"))
+        .expect("image target byte length should fit in usize");
+    if data_len < required_len {
+        return Err(ReadbackError::InvalidTargetBuffer);
+    }
+    Ok(())
+}
+
+pub(crate) fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("imaging_vello_hybrid target"),
         size: wgpu::Extent3d {
@@ -163,7 +226,30 @@ fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Textu
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadbackError, validate_target_layout};
+
+    #[test]
+    fn validate_target_layout_rejects_short_stride() {
+        assert!(matches!(
+            validate_target_layout(4, 1, 16, 12),
+            Err(ReadbackError::InvalidTargetStride)
+        ));
+    }
+
+    #[test]
+    fn validate_target_layout_rejects_short_buffer() {
+        assert!(matches!(
+            validate_target_layout(4, 2, 16, 16),
+            Err(ReadbackError::InvalidTargetBuffer)
+        ));
+    }
 }

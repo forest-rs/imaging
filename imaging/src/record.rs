@@ -785,6 +785,48 @@ pub enum ValidateError {
     InvalidMask(Box<Self>),
 }
 
+impl core::fmt::Display for ValidateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnbalancedPopClip { .. } => {
+                f.write_str("scene validation failed: pop_clip without matching push_clip")
+            }
+            Self::UnbalancedPopGroup { .. } => {
+                f.write_str("scene validation failed: pop_group without matching push_group")
+            }
+            Self::UnbalancedPopContext { .. } => {
+                f.write_str("scene validation failed: pop_context without matching push_context")
+            }
+            Self::UnclosedClips { .. } => {
+                f.write_str("scene validation failed: scene ended with unclosed clips")
+            }
+            Self::UnclosedGroups { .. } => {
+                f.write_str("scene validation failed: scene ended with unclosed groups")
+            }
+            Self::UnclosedContexts { .. } => {
+                f.write_str("scene validation failed: scene ended with unclosed contexts")
+            }
+            Self::InvalidMask(_) => {
+                f.write_str("scene validation failed: retained mask definition is invalid")
+            }
+        }
+    }
+}
+
+impl core::error::Error for ValidateError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::InvalidMask(error) => Some(error.as_ref()),
+            Self::UnbalancedPopClip { .. }
+            | Self::UnbalancedPopGroup { .. }
+            | Self::UnbalancedPopContext { .. }
+            | Self::UnclosedClips { .. }
+            | Self::UnclosedGroups { .. }
+            | Self::UnclosedContexts { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
