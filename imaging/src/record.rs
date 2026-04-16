@@ -374,6 +374,12 @@ impl Scene {
         Self::default()
     }
 
+    /// Return `true` when the recorded command stream is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
     /// Clear all recorded commands.
     #[inline]
     pub fn clear(&mut self) {
@@ -833,6 +839,25 @@ mod tests {
     use crate::MaskRef;
     use alloc::sync::Arc;
     use alloc::vec;
+
+    #[test]
+    fn scene_is_empty_tracks_recorded_commands() {
+        let mut scene = Scene::new();
+        assert!(scene.is_empty());
+
+        scene.draw(Draw::Fill {
+            transform: Affine::IDENTITY,
+            fill_rule: Fill::NonZero,
+            brush: Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: Geometry::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
+            composite: Composite::default(),
+        });
+        assert!(!scene.is_empty());
+
+        scene.clear();
+        assert!(scene.is_empty());
+    }
 
     #[test]
     fn validate_balanced() {
