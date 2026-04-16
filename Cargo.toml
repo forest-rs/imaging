@@ -36,7 +36,7 @@ imaging_wgpu = { default-features = false, path = "imaging_wgpu" }
 svg_imaging = { path = "svg_imaging" }
 velato_imaging = { path = "velato_imaging" }
 
-hashbrown = { default-features = false, features = ["default-hasher"], version = "0.16" }
+hashbrown = { default-features = false, features = ["default-hasher"], version = "0.17" }
 image = { default-features = false, version = "0.25" }
 kurbo = { default-features = false, version = "0.13" }
 peniko = { default-features = false, version = "0.6" }
