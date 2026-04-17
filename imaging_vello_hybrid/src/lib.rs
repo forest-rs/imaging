@@ -13,6 +13,10 @@
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
 //! presentation targets, then pass those handles into [`VelloHybridRenderer`].
 //!
+//! Scene-backed [`imaging::SceneImage`] brushes are intentionally unsupported here. Hybrid scenes
+//! can upload raster images into the backend image atlas, but this backend does not treat retained
+//! scenes as brush-samplable image sources.
+//!
 //! Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
 //! and translated to backend-managed opaque image ids. Use [`VelloHybridSceneSink::with_renderer`]
 //! when recording directly into a native [`vello_hybrid::Scene`] and you want the same image
@@ -102,7 +106,7 @@
 //!         width: 2,
 //!         height: 2,
 //!     };
-//!     let brush = Brush::Image(ImageBrush::new(image));
+//!     let brush = Brush::Image(ImageBrush::from(image));
 //!
 //!     # let device: imaging_vello_hybrid::wgpu::Device = todo!();
 //!     # let queue: imaging_vello_hybrid::wgpu::Queue = todo!();
@@ -905,7 +909,7 @@ mod tests {
             width: 2,
             height: 2,
         };
-        let brush = Brush::Image(ImageBrush::new(image));
+        let brush = Brush::Image(ImageBrush::from(image));
 
         let mut scene = Scene::new();
         {

@@ -9,6 +9,10 @@
 //! Semantic [`imaging::record::Scene`] values can be lowered to native Vello scenes through
 //! [`VelloRenderer::encode_scene`].
 //!
+//! Scene-backed [`imaging::SceneImage`] brushes are intentionally unsupported here. Vello does not
+//! expose a native "scene as image shader" primitive comparable to Skia's retained picture/image
+//! path, and this backend does not silently fall back to offscreen rasterization for them.
+//!
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
 //! presentation targets, then pass those handles into [`VelloRenderer`].
 //!

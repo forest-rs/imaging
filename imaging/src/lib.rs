@@ -103,6 +103,42 @@
 //! Low-level retained payloads like [`record::Draw`], [`record::Clip`], and [`record::Group`] are
 //! also public under [`record`] when you need exact control over the recorded representation.
 //!
+//! # Scene-Backed Image Brushes
+//!
+//! [`SceneImage`] lets you use a retained [`record::Scene`] as the source for an [`ImageBrush`].
+//! This is useful when you want image-brush sampling semantics like `Pad`, `Repeat`, or
+//! `Reflect`, but the source content is authored as vector drawing commands instead of raster
+//! pixels.
+//!
+//! ```rust
+//! use imaging::{Brush, ImageBrush, Painter, SceneImage, record::Scene};
+//! use kurbo::Rect;
+//! use peniko::{Color, Extend};
+//!
+//! let mut source = Scene::new();
+//! {
+//!     let mut painter = Painter::new(&mut source);
+//!     painter.fill_rect(Rect::new(0.0, 0.0, 1.0, 1.0), Color::from_rgb8(0xff, 0x00, 0x00));
+//!     painter.fill_rect(Rect::new(1.0, 0.0, 2.0, 1.0), Color::from_rgb8(0x00, 0xff, 0x00));
+//! }
+//!
+//! let brush = Brush::Image(ImageBrush::from(SceneImage::new(source, 2, 1)).with_extend(
+//!     Extend::Reflect,
+//! ));
+//!
+//! let mut scene = Scene::new();
+//! {
+//!     let mut painter = Painter::new(&mut scene);
+//!     painter.fill(Rect::new(0.0, 0.0, 4.0, 1.0), &brush).draw();
+//! }
+//! ```
+//!
+//! Backend support is renderer-specific:
+//! - `imaging_skia` supports scene-backed image brushes natively.
+//! - `imaging_tiny_skia` and `imaging_vello_cpu` support them by rasterizing the source scene and
+//!   then sampling the realized image.
+//! - `imaging_vello` and `imaging_vello_hybrid` intentionally reject them.
+//!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 
 #![no_std]
@@ -114,12 +150,17 @@ use kurbo::{Affine, Rect};
 use peniko::BlendMode;
 
 pub mod diagnostics;
+mod image;
 mod paint;
 mod painter;
 pub mod record;
 pub mod render;
 pub mod validation;
 
+pub use image::{
+    Brush, BrushRef, Image, ImageBrush, ImageBrushRef, ImageRef, SceneImage, SceneImageWeak,
+    ScenePicture, ScenePictureWeak,
+};
 pub use paint::{
     AppliedMaskRef, ClipRef, ContextRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef,
     MaskRef, PaintSink, SourceLocationRef, StrokeRef,

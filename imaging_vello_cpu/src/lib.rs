@@ -6,6 +6,10 @@
 //! This crate provides a CPU renderer that consumes `imaging::record::Scene` (or accepts commands
 //! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 //!
+//! `imaging_vello_cpu` supports scene-backed [`imaging::SceneImage`] brushes by rendering the
+//! retained subscene to a cached raster image and then sampling that image through the existing
+//! image-brush path.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with [`VelloCpuRenderer`].
@@ -68,8 +72,9 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
-    MaskMode, PaintSink, RgbaImage, StrokeRef,
+    BlurredRoundedRect, Brush as ImagingBrush, BrushRef, ClipRef, Composite, FillRef, Filter,
+    GeometryRef, GlyphRunRef, GroupRef, ImageRef, MaskMode, PaintSink, RgbaImage, SceneImage,
+    SceneImageWeak, StrokeRef,
     record::{Scene, ValidateError, replay, replay_transformed},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
@@ -77,7 +82,9 @@ use imaging::{
     },
 };
 use kurbo::{Affine, Rect, Shape as _};
-use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
+use peniko::{
+    BlendMode, Blob, Brush as PenikoBrush, Fill, ImageAlphaType, ImageData, ImageFormat, Style,
+};
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::glyph::Glyph as VelloGlyph;
 use vello_common::paint::{Image as VelloImage, ImageSource};
@@ -116,6 +123,7 @@ pub struct VelloCpuRenderer {
     clip_depth: u32,
     group_depth: u32,
     mask_cache: VecDeque<CachedMask>,
+    scene_image_cache: VecDeque<CachedSceneImage>,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +132,16 @@ struct CachedMask {
     mode: MaskMode,
     transform: Affine,
     mask: vello_cpu::Mask,
+}
+
+#[derive(Clone, Debug)]
+struct CachedSceneImage {
+    scene_image: SceneImageWeak,
+    scene_image_id: u64,
+    width: u32,
+    height: u32,
+    tolerance: f64,
+    image: ImageData,
 }
 
 impl VelloCpuRenderer {
@@ -156,6 +174,7 @@ impl VelloCpuRenderer {
             clip_depth: 0,
             group_depth: 0,
             mask_cache: VecDeque::new(),
+            scene_image_cache: VecDeque::new(),
         }
     }
 
@@ -164,6 +183,7 @@ impl VelloCpuRenderer {
         if self.tolerance != tolerance {
             self.tolerance = tolerance;
             self.clear_cached_masks();
+            self.clear_cached_scene_images();
         }
     }
 
@@ -184,6 +204,16 @@ impl VelloCpuRenderer {
         self.mask_cache.clear();
     }
 
+    /// Drop any realized scene-image artifacts cached by the renderer.
+    pub fn clear_cached_scene_images(&mut self) {
+        self.scene_image_cache.clear();
+    }
+
+    fn prune_cached_scene_images(&mut self) {
+        self.scene_image_cache
+            .retain(|entry| entry.scene_image.upgrade().is_some());
+    }
+
     fn resize(&mut self, width: u16, height: u16) {
         if self.width == width && self.height == height {
             return;
@@ -193,6 +223,7 @@ impl VelloCpuRenderer {
         self.width = width;
         self.height = height;
         self.clear_cached_masks();
+        self.clear_cached_scene_images();
         self.error = None;
         self.clip_depth = 0;
         self.group_depth = 0;
@@ -317,12 +348,22 @@ impl VelloCpuRenderer {
     ) -> Option<vello_cpu::PaintType> {
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
         let paint: vello_cpu::PaintType = match brush {
-            Brush::Solid(c) => Brush::Solid(c),
-            Brush::Gradient(g) => Brush::Gradient(g),
-            Brush::Image(image) => Brush::Image(VelloImage {
-                image: ImageSource::from_peniko_image_data(&image.image),
-                sampler: image.sampler,
-            }),
+            ImagingBrush::Solid(c) => PenikoBrush::Solid(c),
+            ImagingBrush::Gradient(g) => PenikoBrush::Gradient(g),
+            ImagingBrush::Image(image) => {
+                let sampler = image.sampler;
+                let image_source = match image.image.as_ref() {
+                    ImageRef::Raster(image) => ImageSource::from_peniko_image_data(image),
+                    ImageRef::Scene(scene) => {
+                        let image = self.realize_scene_image(scene)?;
+                        ImageSource::from_peniko_image_data(&image)
+                    }
+                };
+                PenikoBrush::Image(VelloImage {
+                    image: image_source,
+                    sampler,
+                })
+            }
         };
         Some(paint)
     }
@@ -534,6 +575,51 @@ impl VelloCpuRenderer {
             transform,
             mask,
         });
+    }
+
+    fn realize_scene_image(&mut self, scene_image: &SceneImage) -> Option<ImageData> {
+        self.prune_cached_scene_images();
+        if let Some(entry) = self.scene_image_cache.iter().find(|entry| {
+            entry.tolerance == self.tolerance
+                && entry.scene_image_id == scene_image.id()
+                && entry.width == scene_image.width()
+                && entry.height == scene_image.height()
+        }) {
+            return Some(entry.image.clone());
+        }
+
+        let (width, height) = match Self::checked_size(scene_image.width(), scene_image.height()) {
+            Ok(size) => size,
+            Err(err) => {
+                self.set_error_once(err);
+                return None;
+            }
+        };
+        let mut renderer = Self::new(width, height);
+        renderer.set_tolerance(self.tolerance);
+        let image = match renderer.render_scene(scene_image.scene(), width, height) {
+            Ok(image) => image,
+            Err(err) => {
+                self.set_error_once(err);
+                return None;
+            }
+        };
+        let image = ImageData {
+            data: Blob::new(Arc::new(image.data)),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: scene_image.width(),
+            height: scene_image.height(),
+        };
+        self.scene_image_cache.push_back(CachedSceneImage {
+            scene_image: scene_image.downgrade(),
+            scene_image_id: scene_image.id(),
+            width: scene_image.width(),
+            height: scene_image.height(),
+            tolerance: self.tolerance,
+            image: image.clone(),
+        });
+        Some(image)
     }
 }
 
@@ -774,11 +860,11 @@ impl PaintSink for VelloCpuRenderer {
 mod tests {
     use super::*;
     use imaging::{
-        Painter,
+        Brush, ImageBrush, Painter, SceneImage,
         render::{ImageBufferTarget, ImageTargetError},
     };
     use kurbo::Rect;
-    use peniko::Color;
+    use peniko::{Color, Extend};
 
     fn masked_scene(mode: MaskMode) -> Scene {
         let mut mask = Scene::new();
@@ -909,6 +995,85 @@ mod tests {
         let image = renderer.render_source(&mut source, 48, 48).unwrap();
         assert_eq!(image.width, 48);
         assert_eq!(image.height, 48);
+    }
+
+    #[test]
+    fn scene_image_brush_reflects_in_vello_cpu() {
+        let mut source = Scene::new();
+        {
+            let mut painter = Painter::new(&mut source);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                Color::from_rgb8(0xff, 0x00, 0x00),
+            );
+            painter.fill_rect(
+                Rect::new(1.0, 0.0, 2.0, 1.0),
+                Color::from_rgb8(0x00, 0xff, 0x00),
+            );
+        }
+
+        let scene_image = SceneImage::new(source, 2, 1);
+        let brush = Brush::Image(ImageBrush::from(scene_image).with_extend(Extend::Reflect));
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 4.0, 1.0), &brush).draw();
+        }
+
+        let mut renderer = VelloCpuRenderer::new(4, 1);
+        let image = renderer.render_scene(&scene, 4, 1).unwrap();
+        assert_eq!(
+            &image.data[..16],
+            &[
+                0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00,
+                0x00, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn render_scene_reuses_cached_scene_images_for_identical_scenes() {
+        let mut source = Scene::new();
+        {
+            let mut painter = Painter::new(&mut source);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 2.0, 2.0),
+                Color::from_rgb8(0x2a, 0x6f, 0xdb),
+            );
+        }
+        let brush = Brush::Image(ImageBrush::from(SceneImage::new(source, 2, 2)));
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 4.0, 4.0), &brush).draw();
+        }
+
+        let mut renderer = VelloCpuRenderer::new(4, 4);
+        renderer.render_scene(&scene, 4, 4).unwrap();
+        assert_eq!(renderer.scene_image_cache.len(), 1);
+
+        renderer.render_scene(&scene, 4, 4).unwrap();
+        assert_eq!(renderer.scene_image_cache.len(), 1);
+    }
+
+    #[test]
+    fn cached_scene_images_are_dropped_after_source_is_released() {
+        let mut renderer = VelloCpuRenderer::new(1, 1);
+
+        let first = SceneImage::new(Scene::new(), 1, 1);
+        renderer
+            .realize_scene_image(&first)
+            .expect("realize first scene image");
+        assert_eq!(renderer.scene_image_cache.len(), 1);
+        drop(first);
+
+        let second = SceneImage::new(Scene::new(), 1, 1);
+        renderer
+            .realize_scene_image(&second)
+            .expect("realize second scene image");
+        assert_eq!(renderer.scene_image_cache.len(), 1);
+        assert_eq!(renderer.scene_image_cache[0].scene_image_id, second.id());
     }
 
     #[test]

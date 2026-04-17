@@ -4,11 +4,11 @@
 use super::Error;
 use crate::{VelloHybridRenderer, image_registry::HybridImageUploadSession};
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef,
+    BlurredRoundedRect, Brush as ImagingBrush, BrushRef, ClipRef, Composite, FillRef, GeometryRef,
+    GlyphRunRef, GroupRef, PaintSink, StrokeRef,
 };
 use kurbo::{Affine, Shape as _};
-use peniko::{Brush, BrushRef, ImageBrush, Style};
+use peniko::{Brush as PenikoBrush, Style};
 use vello_common::glyph::Glyph as VelloGlyph;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`vello_hybrid::Scene`].
@@ -103,13 +103,16 @@ impl<'a> VelloHybridSceneSink<'a> {
     ) -> Option<vello_common::paint::PaintType> {
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
         match brush {
-            Brush::Solid(c) => Some(Brush::Solid(c)),
-            Brush::Gradient(g) => Some(Brush::Gradient(g)),
-            Brush::Image(image) => self.resolve_image_brush(&image).map(Brush::Image),
+            ImagingBrush::Solid(c) => Some(PenikoBrush::Solid(c)),
+            ImagingBrush::Gradient(g) => Some(PenikoBrush::Gradient(g)),
+            ImagingBrush::Image(image) => self.resolve_image_brush(&image).map(PenikoBrush::Image),
         }
     }
 
-    fn resolve_image_brush(&mut self, image: &ImageBrush) -> Option<vello_common::paint::Image> {
+    fn resolve_image_brush(
+        &mut self,
+        image: &imaging::ImageBrush,
+    ) -> Option<vello_common::paint::Image> {
         let Some(image_upload) = self.image_upload.as_mut() else {
             self.set_error_once(Error::UnsupportedImageBrush);
             return None;
@@ -293,9 +296,9 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             .set_paint_transform(draw.brush_transform.unwrap_or(Affine::IDENTITY));
 
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
-            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
+            (PenikoBrush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
                 peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+                PenikoBrush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };
@@ -328,9 +331,9 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             .set_paint_transform(draw.brush_transform.unwrap_or(Affine::IDENTITY));
 
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
-            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
+            (PenikoBrush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
                 peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+                PenikoBrush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };
@@ -401,7 +404,7 @@ mod tests {
         let mut scene = vello_hybrid::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
-        let image = Brush::Image(ImageBrush::new(ImageData {
+        let image = Brush::Image(ImageBrush::from(ImageData {
             data: Blob::new(Arc::new([255_u8; 16])),
             format: ImageFormat::Rgba8,
             alpha_type: ImageAlphaType::Alpha,

@@ -96,7 +96,7 @@ fn native_scene_sink_supports_image_brushes_with_renderer() {
     let mut scene = vello_hybrid::Scene::new(32, 32);
     scene.reset();
     {
-        let brush = Brush::Image(ImageBrush::new(ImageData {
+        let brush = Brush::Image(ImageBrush::from(ImageData {
             data: Blob::new(Arc::new([
                 0xff, 0x20, 0x20, 0xff, 0x20, 0xff, 0x20, 0xff, 0x20, 0x20, 0xff, 0xff, 0xff, 0xff,
                 0x20, 0xff,

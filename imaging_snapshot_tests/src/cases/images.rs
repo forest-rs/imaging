@@ -26,7 +26,7 @@ impl SnapshotCase for GmImageBrushes {
         let mut painter = Painter::new(sink);
 
         let left = Brush::Image(
-            ImageBrush::new(test_image())
+            ImageBrush::from(test_image())
                 .with_extend(Extend::Pad)
                 .with_quality(ImageQuality::Medium),
         );
@@ -45,7 +45,7 @@ impl SnapshotCase for GmImageBrushes {
             .draw();
 
         let diamond_brush = Brush::Image(
-            ImageBrush::new(test_image())
+            ImageBrush::from(test_image())
                 .with_x_extend(Extend::Reflect)
                 .with_y_extend(Extend::Pad)
                 .with_quality(ImageQuality::Medium),
@@ -66,7 +66,7 @@ impl SnapshotCase for GmImageBrushes {
 
         let frame_stroke = Stroke::new(20.0);
         let frame_brush = Brush::Image(
-            ImageBrush::new(test_image())
+            ImageBrush::from(test_image())
                 .with_extend(Extend::Reflect)
                 .with_quality(ImageQuality::Low),
         );

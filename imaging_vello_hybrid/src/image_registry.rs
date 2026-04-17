@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::Error;
-use peniko::{ImageBrush, ImageData};
+use imaging::{ImageBrush, ImageRef};
+use peniko::ImageData;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use vello_common::paint::{Image as VelloImage, ImageId, ImageSource};
@@ -107,14 +108,17 @@ pub(crate) struct HybridImageUploadSession<'a> {
 
 impl HybridImageUploadSession<'_> {
     pub(crate) fn resolve_image_brush(&mut self, brush: &ImageBrush) -> Result<VelloImage, Error> {
-        let key = ImageKey::derive(&brush.image);
+        let ImageRef::Raster(image) = brush.image.as_ref() else {
+            return Err(Error::UnsupportedImageBrush);
+        };
+        let key = ImageKey::derive(image);
         let image = if let Some(image) = self.pending.iter().find(|ri| ri.key == key).copied() {
             image
         } else if let Some(index) = self.registry.live.iter().position(|ri| ri.key == key) {
             let index = self.registry.touch(index);
             self.registry.live.get(index).copied().unwrap()
         } else {
-            let image_source = ImageSource::from_peniko_image_data(&brush.image);
+            let image_source = ImageSource::from_peniko_image_data(image);
             let ImageSource::Pixmap(pixmap) = image_source else {
                 return Err(Error::Internal(
                     "peniko image conversion did not produce a pixmap",
@@ -132,11 +136,10 @@ impl HybridImageUploadSession<'_> {
                 key,
                 id,
                 may_have_opacities: pixmap.may_have_opacities(),
-                bytes: brush
-                    .image
+                bytes: image
                     .format
-                    .size_in_bytes(brush.image.width, brush.image.height)
-                    .unwrap_or_else(|| brush.image.data.data().len()),
+                    .size_in_bytes(image.width, image.height)
+                    .unwrap_or_else(|| image.data.data().len()),
             };
             self.pending.push(image);
             image

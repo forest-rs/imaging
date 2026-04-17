@@ -11,13 +11,16 @@
 //!
 //! The implementation was integrated from Floem's tiny-skia renderer and adapted to match the
 //! public renderer shape used by the other `imaging_*` backends.
+//!
+//! `imaging_tiny_skia` supports scene-backed [`imaging::SceneImage`] brushes by rasterizing the
+//! retained subscene to a cached pixmap and then applying the normal image-brush sampling path.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, MaskMode,
-    PaintSink, RgbaImage, StrokeRef,
+    BlurredRoundedRect, BrushRef, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef,
+    ImageRef, MaskMode, PaintSink, RgbaImage, SceneImageWeak, StrokeRef,
     record::{Scene, ValidateError},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
@@ -26,14 +29,13 @@ use imaging::{
 };
 use kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke as KurboStroke, Vec2};
 use peniko::{
-    BlendMode, BrushRef, Color, Compose, Extend, Gradient, GradientKind, ImageData, ImageQuality,
-    Mix, RadialGradientPosition,
+    BlendMode, Color, Compose, Extend, Gradient, GradientKind, ImageData, ImageQuality, Mix,
+    RadialGradientPosition,
     color::{self, ColorSpaceTag, DynamicColor, HueDirection, Srgb},
     kurbo::{PathEl, Size},
 };
 use rustc_hash::FxHashMap;
 use std::{
-    borrow::Borrow,
     collections::VecDeque,
     mem::Discriminant,
     sync::Arc,
@@ -216,13 +218,15 @@ impl GlyphCacheKey {
     }
 }
 
-type ImageCacheMap = FxHashMap<u64, (CacheColor, Arc<Pixmap>)>;
+type ImageCacheMap = FxHashMap<ImageCacheKey, (CacheColor, Arc<Pixmap>)>;
+type ScenePixmapCacheMap = FxHashMap<u64, CachedScenePixmap>;
 type ScaledImageCacheMap = FxHashMap<ScaledImageCacheKey, (CacheColor, Arc<Pixmap>)>;
 type BlurredRRectCacheMap = FxHashMap<BlurredRRectCacheKey, (CacheColor, Arc<Pixmap>)>;
 type GlyphCacheMap = FxHashMap<(GlyphCacheKey, u32), GlyphCacheEntry>;
 
 struct RendererCaches {
     image_cache: ImageCacheMap,
+    scene_pixmap_cache: ScenePixmapCacheMap,
     scaled_image_cache: ScaledImageCacheMap,
     blurred_rrect_cache: BlurredRRectCacheMap,
     // The `u32` is a color encoded as a u32 so that it is hashable and eq.
@@ -234,12 +238,19 @@ impl RendererCaches {
     fn new() -> Self {
         Self {
             image_cache: FxHashMap::default(),
+            scene_pixmap_cache: FxHashMap::default(),
             scaled_image_cache: FxHashMap::default(),
             blurred_rrect_cache: FxHashMap::default(),
             glyph_cache: FxHashMap::default(),
             scale_context: ScaleContext::new(),
         }
     }
+}
+
+struct CachedScenePixmap {
+    cache_color: CacheColor,
+    scene_image: SceneImageWeak,
+    pixmap: Arc<Pixmap>,
 }
 
 const GLYPH_FILTER_PAD: u32 = 1;
@@ -412,9 +423,21 @@ fn should_retain_glyph_entry(
     entry.cache_color == cache_color || now.duration_since(entry.last_touched) < GLYPH_CACHE_MIN_TTL
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ImageCacheKey {
+    Raster(u64),
+    Scene(u64),
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedImageBrush {
+    key: ImageCacheKey,
+    sampler: peniko::ImageSampler,
+}
+
 #[derive(Hash, PartialEq, Eq)]
 struct ScaledImageCacheKey {
-    image_id: u64,
+    image_key: ImageCacheKey,
     width: u32,
     height: u32,
     quality: Discriminant<ImageQuality>,
@@ -1338,18 +1361,15 @@ impl<'a> Layer<'a> {
         );
     }
 
-    fn try_fill_image_fallback<T>(
+    fn try_fill_image_fallback(
         &mut self,
         shape: &impl Shape,
         image_pixmap: &Pixmap,
-        image: &peniko::ImageBrush<T>,
+        image: &ResolvedImageBrush,
         brush_transform: Option<Affine>,
         opacity: f32,
         blend_mode: TinyBlendMode,
-    ) -> bool
-    where
-        T: Borrow<ImageData>,
-    {
+    ) -> bool {
         if !image_brush_has_mixed_extend(image) {
             return false;
         }
@@ -1583,17 +1603,15 @@ impl<'a> Layer<'a> {
         true
     }
 
-    fn fill_image_with_pixmap_and_mode<T>(
+    fn fill_image_with_pixmap_and_mode(
         &mut self,
         shape: &impl Shape,
         image_pixmap: &Pixmap,
-        image: &peniko::ImageBrush<T>,
+        image: &ResolvedImageBrush,
         brush_transform: Option<Affine>,
         opacity: f32,
         blend_mode: TinyBlendMode,
-    ) where
-        T: Borrow<ImageData>,
-    {
+    ) {
         if self.try_fill_image_fallback(
             shape,
             image_pixmap,
@@ -1639,18 +1657,16 @@ impl<'a> Layer<'a> {
         }
     }
 
-    fn stroke_image_with_pixmap_and_mode<T>(
+    fn stroke_image_with_pixmap_and_mode(
         &mut self,
         shape: &impl Shape,
         image_pixmap: &Pixmap,
-        image: &peniko::ImageBrush<T>,
+        image: &ResolvedImageBrush,
         stroke: &KurboStroke,
         brush_transform: Option<Affine>,
         opacity: f32,
         blend_mode: TinyBlendMode,
-    ) where
-        T: Borrow<ImageData>,
-    {
+    ) {
         if image_brush_has_mixed_extend(image) {
             return;
         }
@@ -1695,12 +1711,16 @@ impl Layer<'_> {
     }
     fn stroke_with_brush_transform<'b, 's>(
         &mut self,
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         shape: &impl Shape,
         brush: impl Into<BrushRef<'b>>,
         stroke: &'s KurboStroke,
         brush_transform: Option<Affine>,
     ) {
         self.stroke_with_brush_transform_and_mode(
+            caches,
+            cache_color,
             shape,
             brush,
             stroke,
@@ -1712,6 +1732,8 @@ impl Layer<'_> {
 
     fn stroke_with_brush_transform_and_mode<'b, 's>(
         &mut self,
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         shape: &impl Shape,
         brush: impl Into<BrushRef<'b>>,
         stroke: &'s KurboStroke,
@@ -1722,7 +1744,7 @@ impl Layer<'_> {
         let path = try_ret!(shape_to_path(shape));
         let brush = brush.into();
         if let BrushRef::Image(image) = brush {
-            let image_pixmap = try_ret!(image_brush_pixmap(&image));
+            let (image, image_pixmap) = try_ret!(resolve_image_brush(caches, cache_color, image));
             self.stroke_image_with_pixmap_and_mode(
                 shape,
                 &image_pixmap,
@@ -1745,16 +1767,21 @@ impl Layer<'_> {
     }
 
     fn fill<'b>(&mut self, shape: &impl Shape, brush: impl Into<BrushRef<'b>>) {
-        self.fill_with_brush_transform(shape, brush, None);
+        let mut caches = RendererCaches::new();
+        self.fill_with_brush_transform(&mut caches, CacheColor(false), shape, brush, None);
     }
 
     fn fill_with_brush_transform<'b>(
         &mut self,
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         shape: &impl Shape,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
     ) {
         self.fill_with_brush_transform_and_mode(
+            caches,
+            cache_color,
             shape,
             brush,
             brush_transform,
@@ -1765,6 +1792,8 @@ impl Layer<'_> {
 
     fn fill_with_brush_transform_and_mode<'b>(
         &mut self,
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         shape: &impl Shape,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
@@ -1773,7 +1802,7 @@ impl Layer<'_> {
     ) {
         let brush = brush.into();
         if let BrushRef::Image(image) = brush {
-            let image_pixmap = try_ret!(image_brush_pixmap(&image));
+            let (image, image_pixmap) = try_ret!(resolve_image_brush(caches, cache_color, image));
             self.fill_image_with_pixmap_and_mode(
                 shape,
                 &image_pixmap,
@@ -2261,7 +2290,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         match brush.into() {
             BrushRef::Solid(color) => Some(peniko::Brush::Solid(color)),
             BrushRef::Gradient(gradient) => Some(peniko::Brush::Gradient(gradient.clone())),
-            BrushRef::Image(image) => Some(peniko::Brush::Image(image.to_owned())),
+            BrushRef::Image(_) => None,
         }
     }
 
@@ -2304,14 +2333,14 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
 
     fn try_fill_cached_image_rect(
         &mut self,
-        image: &peniko::ImageBrush,
+        image: &ResolvedImageBrush,
+        image_pixmap: &Pixmap,
         rect: Rect,
         draw: &FillRef<'_>,
     ) -> bool {
         if let BlendStrategy::SinglePass(blend_mode) =
             determine_blend_strategy(&draw.composite.blend)
         {
-            let cache_color = self.cache_color;
             let transform = draw.transform;
             let brush_transform = draw.brush_transform;
             let (caches, layers) = (&mut self.caches, &mut self.layers);
@@ -2321,9 +2350,10 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             layer.transform = transform;
             return render_cached_image_rect(
                 caches,
-                cache_color,
+                self.cache_color,
                 layer,
                 image,
+                image_pixmap,
                 rect,
                 transform,
                 brush_transform,
@@ -2340,6 +2370,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             self.cache_color,
             &mut child,
             image,
+            image_pixmap,
             rect,
             draw.transform,
             draw.brush_transform,
@@ -2355,6 +2386,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     }
 
     fn fill_geometry<'b>(
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         brush: impl Into<BrushRef<'b>>,
@@ -2362,21 +2395,23 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     ) {
         match shape {
             imaging::GeometryRef::Rect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, brush_transform);
+                layer.fill_with_brush_transform(caches, cache_color, rect, brush, brush_transform);
             }
             imaging::GeometryRef::RoundedRect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, brush_transform);
+                layer.fill_with_brush_transform(caches, cache_color, rect, brush, brush_transform);
             }
             imaging::GeometryRef::Path(path) => {
-                layer.fill_with_brush_transform(path, brush, brush_transform);
+                layer.fill_with_brush_transform(caches, cache_color, path, brush, brush_transform);
             }
             imaging::GeometryRef::OwnedPath(path) => {
-                layer.fill_with_brush_transform(path, brush, brush_transform);
+                layer.fill_with_brush_transform(caches, cache_color, path, brush, brush_transform);
             }
         }
     }
 
     fn fill_geometry_with_mode<'b>(
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         brush: impl Into<BrushRef<'b>>,
@@ -2386,6 +2421,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     ) {
         match shape {
             imaging::GeometryRef::Rect(rect) => layer.fill_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 rect,
                 brush,
                 brush_transform,
@@ -2393,6 +2430,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 blend_mode,
             ),
             imaging::GeometryRef::RoundedRect(rect) => layer.fill_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 rect,
                 brush,
                 brush_transform,
@@ -2400,6 +2439,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 blend_mode,
             ),
             imaging::GeometryRef::Path(path) => layer.fill_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 path,
                 brush,
                 brush_transform,
@@ -2407,6 +2448,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 blend_mode,
             ),
             imaging::GeometryRef::OwnedPath(path) => layer.fill_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 path,
                 brush,
                 brush_transform,
@@ -2420,7 +2463,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         image_pixmap: &Pixmap,
-        image: &peniko::ImageBrush,
+        image: &ResolvedImageBrush,
         brush_transform: Option<Affine>,
         opacity: f32,
         blend_mode: TinyBlendMode,
@@ -2462,6 +2505,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     }
 
     fn stroke_geometry<'b>(
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         brush: impl Into<BrushRef<'b>>,
@@ -2470,21 +2515,51 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     ) {
         match shape {
             imaging::GeometryRef::Rect(rect) => {
-                layer.stroke_with_brush_transform(rect, brush, stroke, brush_transform);
+                layer.stroke_with_brush_transform(
+                    caches,
+                    cache_color,
+                    rect,
+                    brush,
+                    stroke,
+                    brush_transform,
+                );
             }
             imaging::GeometryRef::RoundedRect(rect) => {
-                layer.stroke_with_brush_transform(rect, brush, stroke, brush_transform);
+                layer.stroke_with_brush_transform(
+                    caches,
+                    cache_color,
+                    rect,
+                    brush,
+                    stroke,
+                    brush_transform,
+                );
             }
             imaging::GeometryRef::Path(path) => {
-                layer.stroke_with_brush_transform(path, brush, stroke, brush_transform);
+                layer.stroke_with_brush_transform(
+                    caches,
+                    cache_color,
+                    path,
+                    brush,
+                    stroke,
+                    brush_transform,
+                );
             }
             imaging::GeometryRef::OwnedPath(path) => {
-                layer.stroke_with_brush_transform(path, brush, stroke, brush_transform);
+                layer.stroke_with_brush_transform(
+                    caches,
+                    cache_color,
+                    path,
+                    brush,
+                    stroke,
+                    brush_transform,
+                );
             }
         }
     }
 
     fn stroke_geometry_with_mode<'b>(
+        caches: &mut RendererCaches,
+        cache_color: CacheColor,
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         brush: impl Into<BrushRef<'b>>,
@@ -2495,6 +2570,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     ) {
         match shape {
             imaging::GeometryRef::Rect(rect) => layer.stroke_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 rect,
                 brush,
                 stroke,
@@ -2503,6 +2580,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 blend_mode,
             ),
             imaging::GeometryRef::RoundedRect(rect) => layer.stroke_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 rect,
                 brush,
                 stroke,
@@ -2511,6 +2590,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 blend_mode,
             ),
             imaging::GeometryRef::Path(path) => layer.stroke_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 path,
                 brush,
                 stroke,
@@ -2519,6 +2600,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 blend_mode,
             ),
             imaging::GeometryRef::OwnedPath(path) => layer.stroke_with_brush_transform_and_mode(
+                caches,
+                cache_color,
                 path,
                 brush,
                 stroke,
@@ -2533,7 +2616,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
         image_pixmap: &Pixmap,
-        image: &peniko::ImageBrush,
+        image: &ResolvedImageBrush,
         stroke: &KurboStroke,
         brush_transform: Option<Affine>,
         opacity: f32,
@@ -2641,6 +2724,62 @@ fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Op
     Some(pixmap)
 }
 
+fn cache_scene_image_pixmap(
+    caches: &mut RendererCaches,
+    cache_color: CacheColor,
+    image: &imaging::SceneImage,
+) -> Option<Arc<Pixmap>> {
+    caches
+        .scene_pixmap_cache
+        .retain(|_, entry| entry.scene_image.upgrade().is_some());
+
+    if let Some(entry) = caches.scene_pixmap_cache.get_mut(&image.id()) {
+        entry.cache_color = cache_color;
+        return Some(entry.pixmap.clone());
+    }
+
+    let pixmap = rasterize_scene_pixmap(
+        image.scene(),
+        image.width(),
+        image.height(),
+        Affine::IDENTITY,
+    )?;
+    caches.scene_pixmap_cache.insert(
+        image.id(),
+        CachedScenePixmap {
+            cache_color,
+            scene_image: image.downgrade(),
+            pixmap: pixmap.clone(),
+        },
+    );
+    Some(pixmap)
+}
+
+fn resolve_image_brush(
+    caches: &mut RendererCaches,
+    cache_color: CacheColor,
+    image: imaging::ImageBrushRef<'_>,
+) -> Option<(ResolvedImageBrush, Arc<Pixmap>)> {
+    match image.image {
+        ImageRef::Raster(image_data) => {
+            let resolved = ResolvedImageBrush {
+                key: ImageCacheKey::Raster(image_data.data.id()),
+                sampler: image.sampler,
+            };
+            let pixmap = cache_image_pixmap(caches, cache_color, image_data)?;
+            Some((resolved, pixmap))
+        }
+        ImageRef::Scene(scene) => {
+            let resolved = ResolvedImageBrush {
+                key: ImageCacheKey::Scene(scene.id()),
+                sampler: image.sampler,
+            };
+            let pixmap = cache_scene_image_pixmap(caches, cache_color, scene)?;
+            Some((resolved, pixmap))
+        }
+    }
+}
+
 impl PaintSink for TinySkiaRender<'_, '_> {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         let clip_path = self.clip_path_for_clip(clip);
@@ -2704,16 +2843,14 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
-        let Some(brush) = self.brush_to_owned(draw.brush) else {
-            return;
-        };
-        if let peniko::Brush::Image(image) = &brush {
-            let Some(image_pixmap) = cache_image_pixmap(self.caches, self.cache_color, image)
+        if let BrushRef::Image(image) = draw.brush {
+            let Some((image, image_pixmap)) =
+                resolve_image_brush(self.caches, self.cache_color, image)
             else {
                 return;
             };
             if let imaging::GeometryRef::Rect(rect) = draw.shape
-                && self.try_fill_cached_image_rect(image, rect, &draw)
+                && self.try_fill_cached_image_rect(&image, &image_pixmap, rect, &draw)
             {
                 return;
             }
@@ -2727,7 +2864,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
                     layer,
                     &draw.shape,
                     &image_pixmap,
-                    image,
+                    &image,
                     draw.brush_transform,
                     draw.composite.alpha,
                     blend_mode,
@@ -2743,7 +2880,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
                 &mut child,
                 &draw.shape,
                 &image_pixmap,
-                image,
+                &image,
                 draw.brush_transform,
                 1.0,
                 TinyBlendMode::SourceOver,
@@ -2753,12 +2890,21 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             return;
         }
 
+        let Some(brush) = self.brush_to_owned(draw.brush) else {
+            return;
+        };
+
         if let BlendStrategy::SinglePass(blend_mode) =
             determine_blend_strategy(&draw.composite.blend)
         {
-            let layer = self.current_layer_mut();
+            let (caches, layers) = (&mut self.caches, &mut self.layers);
+            let layer = layers
+                .last_mut()
+                .expect("TinySkiaRender always has a root layer");
             layer.transform = draw.transform;
             Self::fill_geometry_with_mode(
+                caches,
+                self.cache_color,
                 layer,
                 &draw.shape,
                 &brush,
@@ -2771,18 +2917,23 @@ impl PaintSink for TinySkiaRender<'_, '_> {
 
         let transform = draw.transform;
         let brush_transform = draw.brush_transform;
-        self.draw_with_composite(draw.composite, |layer| {
+        self.draw_with_composite(draw.composite, |caches, cache_color, layer| {
             layer.transform = transform;
-            Self::fill_geometry(layer, &draw.shape, &brush, brush_transform);
+            Self::fill_geometry(
+                caches,
+                cache_color,
+                layer,
+                &draw.shape,
+                &brush,
+                brush_transform,
+            );
         });
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
-        let Some(brush) = self.brush_to_owned(draw.brush) else {
-            return;
-        };
-        if let peniko::Brush::Image(image) = &brush {
-            let Some(image_pixmap) = cache_image_pixmap(self.caches, self.cache_color, image)
+        if let BrushRef::Image(image) = draw.brush {
+            let Some((image, image_pixmap)) =
+                resolve_image_brush(self.caches, self.cache_color, image)
             else {
                 return;
             };
@@ -2795,7 +2946,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
                     layer,
                     &draw.shape,
                     &image_pixmap,
-                    image,
+                    &image,
                     draw.stroke,
                     draw.brush_transform,
                     draw.composite.alpha,
@@ -2812,7 +2963,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
                 &mut child,
                 &draw.shape,
                 &image_pixmap,
-                image,
+                &image,
                 draw.stroke,
                 draw.brush_transform,
                 1.0,
@@ -2823,12 +2974,21 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             return;
         }
 
+        let Some(brush) = self.brush_to_owned(draw.brush) else {
+            return;
+        };
+
         if let BlendStrategy::SinglePass(blend_mode) =
             determine_blend_strategy(&draw.composite.blend)
         {
-            let layer = self.current_layer_mut();
+            let (caches, layers) = (&mut self.caches, &mut self.layers);
+            let layer = layers
+                .last_mut()
+                .expect("TinySkiaRender always has a root layer");
             layer.transform = draw.transform;
             Self::stroke_geometry_with_mode(
+                caches,
+                self.cache_color,
                 layer,
                 &draw.shape,
                 &brush,
@@ -2842,9 +3002,18 @@ impl PaintSink for TinySkiaRender<'_, '_> {
 
         let transform = draw.transform;
         let brush_transform = draw.brush_transform;
-        self.draw_with_composite(draw.composite, |layer| {
+        let stroke = draw.stroke;
+        self.draw_with_composite(draw.composite, |caches, cache_color, layer| {
             layer.transform = transform;
-            Self::stroke_geometry(layer, &draw.shape, &brush, draw.stroke, brush_transform);
+            Self::stroke_geometry(
+                caches,
+                cache_color,
+                layer,
+                &draw.shape,
+                &brush,
+                stroke,
+                brush_transform,
+            );
         });
     }
 
@@ -3597,6 +3766,8 @@ fn draw_brushed_glyphs_into_layer<'a>(
         ),
     );
     content_layer.fill_with_brush_transform_and_mode(
+        caches,
+        cache_color,
         &canvas_rect,
         run.brush,
         Some(Affine::translate((
@@ -3668,19 +3839,27 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         )
     }
 
-    fn draw_with_composite(&mut self, composite: Composite, draw: impl FnOnce(&mut Layer<'_>)) {
+    fn draw_with_composite(
+        &mut self,
+        composite: Composite,
+        draw: impl FnOnce(&mut RendererCaches, CacheColor, &mut Layer<'_>),
+    ) {
         if composite == Composite::default() {
             let transform = self.transform;
-            let layer = self.current_layer_mut();
+            let cache_color = self.cache_color;
+            let (caches, layers) = (&mut self.caches, &mut self.layers);
+            let layer = layers
+                .last_mut()
+                .expect("TinySkiaRender always has a root layer");
             layer.transform = transform;
-            draw(layer);
+            draw(caches, cache_color, layer);
             return;
         }
 
         let Some(mut child) = self.new_composite_child_layer(composite, self.transform) else {
             return;
         };
-        draw(&mut child);
+        draw(self.caches, self.cache_color, &mut child);
 
         let parent = self.current_layer_mut();
         apply_layer(&child, parent);
@@ -3702,6 +3881,9 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         self.caches
             .image_cache
             .retain(|_, (c, _)| *c == self.cache_color);
+        self.caches.scene_pixmap_cache.retain(|_, entry| {
+            entry.cache_color == self.cache_color && entry.scene_image.upgrade().is_some()
+        });
         self.caches
             .scaled_image_cache
             .retain(|_, (c, _)| *c == self.cache_color);
@@ -3829,25 +4011,21 @@ fn realize_image_pixmap(image_data: &ImageData) -> Option<Pixmap> {
     Some(pixmap)
 }
 
-fn cache_image_pixmap<T>(
+fn cache_image_pixmap(
     caches: &mut RendererCaches,
     cache_color: CacheColor,
-    image: &peniko::ImageBrush<T>,
-) -> Option<Arc<Pixmap>>
-where
-    T: Borrow<ImageData>,
-{
-    let image_data = image.image.borrow();
-    let image_id = image_data.data.id();
-    if let Some((entry_color, pixmap)) = caches.image_cache.get_mut(&image_id) {
+    image: &ImageData,
+) -> Option<Arc<Pixmap>> {
+    let image_key = ImageCacheKey::Raster(image.data.id());
+    if let Some((entry_color, pixmap)) = caches.image_cache.get_mut(&image_key) {
         *entry_color = cache_color;
         return Some(pixmap.clone());
     }
 
-    let pixmap = Arc::new(realize_image_pixmap(image_data)?);
+    let pixmap = Arc::new(realize_image_pixmap(image)?);
     caches
         .image_cache
-        .insert(image_id, (cache_color, pixmap.clone()));
+        .insert(image_key, (cache_color, pixmap.clone()));
     Some(pixmap)
 }
 
@@ -3871,19 +4049,16 @@ fn resize_pixmap(
     Some(scaled)
 }
 
-fn cache_scaled_image_pixmap<T>(
+fn cache_scaled_image_pixmap(
     caches: &mut RendererCaches,
     cache_color: CacheColor,
-    image: &peniko::ImageBrush<T>,
+    image: &ResolvedImageBrush,
+    source: &Pixmap,
     width: u32,
     height: u32,
-) -> Option<Arc<Pixmap>>
-where
-    T: Borrow<ImageData>,
-{
-    let image_id = image.image.borrow().data.id();
+) -> Option<Arc<Pixmap>> {
     let key = ScaledImageCacheKey {
-        image_id,
+        image_key: image.key,
         width,
         height,
         quality: std::mem::discriminant(&image.sampler.quality),
@@ -3893,27 +4068,18 @@ where
         return Some(pixmap.clone());
     }
 
-    let source = cache_image_pixmap(caches, cache_color, image)?;
-    let scaled = Arc::new(resize_pixmap(
-        &source,
-        width,
-        height,
-        image.sampler.quality,
-    )?);
+    let scaled = Arc::new(resize_pixmap(source, width, height, image.sampler.quality)?);
     caches
         .scaled_image_cache
         .insert(key, (cache_color, scaled.clone()));
     Some(scaled)
 }
 
-fn cached_image_rect_size<T>(
-    image: &peniko::ImageBrush<T>,
+fn cached_image_rect_size(
+    image: &ResolvedImageBrush,
     rect: Rect,
     brush_transform: Option<Affine>,
-) -> Option<(u32, u32)>
-where
-    T: Borrow<ImageData>,
-{
+) -> Option<(u32, u32)> {
     (brush_transform.is_none()
         && image.sampler.x_extend == Extend::Pad
         && image.sampler.y_extend == Extend::Pad)
@@ -3926,24 +4092,24 @@ where
     ))
 }
 
-fn render_cached_image_rect<T>(
+fn render_cached_image_rect(
     caches: &mut RendererCaches,
     cache_color: CacheColor,
     layer: &mut Layer<'_>,
-    image: &peniko::ImageBrush<T>,
+    image: &ResolvedImageBrush,
+    image_pixmap: &Pixmap,
     rect: Rect,
     transform: Affine,
     brush_transform: Option<Affine>,
     opacity: f32,
     blend_mode: TinyBlendMode,
-) -> bool
-where
-    T: Borrow<ImageData>,
-{
+) -> bool {
     let Some((width, height)) = cached_image_rect_size(image, rect, brush_transform) else {
         return false;
     };
-    let Some(pixmap) = cache_scaled_image_pixmap(caches, cache_color, image, width, height) else {
+    let Some(pixmap) =
+        cache_scaled_image_pixmap(caches, cache_color, image, image_pixmap, width, height)
+    else {
         return false;
     };
     layer.draw_pixmap_rect(
@@ -4125,18 +4291,11 @@ fn brush_to_paint<'b>(
     })
 }
 
-fn image_brush_pixmap<T>(image: &peniko::ImageBrush<T>) -> Option<Pixmap>
-where
-    T: Borrow<ImageData>,
-{
-    realize_image_pixmap(image.image.borrow())
-}
-
-fn image_brush_has_mixed_extend<T>(image: &peniko::ImageBrush<T>) -> bool {
+fn image_brush_has_mixed_extend(image: &ResolvedImageBrush) -> bool {
     image.sampler.x_extend != image.sampler.y_extend
 }
 
-fn image_brush_spread_mode<T>(image: &peniko::ImageBrush<T>) -> SpreadMode {
+fn image_brush_spread_mode(image: &ResolvedImageBrush) -> SpreadMode {
     debug_assert!(
         !image_brush_has_mixed_extend(image),
         "mixed-axis image brushes must use the custom fallback path"
@@ -4254,14 +4413,11 @@ fn pixmap_pixel_or_transparent(
     }
 }
 
-fn sample_image_brush_at<T>(
+fn sample_image_brush_at(
     pixmap: &Pixmap,
-    image: &peniko::ImageBrush<T>,
+    image: &ResolvedImageBrush,
     point: Point,
-) -> PremultipliedColorU8
-where
-    T: Borrow<ImageData>,
-{
+) -> PremultipliedColorU8 {
     let quality = image_quality_to_filter_quality(image.sampler.quality);
     let opacity = opacity_to_u8(image.sampler.alpha);
     let width = pixmap.width();
@@ -5271,9 +5427,11 @@ fn skia_transform(affine: Affine) -> Transform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::{GroupRef, MaskMode, Painter, record::Scene};
+    use imaging::{
+        Brush, GroupRef, ImageBrush, ImageBrushRef, MaskMode, Painter, SceneImage, record::Scene,
+    };
     use peniko::color::{ColorSpaceTag, HueDirection, palette::css};
-    use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+    use peniko::{Blob, Extend, ImageAlphaType, ImageData, ImageFormat};
 
     /// Creates a `Layer` directly without a window, for offscreen rendering.
     fn make_layer(width: u32, height: u32) -> Layer<'static> {
@@ -5438,21 +5596,113 @@ mod tests {
             width: 2,
             height: 2,
         };
-        let brush = peniko::ImageBrush::new(image)
+        let brush = peniko::ImageBrush::new(image.clone())
             .with_extend(Extend::Pad)
             .with_quality(ImageQuality::Medium);
 
         let mut caches = RendererCaches::new();
-        let first = cache_scaled_image_pixmap(&mut caches, CacheColor(false), &brush, 8, 8)
-            .expect("scale image");
+        let source = cache_image_pixmap(&mut caches, CacheColor(false), &image).expect("source");
+        let resolved = ResolvedImageBrush {
+            key: ImageCacheKey::Raster(image.data.id()),
+            sampler: brush.sampler,
+        };
+        let first =
+            cache_scaled_image_pixmap(&mut caches, CacheColor(false), &resolved, &source, 8, 8)
+                .expect("scale image");
         assert_eq!(caches.image_cache.len(), 1);
         assert_eq!(caches.scaled_image_cache.len(), 1);
 
-        let second = cache_scaled_image_pixmap(&mut caches, CacheColor(true), &brush, 8, 8)
-            .expect("reuse scaled image");
+        let second =
+            cache_scaled_image_pixmap(&mut caches, CacheColor(true), &resolved, &source, 8, 8)
+                .expect("reuse scaled image");
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(caches.image_cache.len(), 1);
         assert_eq!(caches.scaled_image_cache.len(), 1);
+    }
+
+    #[test]
+    fn scene_image_brush_reflects_in_tiny_skia() {
+        let mut source = Scene::new();
+        {
+            let mut painter = Painter::new(&mut source);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                Color::from_rgb8(0xff, 0x00, 0x00),
+            );
+            painter.fill_rect(
+                Rect::new(1.0, 0.0, 2.0, 1.0),
+                Color::from_rgb8(0x00, 0xff, 0x00),
+            );
+        }
+
+        let scene_image = SceneImage::new(source, 2, 1);
+        let brush = Brush::Image(
+            ImageBrush::from(scene_image)
+                .with_extend(Extend::Reflect)
+                .with_quality(ImageQuality::Low),
+        );
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 4.0, 1.0), &brush).draw();
+        }
+
+        let mut renderer = TinySkiaRenderer::new();
+        let image = renderer
+            .render_scene(&scene, 4, 1)
+            .expect("render reflected scene image");
+        assert_eq!(
+            &image.data[..16],
+            &[
+                0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00,
+                0x00, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn scene_image_cache_is_used_for_identical_scene_brushes() {
+        let mut source = Scene::new();
+        {
+            let mut painter = Painter::new(&mut source);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 2.0, 2.0),
+                Color::from_rgb8(0x2a, 0x6f, 0xdb),
+            );
+        }
+
+        let scene_image = SceneImage::new(source, 2, 2);
+        let scene_image_id = scene_image.id();
+        let brush = ImageBrush::from(scene_image);
+        let mut caches = RendererCaches::new();
+
+        let (first_brush, first) =
+            resolve_image_brush(&mut caches, CacheColor(false), ImageBrushRef::from(&brush))
+                .expect("realize");
+        assert_eq!(first_brush.key, ImageCacheKey::Scene(scene_image_id));
+        assert_eq!(caches.scene_pixmap_cache.len(), 1);
+
+        let (_, second) =
+            resolve_image_brush(&mut caches, CacheColor(true), ImageBrushRef::from(&brush))
+                .expect("reuse");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(caches.scene_pixmap_cache.len(), 1);
+    }
+
+    #[test]
+    fn scene_image_cache_drops_released_sources() {
+        let mut caches = RendererCaches::new();
+
+        let first = SceneImage::new(Scene::new(), 1, 1);
+        cache_scene_image_pixmap(&mut caches, CacheColor(false), &first).expect("cache first");
+        assert_eq!(caches.scene_pixmap_cache.len(), 1);
+        drop(first);
+
+        let second = SceneImage::new(Scene::new(), 1, 1);
+        cache_scene_image_pixmap(&mut caches, CacheColor(false), &second).expect("cache second");
+        assert_eq!(caches.scene_pixmap_cache.len(), 1);
+        assert!(caches.scene_pixmap_cache.contains_key(&second.id()));
     }
 
     #[test]
@@ -5513,7 +5763,7 @@ mod tests {
             width: 2,
             height: 2,
         };
-        let brush = peniko::ImageBrush::new(image)
+        let brush = ImageBrush::from(image)
             .with_quality(ImageQuality::Low)
             .with_x_extend(Extend::Repeat)
             .with_y_extend(Extend::Pad);
@@ -5672,7 +5922,10 @@ mod tests {
         plain.fill(&Rect::new(0.0, 0.0, 8.0, 2.0), &gradient);
 
         let mut transformed = make_layer(8, 2);
+        let mut caches = RendererCaches::new();
         transformed.fill_with_brush_transform(
+            &mut caches,
+            CacheColor(false),
             &Rect::new(0.0, 0.0, 8.0, 2.0),
             &gradient,
             Some(Affine::translate((2.0, 0.0))),
