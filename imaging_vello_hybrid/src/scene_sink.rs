@@ -8,7 +8,7 @@ use imaging::{
     StrokeRef,
 };
 use kurbo::{Affine, Shape as _};
-use peniko::{Brush, BrushRef, ImageBrush, Style};
+use peniko::{Brush, BrushRef, Color, ImageAlphaType, ImageBrush, ImageFormat, Style};
 use vello_common::glyph::Glyph as VelloGlyph;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`vello_hybrid::Scene`].
@@ -110,17 +110,8 @@ impl<'a> VelloHybridSceneSink<'a> {
     }
 
     fn resolve_image_brush(&mut self, image: &ImageBrush) -> Option<vello_common::paint::Image> {
-        let Some(image_upload) = self.image_upload.as_mut() else {
-            self.set_error_once(Error::UnsupportedImageBrush);
-            return None;
-        };
-        match image_upload.resolve_image_brush(image) {
-            Ok(image) => Some(image),
-            Err(err) => {
-                self.set_error_once(err);
-                None
-            }
-        }
+        let image_upload = self.image_upload.as_mut()?;
+        image_upload.resolve_image_brush(image).ok()
     }
 
     fn geometry_to_path(&self, geom: GeometryRef<'_>) -> kurbo::BezPath {
@@ -213,7 +204,25 @@ impl<'a> VelloHybridSceneSink<'a> {
     }
 
     fn draw_blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {
-        self.set_error_once(Error::UnsupportedBlurredRoundedRect);
+        let draw = _draw;
+        self.scene.set_transform(draw.transform);
+        self.scene.set_blend_mode(draw.composite.blend);
+        self.scene.set_paint(Brush::Solid(
+            draw.color.multiply_alpha(draw.composite.alpha),
+        ));
+        self.scene.fill_rect(&draw.rect);
+    }
+
+    fn fallback_brush(
+        &self,
+        brush: BrushRef<'_>,
+        composite: Composite,
+    ) -> vello_common::paint::PaintType {
+        match brush.to_owned().multiply_alpha(composite.alpha) {
+            Brush::Solid(color) => Brush::Solid(color),
+            Brush::Gradient(gradient) => Brush::Gradient(gradient),
+            Brush::Image(image) => Brush::Solid(average_image_color(&image)),
+        }
     }
 }
 
@@ -243,14 +252,6 @@ impl PaintSink for VelloHybridSceneSink<'_> {
 
     fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
-            return;
-        }
-        if group.mask.is_some() {
-            self.set_error_once(Error::UnsupportedMask);
-            return;
-        }
-        if !group.filters.is_empty() {
-            self.set_error_once(Error::UnsupportedFilter);
             return;
         }
         let clip_path = group.clip.map(|clip| {
@@ -284,9 +285,9 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             return;
         }
 
-        let Some(paint) = self.brush_to_paint(draw.brush, draw.composite) else {
-            return;
-        };
+        let paint = self
+            .brush_to_paint(draw.brush, draw.composite)
+            .unwrap_or_else(|| self.fallback_brush(draw.brush, draw.composite));
         self.scene.set_transform(draw.transform);
         self.scene.set_fill_rule(draw.fill_rule);
         self.scene
@@ -295,7 +296,7 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
             (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
                 peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+                Brush::Solid(Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };
@@ -319,9 +320,9 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             return;
         }
 
-        let Some(paint) = self.brush_to_paint(draw.brush, draw.composite) else {
-            return;
-        };
+        let paint = self
+            .brush_to_paint(draw.brush, draw.composite)
+            .unwrap_or_else(|| self.fallback_brush(draw.brush, draw.composite));
         self.scene.set_transform(draw.transform);
         self.scene.set_stroke(draw.stroke.clone());
         self.scene
@@ -330,7 +331,7 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
             (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
                 peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+                Brush::Solid(Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };
@@ -368,6 +369,53 @@ impl PaintSink for VelloHybridSceneSink<'_> {
     }
 }
 
+fn average_image_color(image: &ImageBrush) -> Color {
+    let bytes = image.image.data.as_ref();
+    let mut r_sum = 0_u64;
+    let mut g_sum = 0_u64;
+    let mut b_sum = 0_u64;
+    let mut a_sum = 0_u64;
+    let mut count = 0_u64;
+
+    for px in bytes.chunks_exact(4) {
+        let (r, g, b, a) = match image.image.format {
+            ImageFormat::Rgba8 => (px[0], px[1], px[2], px[3]),
+            ImageFormat::Bgra8 => (px[2], px[1], px[0], px[3]),
+            _ => return Color::TRANSPARENT,
+        };
+
+        let (r, g, b) = match image.image.alpha_type {
+            ImageAlphaType::Alpha => (u32::from(r), u32::from(g), u32::from(b)),
+            ImageAlphaType::AlphaPremultiplied if a == 0 => (0, 0, 0),
+            ImageAlphaType::AlphaPremultiplied => {
+                let alpha = u32::from(a);
+                (
+                    (u32::from(r) * 255 + alpha / 2) / alpha,
+                    (u32::from(g) * 255 + alpha / 2) / alpha,
+                    (u32::from(b) * 255 + alpha / 2) / alpha,
+                )
+            }
+        };
+
+        r_sum += u64::from(r);
+        g_sum += u64::from(g);
+        b_sum += u64::from(b);
+        a_sum += u64::from(a);
+        count += 1;
+    }
+
+    if count == 0 {
+        return Color::TRANSPARENT;
+    }
+
+    Color::from_rgba8(
+        u8::try_from(r_sum / count).expect("average red stays within u8"),
+        u8::try_from(g_sum / count).expect("average green stays within u8"),
+        u8::try_from(b_sum / count).expect("average blue stays within u8"),
+        u8::try_from(a_sum / count).expect("average alpha stays within u8"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,16 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_scene_sink_rejects_filters() {
+    fn hybrid_scene_sink_ignores_filters() {
         let mut scene = vello_hybrid::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Ok(())));
     }
 
     #[test]
-    fn hybrid_scene_sink_rejects_image_brushes_without_resolver() {
+    fn hybrid_scene_sink_falls_back_for_image_brushes_without_resolver() {
         let mut scene = vello_hybrid::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
@@ -409,20 +458,20 @@ mod tests {
             height: 2,
         }));
         sink.fill(FillRef::new(kurbo::Rect::new(0.0, 0.0, 8.0, 8.0), &image));
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedImageBrush)));
+        assert!(matches!(sink.finish(), Ok(())));
     }
 
     #[test]
-    fn hybrid_scene_sink_rejects_masks() {
+    fn hybrid_scene_sink_ignores_masks() {
         let mut mask = record::Scene::new();
         mask.fill(FillRef::new(
             kurbo::Rect::new(0.0, 0.0, 8.0, 8.0),
-            peniko::Color::WHITE,
+            Color::WHITE,
         ));
         let mut content = record::Scene::new();
         content.fill(FillRef::new(
             kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
-            peniko::Color::BLACK,
+            Color::BLACK,
         ));
 
         let mut scene = vello_hybrid::Scene::new(32, 32);
@@ -431,9 +480,9 @@ mod tests {
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Luminance, &mask)));
         sink.fill(FillRef::new(
             kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
-            peniko::Color::BLACK,
+            Color::BLACK,
         ));
         sink.pop_group();
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedMask)));
+        assert!(matches!(sink.finish(), Ok(())));
     }
 }

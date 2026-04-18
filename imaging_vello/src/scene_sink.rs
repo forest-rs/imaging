@@ -4,8 +4,8 @@
 use super::Error;
 use crate::vello::{self, Glyph as VelloGlyph};
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
-    PaintSink, StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
+    StrokeRef,
     record::{Scene, replay_transformed},
 };
 use kurbo::{Affine, Rect};
@@ -27,7 +27,6 @@ pub struct VelloSceneSink<'a> {
 #[derive(Clone, Debug)]
 struct PendingMask {
     scene: Scene,
-    mode: MaskMode,
     transform: Affine,
 }
 
@@ -120,14 +119,21 @@ impl<'a> VelloSceneSink<'a> {
         glyph_run: GlyphRunRef<'_>,
         glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
     ) {
-        if glyph_run.composite.blend != peniko::BlendMode::default() {
-            self.set_error_once(Error::UnsupportedGlyphBlend);
-            return;
-        }
-
         let Some(paint) = self.brush_to_brush(glyph_run.brush, glyph_run.composite) else {
             return;
         };
+
+        let blended = glyph_run.composite.blend != peniko::BlendMode::default();
+        if blended {
+            self.scene.push_layer(
+                Fill::NonZero,
+                glyph_run.composite.blend,
+                1.0,
+                Affine::IDENTITY,
+                &self.surface_clip,
+            );
+            self.push_group_frame(None);
+        }
 
         let builder = self
             .scene
@@ -145,12 +151,26 @@ impl<'a> VelloSceneSink<'a> {
             y: glyph.y,
         });
         builder.draw(glyph_run.style, glyphs);
+
+        if blended {
+            if self.pop_group_frame().is_none() {
+                return;
+            }
+            self.scene.pop_layer();
+        }
     }
 
     fn draw_blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
-        if draw.composite.blend != peniko::BlendMode::default() {
-            self.set_error_once(Error::UnsupportedBlurredRoundedRectBlend);
-            return;
+        let blended = draw.composite.blend != peniko::BlendMode::default();
+        if blended {
+            self.scene.push_layer(
+                Fill::NonZero,
+                draw.composite.blend,
+                1.0,
+                draw.transform,
+                &draw.rect,
+            );
+            self.push_group_frame(None);
         }
         self.scene.draw_blurred_rounded_rect(
             draw.transform,
@@ -159,6 +179,12 @@ impl<'a> VelloSceneSink<'a> {
             draw.radius,
             draw.std_dev,
         );
+        if blended {
+            if self.pop_group_frame().is_none() {
+                return;
+            }
+            self.scene.pop_layer();
+        }
     }
 
     fn replay_masked_subscene(&mut self, scene: &Scene, transform: Affine) {
@@ -211,18 +237,6 @@ impl PaintSink for VelloSceneSink<'_> {
 
     fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
-            return;
-        }
-        if !group.filters.is_empty() {
-            self.set_error_once(Error::UnsupportedFilter);
-            return;
-        }
-        if group
-            .mask
-            .as_ref()
-            .is_some_and(|mask| mask.mask.mode != MaskMode::Luminance)
-        {
-            self.set_error_once(Error::UnsupportedMask);
             return;
         }
 
@@ -308,7 +322,6 @@ impl PaintSink for VelloSceneSink<'_> {
         }
         self.push_group_frame(group.mask.map(|mask| PendingMask {
             scene: mask.mask.scene.clone(),
-            mode: mask.mask.mode,
             transform: mask.transform,
         }));
     }
@@ -321,11 +334,6 @@ impl PaintSink for VelloSceneSink<'_> {
             return;
         };
         if let Some(mask) = mask {
-            debug_assert_eq!(
-                mask.mode,
-                MaskMode::Luminance,
-                "only luminance masks should reach Vello group-mask replay"
-            );
             self.scene.push_luminance_mask_layer(
                 Fill::NonZero,
                 1.0,
@@ -539,11 +547,12 @@ mod tests {
     }
 
     #[test]
-    fn vello_scene_sink_rejects_filters() {
+    fn vello_scene_sink_ignores_filters() {
         let mut scene = vello::Scene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Ok(())));
     }
 
     #[test]
@@ -560,13 +569,15 @@ mod tests {
     }
 
     #[test]
-    fn vello_scene_sink_rejects_alpha_masks() {
+    fn vello_scene_sink_falls_back_for_alpha_masks() {
         let mut mask = Scene::new();
         mask.fill(FillRef::new(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE));
 
         let mut scene = vello::Scene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Alpha, &mask)));
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedMask)));
+        sink.fill(FillRef::new(Rect::new(4.0, 4.0, 20.0, 20.0), Color::BLACK));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Ok(())));
     }
 }
