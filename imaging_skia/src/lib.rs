@@ -172,7 +172,7 @@ use imaging::{
     record::{Scene, ValidateError, replay},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
-        RenderContentError, RenderSource, RenderUnsupportedError,
+        RenderContentError, RenderSource,
     },
 };
 use kurbo::{Affine, Shape as _};
@@ -219,12 +219,6 @@ pub enum Error {
     UnsupportedGpuTextureFormat,
     /// The target image buffer format cannot be represented through Skia.
     UnsupportedImageTargetFormat,
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
-    /// A filter configuration could not be translated.
-    UnsupportedFilter,
-    /// A glyph run used a per-glyph transform unsupported by this backend.
-    UnsupportedGlyphTransform,
     /// Font bytes could not be loaded by Skia.
     InvalidFontData,
     /// A glyph identifier could not be represented by Skia's glyph type.
@@ -1156,13 +1150,6 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         Error::InvalidScene(error) => {
             ImageRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
-        }
-        Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
-        Error::UnsupportedGlyphTransform => {
-            ImageRendererError::Unsupported(RenderUnsupportedError::Glyph)
-        }
         Error::InvalidFontData => ImageRendererError::Content(RenderContentError::InvalidFontData),
         Error::InvalidGlyphId => ImageRendererError::Content(RenderContentError::InvalidGlyphId),
         #[cfg(feature = "gpu")]
@@ -1206,15 +1193,6 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
     match error {
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
-        }
-        Error::UnsupportedImageBrush => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
-        }
-        Error::UnsupportedFilter => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::Filter)
-        }
-        Error::UnsupportedGlyphTransform => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::Glyph)
         }
         Error::Internal("render width too large" | "render height too large") => {
             TextureRendererError::Target(TextureTargetError::DimensionsTooLarge)
