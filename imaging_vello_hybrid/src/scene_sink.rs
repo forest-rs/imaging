@@ -370,12 +370,11 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         self.draw_blurred_rounded_rect(draw);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use imaging::{Filter, MaskMode, MaskRef, record};
-    use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+    use peniko::{Blob, Brush, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
     use std::sync::Arc;
 
     #[test]

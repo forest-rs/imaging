@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::Error;
-use imaging::{ImageBrush, ImageRef};
-use peniko::ImageData;
+use imaging::{ImageBrush, ImageRef, SceneImage, SceneImageWeak};
+use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 use vello_common::paint::{Image as VelloImage, ImageId, ImageSource};
 
 #[derive(Debug)]
 pub(crate) struct HybridImageRegistry {
     live: VecDeque<RegisteredImage>,
+    scene_images: VecDeque<CachedSceneImage>,
     bytes_used: usize,
     max_bytes: usize,
 }
@@ -25,6 +27,7 @@ impl HybridImageRegistry {
     pub(crate) fn new(max_bytes: usize) -> Self {
         Self {
             live: VecDeque::new(),
+            scene_images: VecDeque::new(),
             bytes_used: 0,
             max_bytes,
         }
@@ -35,6 +38,7 @@ impl HybridImageRegistry {
         renderer: &'a mut vello_hybrid::Renderer,
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
+        tolerance: f64,
         mut encoder: wgpu::CommandEncoder,
     ) -> HybridImageUploadSession<'a> {
         // We evict excess images at the start of the session,
@@ -50,6 +54,7 @@ impl HybridImageRegistry {
             renderer,
             device,
             queue,
+            tolerance,
             encoder: Some(encoder),
             pending: Vec::new(),
         }
@@ -102,22 +107,78 @@ pub(crate) struct HybridImageUploadSession<'a> {
     renderer: &'a mut vello_hybrid::Renderer,
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
+    tolerance: f64,
     encoder: Option<wgpu::CommandEncoder>,
     pending: Vec<RegisteredImage>,
 }
 
 impl HybridImageUploadSession<'_> {
-    pub(crate) fn resolve_image_brush(&mut self, brush: &ImageBrush) -> Result<VelloImage, Error> {
-        let ImageRef::Raster(image) = brush.image.as_ref() else {
-            return Err(Error::UnsupportedImageBrush);
+    pub(crate) fn realize_scene_image(
+        &mut self,
+        scene_image: &SceneImage,
+    ) -> Result<ImageData, Error> {
+        self.registry
+            .scene_images
+            .retain(|entry| entry.scene_image.upgrade().is_some());
+
+        if let Some(entry) = self.registry.scene_images.iter().find(|entry| {
+            entry.scene_image_id == scene_image.id()
+                && entry.width == scene_image.width()
+                && entry.height == scene_image.height()
+                && entry.tolerance == self.tolerance
+        }) {
+            return Ok(entry.image.clone());
+        }
+
+        let (width, height) = crate::VelloHybridRendererState::checked_size(
+            scene_image.width(),
+            scene_image.height(),
+        )?;
+        let mut renderer = crate::VelloHybridRenderer::new(self.device.clone(), self.queue.clone());
+        renderer.set_tolerance(self.tolerance);
+        let native = renderer.encode_scene(scene_image.scene(), width, height)?;
+        let image = renderer.render(&native, width, height)?;
+        let image = ImageData {
+            data: Blob::new(Arc::new(image.data)),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: scene_image.width(),
+            height: scene_image.height(),
         };
-        let key = ImageKey::derive(image);
+        self.registry.scene_images.push_back(CachedSceneImage {
+            scene_image: scene_image.downgrade(),
+            scene_image_id: scene_image.id(),
+            width: scene_image.width(),
+            height: scene_image.height(),
+            tolerance: self.tolerance,
+            image: image.clone(),
+        });
+        Ok(image)
+    }
+    pub(crate) fn resolve_image_brush(&mut self, brush: &ImageBrush) -> Result<VelloImage, Error> {
+        let key = match brush.image.as_ref() {
+            ImageRef::Raster(image) => ImageKey::Raster(ImageDataKey::derive(image)),
+            ImageRef::Scene(scene_image) => ImageKey::Scene(SceneImageKey {
+                scene_image_id: scene_image.id(),
+                width: scene_image.width(),
+                height: scene_image.height(),
+                tolerance: self.tolerance.to_bits(),
+            }),
+        };
         let image = if let Some(image) = self.pending.iter().find(|ri| ri.key == key).copied() {
             image
         } else if let Some(index) = self.registry.live.iter().position(|ri| ri.key == key) {
             let index = self.registry.touch(index);
             self.registry.live.get(index).copied().unwrap()
         } else {
+            let realized_image;
+            let image = match brush.image.as_ref() {
+                ImageRef::Raster(image) => image,
+                ImageRef::Scene(scene_image) => {
+                    realized_image = self.realize_scene_image(scene_image)?;
+                    &realized_image
+                }
+            };
             let image_source = ImageSource::from_peniko_image_data(image);
             let ImageSource::Pixmap(pixmap) = image_source else {
                 return Err(Error::Internal(
@@ -185,15 +246,21 @@ struct RegisteredImage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ImageKey {
-    format: core::mem::Discriminant<peniko::ImageFormat>,
-    alpha_type: core::mem::Discriminant<peniko::ImageAlphaType>,
+enum ImageKey {
+    Raster(ImageDataKey),
+    Scene(SceneImageKey),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ImageDataKey {
+    format: core::mem::Discriminant<ImageFormat>,
+    alpha_type: core::mem::Discriminant<ImageAlphaType>,
     width: u32,
     height: u32,
     data_hash: u64,
 }
 
-impl ImageKey {
+impl ImageDataKey {
     fn derive(image: &ImageData) -> Self {
         let mut hasher = DefaultHasher::new();
         image.data.data().hash(&mut hasher);
@@ -207,11 +274,29 @@ impl ImageKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SceneImageKey {
+    scene_image_id: u64,
+    width: u32,
+    height: u32,
+    tolerance: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedSceneImage {
+    scene_image: SceneImageWeak,
+    scene_image_id: u64,
+    width: u32,
+    height: u32,
+    tolerance: f64,
+    image: ImageData,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::image_registry::HybridImageRegistry;
 
-    use super::{ImageKey, RegisteredImage};
+    use super::{ImageDataKey, ImageKey, RegisteredImage, SceneImageKey};
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -231,7 +316,7 @@ mod tests {
     fn image_key_dedupes_equivalent_image_contents() {
         let a = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
         let b = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
-        assert_eq!(ImageKey::derive(&a), ImageKey::derive(&b));
+        assert_eq!(ImageDataKey::derive(&a), ImageDataKey::derive(&b));
     }
 
     #[test]
@@ -239,10 +324,25 @@ mod tests {
         let mut a = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
         let mut b = a.clone();
         b.alpha_type = ImageAlphaType::AlphaPremultiplied;
-        assert_ne!(ImageKey::derive(&a), ImageKey::derive(&b));
+        assert_ne!(ImageDataKey::derive(&a), ImageDataKey::derive(&b));
 
         a.format = ImageFormat::Bgra8;
-        assert_ne!(ImageKey::derive(&a), ImageKey::derive(&b));
+        assert_ne!(ImageDataKey::derive(&a), ImageDataKey::derive(&b));
+    }
+
+    #[test]
+    fn scene_image_key_distinguishes_scene_identity() {
+        let a = SceneImageKey {
+            scene_image_id: 1,
+            width: 2,
+            height: 3,
+            tolerance: 0.1_f64.to_bits(),
+        };
+        let b = SceneImageKey {
+            scene_image_id: 2,
+            ..a
+        };
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -252,8 +352,8 @@ mod tests {
 
         let bytes_used = a.data.len() + b.data.len();
 
-        let a_key = ImageKey::derive(&a);
-        let b_key = ImageKey::derive(&b);
+        let a_key = ImageKey::Raster(ImageDataKey::derive(&a));
+        let b_key = ImageKey::Raster(ImageDataKey::derive(&b));
 
         let a_ri = RegisteredImage {
             key: a_key,
@@ -274,6 +374,7 @@ mod tests {
 
         let mut registry = HybridImageRegistry {
             live,
+            scene_images: VecDeque::new(),
             max_bytes: 1000 * 1000 * 1000,
             bytes_used,
         };

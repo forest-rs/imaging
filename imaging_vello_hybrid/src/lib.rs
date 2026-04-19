@@ -13,9 +13,8 @@
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
 //! presentation targets, then pass those handles into [`VelloHybridRenderer`].
 //!
-//! Scene-backed [`imaging::SceneImage`] brushes are intentionally unsupported here. Hybrid scenes
-//! can upload raster images into the backend image atlas, but this backend does not treat retained
-//! scenes as brush-samplable image sources.
+//! Scene-backed [`imaging::SceneImage`] brushes are supported by rasterizing the retained scene to
+//! a cached image, then uploading that image into the hybrid atlas.
 //!
 //! Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
 //! and translated to backend-managed opaque image ids. Use [`VelloHybridSceneSink::with_renderer`]
@@ -268,6 +267,7 @@ impl VelloHybridRendererState {
             &mut self.renderer,
             &self.device,
             &self.queue,
+            self.tolerance,
             encoder,
         )
     }
@@ -644,7 +644,10 @@ fn map_readback_image_error(error: ReadbackError) -> ImageRendererError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::{Painter, record::Scene, render::ImageTargetError};
+    use imaging::{
+        Brush as ImagingBrush, ImageBrush as ImagingImageBrush, Painter, SceneImage, ScenePicture,
+        record::Scene, render::ImageTargetError,
+    };
     use kurbo::Rect;
     use peniko::{Blob, Brush, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
     use pollster::block_on;
@@ -924,5 +927,50 @@ mod tests {
         let image = renderer.render(&native, 20, 20).unwrap();
         assert_eq!(image.width, 20);
         assert_eq!(image.height, 20);
+    }
+
+    #[test]
+    fn scene_image_brush_renders() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let source = solid_scene(Color::from_rgb8(0x12, 0x34, 0x56), 2.0, 2.0);
+        let brush = ImagingBrush::Image(ImagingImageBrush::from(SceneImage::new(source, 2, 2)));
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 20.0, 20.0), &brush).draw();
+        }
+
+        let native = renderer.encode_scene(&scene, 20, 20).unwrap();
+        let image = renderer.render(&native, 20, 20).unwrap();
+        assert_eq!(image.width, 20);
+        assert_eq!(image.height, 20);
+    }
+
+    #[test]
+    fn scene_picture_draw_renders() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let picture = ScenePicture::new(
+            solid_scene(Color::from_rgb8(0xaa, 0x44, 0x22), 8.0, 8.0),
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+        );
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.draw_scene_picture(&picture, kurbo::Affine::IDENTITY);
+        }
+
+        let native = renderer.encode_scene(&scene, 8, 8).unwrap();
+        let image = renderer.render(&native, 8, 8).unwrap();
+        assert_eq!(image.width, 8);
+        assert_eq!(image.height, 8);
     }
 }

@@ -2327,7 +2327,7 @@ mod tests {
             painter.fill(Rect::new(0.0, 0.0, 4.0, 1.0), &brush).draw();
         }
 
-        let mut renderer = SkiaRenderer::new();
+        let mut renderer = SkiaCpuRenderer::new();
         let image = renderer.render_scene(&scene, 4, 1).unwrap();
         assert_eq!(
             &image.data[..16],

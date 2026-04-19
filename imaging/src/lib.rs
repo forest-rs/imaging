@@ -137,7 +137,9 @@
 //! - `imaging_skia` supports scene-backed image brushes natively.
 //! - `imaging_tiny_skia` and `imaging_vello_cpu` support them by rasterizing the source scene and
 //!   then sampling the realized image.
-//! - `imaging_vello` and `imaging_vello_hybrid` intentionally reject them.
+//! - `imaging_vello_hybrid` supports them by rasterizing the source scene, then uploading the
+//!   realized image into its hybrid atlas cache.
+//! - `imaging_vello` intentionally rejects them.
 //!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 
