@@ -166,7 +166,7 @@ use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
 use imaging::render::{
     GpuReadbackError, ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError,
-    ImageTargetError, RenderContentError, RenderSource, RenderUnsupportedError,
+    ImageTargetError, RenderContentError, RenderSource,
 };
 pub use imaging_wgpu::wgpu;
 use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError, TextureViewTarget};
@@ -187,12 +187,8 @@ pub enum Error {
     InvalidScene(ValidateError),
     /// An image brush was encountered on a sink path that has no renderer-backed image resolver.
     UnsupportedImageBrush,
-    /// A filter configuration could not be translated.
-    UnsupportedFilter,
     /// Masks are not supported by this backend yet.
     UnsupportedMask,
-    /// Blurred rounded rect draws are not supported by this backend yet.
-    UnsupportedBlurredRoundedRect,
     /// Vello hybrid returned a render error.
     Render(RenderError),
     /// An internal invariant was violated.
@@ -570,16 +566,6 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
-        }
-        Error::UnsupportedFilter => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::Filter)
-        }
-        Error::UnsupportedMask => TextureRendererError::Unsupported(RenderUnsupportedError::Mask),
-        Error::UnsupportedBlurredRoundedRect => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::BlurredRoundedRect)
-        }
         Error::Internal("render width too large" | "render height too large") => {
             TextureRendererError::Target(TextureTargetError::DimensionsTooLarge)
         }
@@ -640,8 +626,10 @@ fn map_readback_image_error(error: ReadbackError) -> ImageRendererError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::{Painter, record::Scene, render::ImageTargetError};
-    use kurbo::Rect;
+    use imaging::{
+        BlurredRoundedRect, Composite, Filter, Painter, record::Scene, render::ImageTargetError,
+    };
+    use kurbo::{Affine, Rect};
     use peniko::{Blob, Brush, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
     use pollster::block_on;
     use std::sync::Arc;
@@ -920,5 +908,65 @@ mod tests {
         let image = renderer.render(&native, 20, 20).unwrap();
         assert_eq!(image.width, 20);
         assert_eq!(image.height, 20);
+    }
+    #[test]
+    fn blurred_rounded_rect_blurs_beyond_source_rect() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.blurred_rounded_rect(BlurredRoundedRect {
+                transform: Affine::IDENTITY,
+                rect: Rect::new(8.0, 8.0, 24.0, 24.0),
+                color: Color::from_rgba8(0x40, 0x80, 0xc0, 0xff),
+                radius: 6.0,
+                std_dev: 3.0,
+                composite: Composite::default(),
+            });
+        }
+
+        let native = renderer.encode_scene(&scene, 32, 32).unwrap();
+        let image = renderer.render(&native, 32, 32).unwrap();
+
+        let alpha_at = |x: usize, y: usize| -> u8 { image.data[(y * 32 + x) * 4 + 3] };
+        assert_eq!(alpha_at(2, 2), 0);
+        assert!(alpha_at(6, 16) > 0);
+        assert!(alpha_at(16, 16) > alpha_at(6, 16));
+    }
+
+    #[test]
+    fn filtered_group_blurs_beyond_source_rect() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.with_group(
+                imaging::GroupRef::new().with_filters(&[Filter::blur(3.0)]),
+                |group| {
+                    group
+                        .fill(
+                            Rect::new(8.0, 8.0, 24.0, 24.0),
+                            Color::from_rgb8(0x20, 0x90, 0x60),
+                        )
+                        .draw();
+                },
+            );
+        }
+
+        let native = renderer.encode_scene(&scene, 32, 32).unwrap();
+        let image = renderer.render(&native, 32, 32).unwrap();
+
+        let alpha_at = |x: usize, y: usize| -> u8 { image.data[(y * 32 + x) * 4 + 3] };
+        assert_eq!(alpha_at(2, 2), 0);
+        assert!(alpha_at(6, 16) > 0);
+        assert!(alpha_at(16, 16) > alpha_at(6, 16));
     }
 }
