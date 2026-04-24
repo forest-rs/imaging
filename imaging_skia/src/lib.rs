@@ -217,6 +217,9 @@ pub enum Error {
     /// The target texture format cannot be represented through Skia Ganesh.
     #[cfg(feature = "gpu")]
     UnsupportedGpuTextureFormat,
+    /// The caller-owned GPU texture is not usable as a Skia render target.
+    #[cfg(feature = "gpu")]
+    InvalidGpuTextureTarget(&'static str),
     /// The target image buffer format cannot be represented through Skia.
     UnsupportedImageTargetFormat,
     /// An image brush was encountered; this backend does not support it.
@@ -813,16 +816,41 @@ pub struct SkiaRenderer {
 impl SkiaGpuRendererState {
     fn checked_texture_size(texture: &wgpu::Texture) -> Result<(u32, u32), Error> {
         if texture.dimension() != wgpu::TextureDimension::D2 {
-            return Err(Error::Internal(
+            return Err(Error::InvalidGpuTextureTarget(
                 "Skia GPU renderer only supports 2D textures",
             ));
         }
         if texture.sample_count() != 1 {
-            return Err(Error::Internal(
+            return Err(Error::InvalidGpuTextureTarget(
                 "Skia GPU renderer only supports single-sampled textures",
             ));
         }
+        if texture.mip_level_count() != 1 {
+            return Err(Error::InvalidGpuTextureTarget(
+                "Skia GPU renderer only supports single-mip textures",
+            ));
+        }
+        if texture.depth_or_array_layers() != 1 {
+            return Err(Error::InvalidGpuTextureTarget(
+                "Skia GPU renderer only supports single-layer textures",
+            ));
+        }
         Ok((texture.width(), texture.height()))
+    }
+
+    fn prepare_texture_for_skia(&mut self, texture: &wgpu::Texture) -> Result<(), Error> {
+        let _ = Self::checked_texture_size(texture)?;
+        self.backend.can_wrap_texture_format(texture.format())?;
+        if !texture
+            .usage()
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            return Err(Error::InvalidGpuTextureTarget(
+                "Skia GPU renderer requires RENDER_ATTACHMENT texture usage",
+            ));
+        }
+        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        Ok(())
     }
 
     fn new(
@@ -853,8 +881,7 @@ impl SkiaGpuRendererState {
         picture: &sk::Picture,
         texture: &wgpu::Texture,
     ) -> Result<(), Error> {
-        let _ = Self::checked_texture_size(texture)?;
-        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        self.prepare_texture_for_skia(texture)?;
         let mut surface = self.backend.wrap_texture(texture)?;
         surface.canvas().clear(sk::Color::TRANSPARENT);
         surface.canvas().draw_picture(picture, None, None);
@@ -867,9 +894,8 @@ impl SkiaGpuRendererState {
         source: &mut dyn RenderSource,
         texture: &wgpu::Texture,
     ) -> Result<(), Error> {
-        let _ = Self::checked_texture_size(texture)?;
         source.validate().map_err(Error::InvalidScene)?;
-        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        self.prepare_texture_for_skia(texture)?;
         let mut surface = self.backend.wrap_texture(texture)?;
         surface.canvas().clear(sk::Color::TRANSPARENT);
         let mut sink = SkCanvasSink::new_with_caches(
@@ -890,8 +916,7 @@ impl SkiaGpuRendererState {
         picture: &sk::Picture,
         texture: &wgpu::Texture,
     ) -> Result<(), Error> {
-        let _ = Self::checked_texture_size(texture)?;
-        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        self.prepare_texture_for_skia(texture)?;
         let mut surface = self.backend.wrap_texture(texture)?;
         surface.canvas().clear(sk::Color::TRANSPARENT);
         surface.canvas().draw_picture(picture, None, None);
@@ -1171,6 +1196,10 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         Error::UnsupportedGpuTextureFormat | Error::UnsupportedImageTargetFormat => {
             ImageRendererError::Target(ImageTargetError::UnsupportedTargetFormat)
         }
+        #[cfg(feature = "gpu")]
+        Error::InvalidGpuTextureTarget(message) => {
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(message))
+        }
         Error::Internal("image target dimensions do not match renderer output") => {
             ImageRendererError::Target(ImageTargetError::InvalidTarget(
                 "image target dimensions do not match renderer output",
@@ -1223,6 +1252,9 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         }
         Error::UnsupportedGpuTextureFormat => {
             TextureRendererError::Target(TextureTargetError::UnsupportedTextureFormat)
+        }
+        Error::InvalidGpuTextureTarget(message) => {
+            TextureRendererError::Target(TextureTargetError::InvalidTarget(message))
         }
         Error::UnsupportedGpuBackend => {
             TextureRendererError::Target(TextureTargetError::UnsupportedGpuBackend)
