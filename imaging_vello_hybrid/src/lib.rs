@@ -759,7 +759,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloHybridRenderer::new(device.clone(), queue);
+        let mut renderer = VelloHybridRenderer::new(device.clone(), queue.clone());
 
         let mut scene = Scene::new();
         {
@@ -791,6 +791,10 @@ mod tests {
         renderer
             .render_to_texture_view(&native, &texture_view, 24, 24)
             .unwrap();
+
+        let mut image = RgbaImage::new(24, 24);
+        read_texture_into(&device, &queue, &texture, 24, 24, &mut image).unwrap();
+        assert_eq!(&image.data[..4], &[0xd9, 0x77, 0x06, 0xff]);
     }
 
     #[test]
@@ -798,7 +802,7 @@ mod tests {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
         };
-        let mut renderer = VelloHybridRenderer::new(device.clone(), queue);
+        let mut renderer = VelloHybridRenderer::new(device.clone(), queue.clone());
 
         let mut scene = Scene::new();
         {
@@ -833,6 +837,10 @@ mod tests {
             TextureViewTarget::new(&texture_view, 24, 24),
         )
         .unwrap();
+
+        let mut image = RgbaImage::new(24, 24);
+        read_texture_into(&device, &queue, &texture, 24, 24, &mut image).unwrap();
+        assert_eq!(&image.data[..4], &[0x1d, 0x4e, 0x89, 0xff]);
     }
 
     #[test]

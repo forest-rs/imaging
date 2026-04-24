@@ -4,8 +4,6 @@
 use imaging::RgbaImage;
 use std::sync::mpsc;
 
-use crate::initialize_texture_for_wgpu;
-
 #[derive(Debug)]
 pub(crate) enum ReadbackError {
     DevicePoll,
@@ -25,14 +23,12 @@ pub(crate) struct ScratchTexture {
 impl ScratchTexture {
     pub(crate) fn new(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
         label: &'static str,
     ) -> Self {
         let texture = create_texture(device, width, height, format, label);
-        initialize_texture_for_wgpu(device, queue, &texture);
         Self {
             texture,
             width,
