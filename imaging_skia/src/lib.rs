@@ -217,6 +217,9 @@ pub enum Error {
     /// The target texture format cannot be represented through Skia Ganesh.
     #[cfg(feature = "gpu")]
     UnsupportedGpuTextureFormat,
+    /// The caller-owned GPU texture is not usable as a Skia render target.
+    #[cfg(feature = "gpu")]
+    InvalidGpuTextureTarget(&'static str),
     /// The target image buffer format cannot be represented through Skia.
     UnsupportedImageTargetFormat,
     /// An image brush was encountered; this backend does not support it.
@@ -813,16 +816,41 @@ pub struct SkiaRenderer {
 impl SkiaGpuRendererState {
     fn checked_texture_size(texture: &wgpu::Texture) -> Result<(u32, u32), Error> {
         if texture.dimension() != wgpu::TextureDimension::D2 {
-            return Err(Error::Internal(
+            return Err(Error::InvalidGpuTextureTarget(
                 "Skia GPU renderer only supports 2D textures",
             ));
         }
         if texture.sample_count() != 1 {
-            return Err(Error::Internal(
+            return Err(Error::InvalidGpuTextureTarget(
                 "Skia GPU renderer only supports single-sampled textures",
             ));
         }
+        if texture.mip_level_count() != 1 {
+            return Err(Error::InvalidGpuTextureTarget(
+                "Skia GPU renderer only supports single-mip textures",
+            ));
+        }
+        if texture.depth_or_array_layers() != 1 {
+            return Err(Error::InvalidGpuTextureTarget(
+                "Skia GPU renderer only supports single-layer textures",
+            ));
+        }
         Ok((texture.width(), texture.height()))
+    }
+
+    fn prepare_texture_for_skia(&mut self, texture: &wgpu::Texture) -> Result<(), Error> {
+        let _ = Self::checked_texture_size(texture)?;
+        self.backend.can_wrap_texture_format(texture.format())?;
+        if !texture
+            .usage()
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            return Err(Error::InvalidGpuTextureTarget(
+                "Skia GPU renderer requires RENDER_ATTACHMENT texture usage",
+            ));
+        }
+        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        Ok(())
     }
 
     fn new(
@@ -853,7 +881,7 @@ impl SkiaGpuRendererState {
         picture: &sk::Picture,
         texture: &wgpu::Texture,
     ) -> Result<(), Error> {
-        let _ = Self::checked_texture_size(texture)?;
+        self.prepare_texture_for_skia(texture)?;
         let mut surface = self.backend.wrap_texture(texture)?;
         surface.canvas().clear(sk::Color::TRANSPARENT);
         surface.canvas().draw_picture(picture, None, None);
@@ -866,8 +894,8 @@ impl SkiaGpuRendererState {
         source: &mut dyn RenderSource,
         texture: &wgpu::Texture,
     ) -> Result<(), Error> {
-        let _ = Self::checked_texture_size(texture)?;
         source.validate().map_err(Error::InvalidScene)?;
+        self.prepare_texture_for_skia(texture)?;
         let mut surface = self.backend.wrap_texture(texture)?;
         surface.canvas().clear(sk::Color::TRANSPARENT);
         let mut sink = SkCanvasSink::new_with_caches(
@@ -888,7 +916,7 @@ impl SkiaGpuRendererState {
         picture: &sk::Picture,
         texture: &wgpu::Texture,
     ) -> Result<(), Error> {
-        let _ = Self::checked_texture_size(texture)?;
+        self.prepare_texture_for_skia(texture)?;
         let mut surface = self.backend.wrap_texture(texture)?;
         surface.canvas().clear(sk::Color::TRANSPARENT);
         surface.canvas().draw_picture(picture, None, None);
@@ -966,6 +994,11 @@ impl SkiaRenderer {
     }
 
     /// Render a native [`skia_safe::Picture`] into a caller-owned `wgpu::Texture`.
+    ///
+    /// The texture must come from the same `wgpu::Device` and backend used to create this
+    /// renderer. It must be a 2D, single-sampled, single-layer, single-mip texture with
+    /// `wgpu::TextureUsages::RENDER_ATTACHMENT`, and its format must be one of
+    /// [`TextureRenderer::supported_texture_formats`].
     pub fn render_picture_to_texture(
         &mut self,
         picture: &sk::Picture,
@@ -1019,7 +1052,6 @@ impl TextureRenderer for SkiaRenderer {
     ) -> Result<Self::Texture, TextureRendererError> {
         let texture = ScratchTexture::new(
             &self.state.device,
-            &self.state.queue,
             width,
             height,
             wgpu::TextureFormat::Rgba8Unorm,
@@ -1056,7 +1088,6 @@ impl SkiaRenderer {
         let scratch = self.scratch.get_or_insert_with(|| {
             ScratchTexture::new(
                 &self.state.device,
-                &self.state.queue,
                 width,
                 height,
                 format,
@@ -1129,6 +1160,7 @@ impl ImageRenderer for SkiaRenderer {
         )
         .map_err(map_image_renderer_error)?;
         let texture = self.scratch_texture_for_format(target.width, target.height, texture_format);
+        initialize_texture_for_wgpu(&self.state.device, &self.state.queue, &texture);
         let mut surface = self
             .state
             .backend
@@ -1168,6 +1200,10 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         #[cfg(feature = "gpu")]
         Error::UnsupportedGpuTextureFormat | Error::UnsupportedImageTargetFormat => {
             ImageRendererError::Target(ImageTargetError::UnsupportedTargetFormat)
+        }
+        #[cfg(feature = "gpu")]
+        Error::InvalidGpuTextureTarget(message) => {
+            ImageRendererError::Target(ImageTargetError::InvalidTarget(message))
         }
         Error::Internal("image target dimensions do not match renderer output") => {
             ImageRendererError::Target(ImageTargetError::InvalidTarget(
@@ -1221,6 +1257,9 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         }
         Error::UnsupportedGpuTextureFormat => {
             TextureRendererError::Target(TextureTargetError::UnsupportedTextureFormat)
+        }
+        Error::InvalidGpuTextureTarget(message) => {
+            TextureRendererError::Target(TextureTargetError::InvalidTarget(message))
         }
         Error::UnsupportedGpuBackend => {
             TextureRendererError::Target(TextureTargetError::UnsupportedGpuBackend)
@@ -2421,6 +2460,61 @@ mod tests {
     }
 
     #[cfg(feature = "gpu")]
+    fn gpu_render_target_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_skia gpu target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    #[cfg(feature = "gpu")]
+    fn solid_scene(width: u32, height: u32, color: Color) -> Scene {
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
+                &Brush::Solid(color),
+            );
+        }
+        scene
+    }
+
+    #[cfg(feature = "gpu")]
+    fn solid_picture(width: u32, height: u32, color: Color) -> sk::Picture {
+        let mut sink =
+            SkPictureRecorderSink::new(Rect::new(0.0, 0.0, f64::from(width), f64::from(height)));
+        {
+            let mut painter = Painter::new(&mut sink);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
+                &Brush::Solid(color),
+            );
+        }
+        sink.finish_picture().unwrap()
+    }
+
+    fn assert_solid_rgba_image(image: &RgbaImage, expected: [u8; 4]) {
+        assert_eq!(
+            image.data.len(),
+            usize::try_from(image.width).unwrap() * usize::try_from(image.height).unwrap() * 4
+        );
+        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+            assert_eq!(pixel, expected, "pixel {index} did not match");
+        }
+    }
+
+    #[cfg(feature = "gpu")]
     #[test]
     fn gpu_renderer_reports_supported_texture_formats() {
         let Some((renderer, _device)) = try_init_gpu_renderer_with_device() else {
@@ -2473,7 +2567,7 @@ mod tests {
 
         assert_eq!(image.width, 16);
         assert_eq!(image.height, 16);
-        assert_eq!(&image.data[..4], &[0x11, 0x22, 0x33, 0xff]);
+        assert_solid_rgba_image(&image, [0x11, 0x22, 0x33, 0xff]);
     }
 
     #[cfg(feature = "gpu")]
@@ -2482,33 +2576,78 @@ mod tests {
         let Some((mut renderer, device)) = try_init_gpu_renderer_with_device() else {
             return;
         };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("imaging_skia gpu target"),
-            size: wgpu::Extent3d {
-                width: 24,
-                height: 24,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        let mut scene = Scene::new();
-        {
-            let mut painter = Painter::new(&mut scene);
-            painter.fill_rect(
-                Rect::new(0.0, 0.0, 24.0, 24.0),
-                &Brush::Solid(Color::from_rgb8(0x2a, 0x6f, 0xdb)),
-            );
-        }
+        let texture = gpu_render_target_texture(&device, 24, 24);
+        let scene = solid_scene(24, 24, Color::from_rgb8(0x2a, 0x6f, 0xdb));
 
         let mut source = &scene;
         TextureRenderer::render_source_into_texture(&mut renderer, &mut source, texture.clone())
             .unwrap();
+
+        let mut image = RgbaImage::new(24, 24);
+        read_texture_into(&device, &renderer.state.queue, &texture, 24, 24, &mut image).unwrap();
+        assert_solid_rgba_image(&image, [0x2a, 0x6f, 0xdb, 0xff]);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_renderer_renders_picture_to_texture_visible_to_wgpu() {
+        let Some((mut renderer, device)) = try_init_gpu_renderer_with_device() else {
+            return;
+        };
+        let texture = gpu_render_target_texture(&device, 32, 18);
+        let picture = solid_picture(32, 18, Color::from_rgb8(0x11, 0x44, 0xaa));
+
+        renderer
+            .render_picture_to_texture(&picture, &texture)
+            .unwrap();
+
+        let mut image = RgbaImage::new(32, 18);
+        read_texture_into(&device, &renderer.state.queue, &texture, 32, 18, &mut image).unwrap();
+        assert_solid_rgba_image(&image, [0x11, 0x44, 0xaa, 0xff]);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_renderer_readback_survives_scratch_texture_resize() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+        let mut image = RgbaImage::new(1, 1);
+
+        let first = solid_picture(8, 8, Color::from_rgb8(0xff, 0x00, 0x00));
+        renderer
+            .render_picture_into(&first, 8, 8, &mut image)
+            .unwrap();
+        assert_eq!((image.width, image.height), (8, 8));
+        assert_solid_rgba_image(&image, [0xff, 0x00, 0x00, 0xff]);
+
+        let resized = solid_picture(13, 9, Color::from_rgb8(0x00, 0xff, 0x00));
+        renderer
+            .render_picture_into(&resized, 13, 9, &mut image)
+            .unwrap();
+        assert_eq!((image.width, image.height), (13, 9));
+        assert_solid_rgba_image(&image, [0x00, 0xff, 0x00, 0xff]);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_renderer_source_to_image_survives_scratch_texture_resize() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+
+        let first = solid_scene(7, 7, Color::from_rgb8(0xff, 0x00, 0x00));
+        let mut first_source = &first;
+        let image = ImageRenderer::render_source(&mut renderer, &mut first_source, 7, 7).unwrap();
+        assert_eq!((image.width, image.height), (7, 7));
+        assert_solid_rgba_image(&image, [0xff, 0x00, 0x00, 0xff]);
+
+        let resized = solid_scene(11, 5, Color::from_rgb8(0x00, 0xff, 0x00));
+        let mut resized_source = &resized;
+        let image =
+            ImageRenderer::render_source(&mut renderer, &mut resized_source, 11, 5).unwrap();
+        assert_eq!((image.width, image.height), (11, 5));
+        assert_solid_rgba_image(&image, [0x00, 0xff, 0x00, 0xff]);
     }
 
     #[cfg(feature = "gpu")]
@@ -2555,6 +2694,6 @@ mod tests {
             &mut image,
         )
         .unwrap();
-        assert_eq!(&image.data[..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_solid_rgba_image(&image, [0xff, 0x00, 0x00, 0xff]);
     }
 }

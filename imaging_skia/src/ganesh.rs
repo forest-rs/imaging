@@ -123,7 +123,6 @@ impl GaneshBackend {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn can_wrap_texture_format(
         &self,
         texture_format: wgpu::TextureFormat,
