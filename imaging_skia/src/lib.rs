@@ -994,6 +994,11 @@ impl SkiaRenderer {
     }
 
     /// Render a native [`skia_safe::Picture`] into a caller-owned `wgpu::Texture`.
+    ///
+    /// The texture must come from the same `wgpu::Device` and backend used to create this
+    /// renderer. It must be a 2D, single-sampled, single-layer, single-mip texture with
+    /// `wgpu::TextureUsages::RENDER_ATTACHMENT`, and its format must be one of
+    /// [`TextureRenderer::supported_texture_formats`].
     pub fn render_picture_to_texture(
         &mut self,
         picture: &sk::Picture,
