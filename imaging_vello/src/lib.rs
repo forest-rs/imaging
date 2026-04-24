@@ -567,6 +567,16 @@ mod tests {
         scene
     }
 
+    fn assert_solid_rgba_image(image: &RgbaImage, expected: [u8; 4]) {
+        assert_eq!(
+            image.data.len(),
+            usize::try_from(image.width).unwrap() * usize::try_from(image.height).unwrap() * 4
+        );
+        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+            assert_eq!(pixel, expected, "pixel {index} did not match");
+        }
+    }
+
     fn try_init_device_and_queue() -> Result<(wgpu::Device, wgpu::Queue), ()> {
         block_on(async {
             let instance = wgpu::Instance::default();
@@ -702,7 +712,7 @@ mod tests {
 
         let mut image = RgbaImage::new(32, 32);
         read_texture_into(&device, &queue, &texture, 32, 32, &mut image).unwrap();
-        assert_eq!(&image.data[..4], &[0x1d, 0x4e, 0x89, 0xff]);
+        assert_solid_rgba_image(&image, [0x1d, 0x4e, 0x89, 0xff]);
     }
 
     #[test]
@@ -748,7 +758,7 @@ mod tests {
 
         let mut image = RgbaImage::new(24, 24);
         read_texture_into(&device, &queue, &texture, 24, 24, &mut image).unwrap();
-        assert_eq!(&image.data[..4], &[0x1d, 0x4e, 0x89, 0xff]);
+        assert_solid_rgba_image(&image, [0x1d, 0x4e, 0x89, 0xff]);
     }
 
     #[test]
@@ -772,7 +782,7 @@ mod tests {
 
         let mut image = RgbaImage::new(8, 8);
         read_texture_into(&device, &queue, &first_texture, 8, 8, &mut image).unwrap();
-        assert_eq!(&image.data[..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_solid_rgba_image(&image, [0xff, 0x00, 0x00, 0xff]);
     }
 
     #[test]

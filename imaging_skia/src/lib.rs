@@ -2504,6 +2504,16 @@ mod tests {
         sink.finish_picture().unwrap()
     }
 
+    fn assert_solid_rgba_image(image: &RgbaImage, expected: [u8; 4]) {
+        assert_eq!(
+            image.data.len(),
+            usize::try_from(image.width).unwrap() * usize::try_from(image.height).unwrap() * 4
+        );
+        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+            assert_eq!(pixel, expected, "pixel {index} did not match");
+        }
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_renderer_reports_supported_texture_formats() {
@@ -2557,7 +2567,7 @@ mod tests {
 
         assert_eq!(image.width, 16);
         assert_eq!(image.height, 16);
-        assert_eq!(&image.data[..4], &[0x11, 0x22, 0x33, 0xff]);
+        assert_solid_rgba_image(&image, [0x11, 0x22, 0x33, 0xff]);
     }
 
     #[cfg(feature = "gpu")]
@@ -2575,7 +2585,7 @@ mod tests {
 
         let mut image = RgbaImage::new(24, 24);
         read_texture_into(&device, &renderer.state.queue, &texture, 24, 24, &mut image).unwrap();
-        assert_eq!(&image.data[..4], &[0x2a, 0x6f, 0xdb, 0xff]);
+        assert_solid_rgba_image(&image, [0x2a, 0x6f, 0xdb, 0xff]);
     }
 
     #[cfg(feature = "gpu")]
@@ -2593,7 +2603,7 @@ mod tests {
 
         let mut image = RgbaImage::new(32, 18);
         read_texture_into(&device, &renderer.state.queue, &texture, 32, 18, &mut image).unwrap();
-        assert_eq!(&image.data[..4], &[0x11, 0x44, 0xaa, 0xff]);
+        assert_solid_rgba_image(&image, [0x11, 0x44, 0xaa, 0xff]);
     }
 
     #[cfg(feature = "gpu")]
@@ -2609,14 +2619,14 @@ mod tests {
             .render_picture_into(&first, 8, 8, &mut image)
             .unwrap();
         assert_eq!((image.width, image.height), (8, 8));
-        assert_eq!(&image.data[..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_solid_rgba_image(&image, [0xff, 0x00, 0x00, 0xff]);
 
         let resized = solid_picture(13, 9, Color::from_rgb8(0x00, 0xff, 0x00));
         renderer
             .render_picture_into(&resized, 13, 9, &mut image)
             .unwrap();
         assert_eq!((image.width, image.height), (13, 9));
-        assert_eq!(&image.data[..4], &[0x00, 0xff, 0x00, 0xff]);
+        assert_solid_rgba_image(&image, [0x00, 0xff, 0x00, 0xff]);
     }
 
     #[cfg(feature = "gpu")]
@@ -2630,14 +2640,14 @@ mod tests {
         let mut first_source = &first;
         let image = ImageRenderer::render_source(&mut renderer, &mut first_source, 7, 7).unwrap();
         assert_eq!((image.width, image.height), (7, 7));
-        assert_eq!(&image.data[..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_solid_rgba_image(&image, [0xff, 0x00, 0x00, 0xff]);
 
         let resized = solid_scene(11, 5, Color::from_rgb8(0x00, 0xff, 0x00));
         let mut resized_source = &resized;
         let image =
             ImageRenderer::render_source(&mut renderer, &mut resized_source, 11, 5).unwrap();
         assert_eq!((image.width, image.height), (11, 5));
-        assert_eq!(&image.data[..4], &[0x00, 0xff, 0x00, 0xff]);
+        assert_solid_rgba_image(&image, [0x00, 0xff, 0x00, 0xff]);
     }
 
     #[cfg(feature = "gpu")]
@@ -2684,6 +2694,6 @@ mod tests {
             &mut image,
         )
         .unwrap();
-        assert_eq!(&image.data[..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_solid_rgba_image(&image, [0xff, 0x00, 0x00, 0xff]);
     }
 }
