@@ -9,6 +9,8 @@ use imaging::{
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, BrushRef, ImageBrush, Style};
+use std::sync::Arc;
+use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::glyph::Glyph as VelloGlyph;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`vello_hybrid::Scene`].
@@ -212,8 +214,73 @@ impl<'a> VelloHybridSceneSink<'a> {
         }
     }
 
-    fn draw_blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {
-        self.set_error_once(Error::UnsupportedBlurredRoundedRect);
+    fn draw_blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "filter sigma is stored as f32"
+        )]
+        let blur_sigma = draw.std_dev as f32;
+        self.scene.set_transform(draw.transform);
+        self.scene.set_fill_rule(peniko::Fill::NonZero);
+        self.scene.push_layer(
+            None,
+            Some(draw.composite.blend),
+            Some(draw.composite.alpha),
+            None,
+            self.filters_to_vello(&[imaging::Filter::blur(blur_sigma)]),
+        );
+        self.scene.set_blend_mode(Composite::default().blend);
+        self.scene.set_paint(Brush::Solid(
+            draw.color.multiply_alpha(Composite::default().alpha),
+        ));
+        let path = draw
+            .rect
+            .to_rounded_rect(draw.radius)
+            .to_path(self.tolerance);
+        self.scene.fill_path(&path);
+        self.scene.pop_layer();
+    }
+
+    fn filters_to_vello(&self, filters: &[imaging::Filter]) -> Option<VelloFilter> {
+        if filters.is_empty() {
+            return None;
+        }
+
+        let mut graph = FilterGraph::new();
+        let mut last = None;
+        for filter in filters {
+            let primitive = match *filter {
+                imaging::Filter::Flood { color } => FilterPrimitive::Flood { color },
+                imaging::Filter::Blur {
+                    std_deviation_x,
+                    std_deviation_y,
+                } => FilterPrimitive::GaussianBlur {
+                    std_deviation: std_deviation_x.max(std_deviation_y),
+                    edge_mode: EdgeMode::None,
+                },
+                imaging::Filter::DropShadow {
+                    dx,
+                    dy,
+                    std_deviation_x,
+                    std_deviation_y,
+                    color,
+                } => FilterPrimitive::DropShadow {
+                    dx,
+                    dy,
+                    std_deviation: std_deviation_x.max(std_deviation_y),
+                    color,
+                    edge_mode: EdgeMode::None,
+                },
+                imaging::Filter::Offset { dx, dy } => FilterPrimitive::Offset { dx, dy },
+            };
+            last = Some(graph.add(primitive, None));
+        }
+        if let Some(output) = last {
+            graph.set_output(output);
+        }
+        Some(VelloFilter {
+            graph: Arc::new(graph),
+        })
     }
 }
 
@@ -249,10 +316,6 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             self.set_error_once(Error::UnsupportedMask);
             return;
         }
-        if !group.filters.is_empty() {
-            self.set_error_once(Error::UnsupportedFilter);
-            return;
-        }
         let clip_path = group.clip.map(|clip| {
             let (xf, path, fill_rule) = self.clip_to_path(clip);
             self.scene.set_transform(xf);
@@ -262,8 +325,9 @@ impl PaintSink for VelloHybridSceneSink<'_> {
 
         let blend = Some(group.composite.blend);
         let opacity = Some(group.composite.alpha);
+        let filter = self.filters_to_vello(group.filters);
         self.scene
-            .push_layer(clip_path.as_ref(), blend, opacity, None, None);
+            .push_layer(clip_path.as_ref(), blend, opacity, None, filter);
         self.group_depth += 1;
     }
 
@@ -388,12 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_scene_sink_rejects_filters() {
+    fn hybrid_scene_sink_supports_filters() {
         let mut scene = vello_hybrid::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Ok(())));
     }
 
     #[test]
