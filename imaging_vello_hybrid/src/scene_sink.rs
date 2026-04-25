@@ -4,12 +4,35 @@
 use super::Error;
 use crate::{VelloHybridRenderer, image_registry::HybridImageUploadSession};
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
+    PaintSink, StrokeRef,
+    record::{Scene, replay_transformed},
 };
 use kurbo::{Affine, Shape as _};
-use peniko::{Brush, BrushRef, ImageBrush, Style};
+use peniko::{
+    BlendMode, Brush, BrushRef, Color, ColorStop, ImageAlphaType, ImageBrush, ImageData,
+    ImageFormat, Style,
+};
 use vello_common::glyph::Glyph as VelloGlyph;
+
+#[derive(Clone, Debug)]
+struct PendingMask {
+    scene: Scene,
+    mode: MaskMode,
+    transform: Affine,
+}
+
+#[derive(Clone, Debug)]
+enum LayerFrame {
+    Clip,
+    Group { mask: Option<Box<PendingMask>> },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PaintMode {
+    Normal,
+    Mask(MaskMode),
+}
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`vello_hybrid::Scene`].
 pub struct VelloHybridSceneSink<'a> {
@@ -17,8 +40,8 @@ pub struct VelloHybridSceneSink<'a> {
     image_upload: Option<HybridImageUploadSession<'a>>,
     tolerance: f64,
     error: Option<Error>,
-    clip_depth: u32,
-    group_depth: u32,
+    layer_stack: Vec<LayerFrame>,
+    paint_mode: PaintMode,
 }
 
 impl core::fmt::Debug for VelloHybridSceneSink<'_> {
@@ -26,8 +49,8 @@ impl core::fmt::Debug for VelloHybridSceneSink<'_> {
         f.debug_struct("VelloHybridSceneSink")
             .field("tolerance", &self.tolerance)
             .field("error", &self.error)
-            .field("clip_depth", &self.clip_depth)
-            .field("group_depth", &self.group_depth)
+            .field("layer_stack_depth", &self.layer_stack.len())
+            .field("paint_mode", &self.paint_mode)
             .finish_non_exhaustive()
     }
 }
@@ -40,8 +63,8 @@ impl<'a> VelloHybridSceneSink<'a> {
             image_upload: None,
             tolerance: 0.1,
             error: None,
-            clip_depth: 0,
-            group_depth: 0,
+            layer_stack: Vec::new(),
+            paint_mode: PaintMode::Normal,
         }
     }
 
@@ -61,8 +84,8 @@ impl<'a> VelloHybridSceneSink<'a> {
             ),
             tolerance: 0.1,
             error: None,
-            clip_depth: 0,
-            group_depth: 0,
+            layer_stack: Vec::new(),
+            paint_mode: PaintMode::Normal,
         }
     }
 
@@ -75,10 +98,8 @@ impl<'a> VelloHybridSceneSink<'a> {
     pub fn finish(&mut self) -> Result<(), Error> {
         let result = if let Some(err) = self.error.take() {
             Err(err)
-        } else if self.clip_depth != 0 {
-            Err(Error::Internal("unbalanced clip stack"))
-        } else if self.group_depth != 0 {
-            Err(Error::Internal("unbalanced group stack"))
+        } else if !self.layer_stack.is_empty() {
+            Err(Error::Internal("unbalanced layer stack"))
         } else {
             Ok(())
         };
@@ -102,11 +123,46 @@ impl<'a> VelloHybridSceneSink<'a> {
         composite: Composite,
     ) -> Option<vello_common::paint::PaintType> {
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
-        match brush {
-            Brush::Solid(c) => Some(Brush::Solid(c)),
-            Brush::Gradient(g) => Some(Brush::Gradient(g)),
-            Brush::Image(image) => self.resolve_image_brush(&image).map(Brush::Image),
+        match self.paint_mode {
+            PaintMode::Normal => match brush {
+                Brush::Solid(color) => Some(Brush::Solid(color)),
+                Brush::Gradient(gradient) => Some(Brush::Gradient(gradient)),
+                Brush::Image(image) => self.resolve_image_brush(&image).map(Brush::Image),
+            },
+            PaintMode::Mask(mode) => self.mask_brush_to_paint(brush, mode),
         }
+    }
+
+    fn mask_brush_to_paint(
+        &mut self,
+        brush: Brush,
+        mode: MaskMode,
+    ) -> Option<vello_common::paint::PaintType> {
+        match brush {
+            Brush::Solid(color) => Some(Brush::Solid(mask_color(color, mode))),
+            Brush::Gradient(mut gradient) => {
+                for stop in gradient.stops.iter_mut() {
+                    *stop = ColorStop {
+                        offset: stop.offset,
+                        color: mask_color(stop.color.to_alpha_color::<peniko::color::Srgb>(), mode)
+                            .into(),
+                    };
+                }
+                Some(Brush::Gradient(gradient))
+            }
+            Brush::Image(image) => self
+                .mask_image_brush(&image, mode)
+                .and_then(|image| self.resolve_image_brush(&image))
+                .map(Brush::Image),
+        }
+    }
+
+    fn mask_image_brush(&self, image: &ImageBrush, mode: MaskMode) -> Option<ImageBrush> {
+        let transformed = mask_image_data(&image.image, mode)?;
+        Some(ImageBrush {
+            image: transformed,
+            sampler: image.sampler,
+        })
     }
 
     fn resolve_image_brush(&mut self, image: &ImageBrush) -> Option<vello_common::paint::Image> {
@@ -215,6 +271,57 @@ impl<'a> VelloHybridSceneSink<'a> {
     fn draw_blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {
         self.set_error_once(Error::UnsupportedBlurredRoundedRect);
     }
+
+    fn push_clip_frame(&mut self) {
+        self.layer_stack.push(LayerFrame::Clip);
+    }
+
+    fn push_group_frame(&mut self, mask: Option<Box<PendingMask>>) {
+        self.layer_stack.push(LayerFrame::Group { mask });
+    }
+
+    fn pop_clip_frame(&mut self) -> bool {
+        match self.layer_stack.pop() {
+            Some(LayerFrame::Clip) => true,
+            _ => {
+                self.set_error_once(Error::Internal("pop_clip underflow"));
+                false
+            }
+        }
+    }
+
+    fn pop_group_frame(&mut self) -> Option<Option<PendingMask>> {
+        match self.layer_stack.pop() {
+            Some(LayerFrame::Group { mask }) => Some(mask.map(|mask| *mask)),
+            _ => {
+                self.set_error_once(Error::Internal("pop_group underflow"));
+                None
+            }
+        }
+    }
+
+    fn replay_masked_subscene(&mut self, scene: &Scene, transform: Affine, mode: MaskMode) {
+        let old_mode = self.paint_mode;
+        self.paint_mode = PaintMode::Mask(mode);
+        replay_transformed(scene, self, transform);
+        self.paint_mode = old_mode;
+    }
+
+    fn apply_mask(&mut self, mask: PendingMask) {
+        self.scene.push_layer(
+            None,
+            Some(BlendMode::new(peniko::Mix::Normal, peniko::Compose::DestIn)),
+            Some(1.0),
+            None,
+            None,
+        );
+        self.push_group_frame(None);
+        self.replay_masked_subscene(&mask.scene, mask.transform, mask.mode);
+        if self.pop_group_frame().is_none() {
+            return;
+        }
+        self.scene.pop_layer();
+    }
 }
 
 impl PaintSink for VelloHybridSceneSink<'_> {
@@ -226,27 +333,21 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         self.scene.set_transform(xf);
         self.scene.set_fill_rule(fill_rule);
         self.scene.push_clip_path(&path);
-        self.clip_depth += 1;
+        self.push_clip_frame();
     }
 
     fn pop_clip(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if self.clip_depth == 0 {
-            self.set_error_once(Error::Internal("pop_clip underflow"));
+        if !self.pop_clip_frame() {
             return;
         }
         self.scene.pop_clip_path();
-        self.clip_depth -= 1;
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
-            return;
-        }
-        if group.mask.is_some() {
-            self.set_error_once(Error::UnsupportedMask);
             return;
         }
         if !group.filters.is_empty() {
@@ -264,19 +365,26 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         let opacity = Some(group.composite.alpha);
         self.scene
             .push_layer(clip_path.as_ref(), blend, opacity, None, None);
-        self.group_depth += 1;
+        self.push_group_frame(group.mask.map(|mask| {
+            Box::new(PendingMask {
+                scene: mask.mask.scene.clone(),
+                mode: mask.mask.mode,
+                transform: mask.transform,
+            })
+        }));
     }
 
     fn pop_group(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if self.group_depth == 0 {
-            self.set_error_once(Error::Internal("pop_group underflow"));
+        let Some(mask) = self.pop_group_frame() else {
             return;
+        };
+        if let Some(mask) = mask {
+            self.apply_mask(mask);
         }
         self.scene.pop_layer();
-        self.group_depth -= 1;
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -293,9 +401,9 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             .set_paint_transform(draw.brush_transform.unwrap_or(Affine::IDENTITY));
 
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
-            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
-                peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+            (Brush::Solid(color), peniko::Compose::Copy) if color.components[3] == 0.0 => (
+                BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
+                Brush::Solid(Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };
@@ -328,9 +436,9 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             .set_paint_transform(draw.brush_transform.unwrap_or(Affine::IDENTITY));
 
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
-            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
-                peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+            (Brush::Solid(color), peniko::Compose::Copy) if color.components[3] == 0.0 => (
+                BlendMode::new(peniko::Mix::Normal, peniko::Compose::Clear),
+                Brush::Solid(Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };
@@ -368,10 +476,85 @@ impl PaintSink for VelloHybridSceneSink<'_> {
     }
 }
 
+fn mask_color(color: Color, mode: MaskMode) -> Color {
+    let coverage = match mode {
+        MaskMode::Alpha => color.components[3],
+        MaskMode::Luminance => {
+            let alpha = color.components[3];
+            let luminance = color.components[0] * 0.2126
+                + color.components[1] * 0.7152
+                + color.components[2] * 0.0722;
+            alpha * luminance
+        }
+    }
+    .clamp(0.0, 1.0);
+    Color::from_rgba8(255, 255, 255, normalized_to_u8(coverage))
+}
+
+fn mask_image_data(image: &ImageData, mode: MaskMode) -> Option<ImageData> {
+    let mut out = Vec::with_capacity(image.data.as_ref().len());
+    for px in image.data.as_ref().chunks_exact(4) {
+        let (r, g, b, a) = match image.format {
+            ImageFormat::Rgba8 => (px[0], px[1], px[2], px[3]),
+            ImageFormat::Bgra8 => (px[2], px[1], px[0], px[3]),
+            _ => return None,
+        };
+        let coverage = mask_coverage_from_pixel(r, g, b, a, image.alpha_type, mode);
+        out.extend_from_slice(&[255, 255, 255, coverage]);
+    }
+    Some(ImageData {
+        data: peniko::Blob::from(out),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width: image.width,
+        height: image.height,
+    })
+}
+
+fn mask_coverage_from_pixel(
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    alpha_type: ImageAlphaType,
+    mode: MaskMode,
+) -> u8 {
+    match mode {
+        MaskMode::Alpha => a,
+        MaskMode::Luminance => match alpha_type {
+            ImageAlphaType::Alpha => {
+                let alpha = f32::from(a) / 255.0;
+                let luminance = (f32::from(r) / 255.0) * 0.2126
+                    + (f32::from(g) / 255.0) * 0.7152
+                    + (f32::from(b) / 255.0) * 0.0722;
+                normalized_to_u8(alpha * luminance)
+            }
+            ImageAlphaType::AlphaPremultiplied => {
+                let premul_luma =
+                    f32::from(r) * 0.2126 + f32::from(g) * 0.7152 + f32::from(b) * 0.0722;
+                byte_value_to_u8(premul_luma)
+            }
+        },
+    }
+}
+
+fn normalized_to_u8(value: f32) -> u8 {
+    let scaled = (value.clamp(0.0, 1.0) * 255.0).round();
+    byte_value_to_u8(scaled)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "value is clamped to the u8 range first"
+)]
+fn byte_value_to_u8(value: f32) -> u8 {
+    u8::try_from(value.clamp(0.0, 255.0) as i16).expect("value is clamped to u8 range")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imaging::{Filter, MaskMode, MaskRef, record};
+    use imaging::{Filter, MaskRef};
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
     use std::sync::Arc;
 
@@ -413,16 +596,11 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_scene_sink_rejects_masks() {
-        let mut mask = record::Scene::new();
+    fn hybrid_scene_sink_supports_luminance_masks() {
+        let mut mask = Scene::new();
         mask.fill(FillRef::new(
             kurbo::Rect::new(0.0, 0.0, 8.0, 8.0),
-            peniko::Color::WHITE,
-        ));
-        let mut content = record::Scene::new();
-        content.fill(FillRef::new(
-            kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
-            peniko::Color::BLACK,
+            Color::WHITE,
         ));
 
         let mut scene = vello_hybrid::Scene::new(32, 32);
@@ -431,9 +609,29 @@ mod tests {
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Luminance, &mask)));
         sink.fill(FillRef::new(
             kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
-            peniko::Color::BLACK,
+            Color::BLACK,
         ));
         sink.pop_group();
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedMask)));
+        assert!(matches!(sink.finish(), Ok(())));
+    }
+
+    #[test]
+    fn hybrid_scene_sink_supports_alpha_masks() {
+        let mut mask = Scene::new();
+        mask.fill(FillRef::new(
+            kurbo::Rect::new(0.0, 0.0, 8.0, 8.0),
+            Color::WHITE,
+        ));
+
+        let mut scene = vello_hybrid::Scene::new(32, 32);
+        scene.reset();
+        let mut sink = VelloHybridSceneSink::new(&mut scene);
+        sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Alpha, &mask)));
+        sink.fill(FillRef::new(
+            kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
+            Color::BLACK,
+        ));
+        sink.pop_group();
+        assert!(matches!(sink.finish(), Ok(())));
     }
 }

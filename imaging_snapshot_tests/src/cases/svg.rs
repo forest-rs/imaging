@@ -202,8 +202,15 @@ impl SnapshotCase for GmSvgLuminanceMask {
         10
     }
 
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        10
+    }
+
     fn supports_backend(&self, backend: &str) -> bool {
-        backend != "vello_hybrid"
+        matches!(
+            backend,
+            "skia" | "tiny_skia" | "vello_cpu" | "vello" | "vello_hybrid"
+        )
     }
 
     fn run(&self, sink: &mut dyn PaintSink, _width: f64, _height: f64) {
