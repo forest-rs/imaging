@@ -4,12 +4,12 @@
 use super::Error;
 use crate::vello::{self, Glyph as VelloGlyph};
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
-    PaintSink, StrokeRef,
+    BlurredRoundedRect, Brush as ImagingBrush, BrushRef, ClipRef, Composite, FillRef, GeometryRef,
+    GlyphRunRef, GroupRef, ImageRef, MaskMode, PaintSink, StrokeRef,
     record::{Scene, replay_transformed},
 };
 use kurbo::{Affine, Rect};
-use peniko::{Brush, BrushRef, Fill};
+use peniko::{Brush as PenikoBrush, Fill};
 use std::boxed::Box;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`crate::vello::Scene`].
@@ -78,10 +78,25 @@ impl<'a> VelloSceneSink<'a> {
         }
     }
 
-    fn brush_to_brush(&mut self, brush: BrushRef<'_>, composite: Composite) -> Option<Brush> {
+    fn brush_to_brush(&mut self, brush: BrushRef<'_>, composite: Composite) -> Option<PenikoBrush> {
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
         match brush {
-            Brush::Solid(_) | Brush::Gradient(_) | Brush::Image(_) => Some(brush),
+            ImagingBrush::Image(image) if !matches!(image.image.as_ref(), ImageRef::Raster(_)) => {
+                self.set_error_once(Error::UnsupportedImageBrush);
+                None
+            }
+            ImagingBrush::Solid(color) => Some(PenikoBrush::Solid(color)),
+            ImagingBrush::Gradient(gradient) => Some(PenikoBrush::Gradient(gradient)),
+            ImagingBrush::Image(image) => {
+                let ImageRef::Raster(raster) = image.image.as_ref() else {
+                    self.set_error_once(Error::UnsupportedImageBrush);
+                    return None;
+                };
+                Some(PenikoBrush::Image(peniko::ImageBrush {
+                    image: raster.clone(),
+                    sampler: image.sampler,
+                }))
+            }
         }
     }
 
@@ -348,9 +363,9 @@ impl PaintSink for VelloSceneSink<'_> {
         };
 
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
-            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
+            (PenikoBrush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
                 peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::DestOut),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+                PenikoBrush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };
@@ -434,9 +449,9 @@ impl PaintSink for VelloSceneSink<'_> {
         };
 
         let (blend, paint) = match (&paint, draw.composite.blend.compose) {
-            (Brush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
+            (PenikoBrush::Solid(c), peniko::Compose::Copy) if c.components[3] == 0.0 => (
                 peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::DestOut),
-                Brush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
+                PenikoBrush::Solid(peniko::Color::from_rgba8(0, 0, 0, 255)),
             ),
             _ => (draw.composite.blend, paint),
         };

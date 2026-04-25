@@ -12,11 +12,9 @@
 
 use alloc::vec::Vec;
 
-use peniko::BrushRef;
-
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef, PaintSink,
-    SourceLocationRef, StrokeRef,
+    BlurredRoundedRect, BrushRef, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef,
+    PaintSink, SourceLocationRef, StrokeRef,
     record::{ContextNote, ResolvedSourceLocation, Scene},
 };
 
@@ -451,15 +449,13 @@ mod tests {
     use alloc::vec;
 
     use kurbo::{Affine, BezPath, Rect, Stroke};
-    use peniko::{Brush, Color, Fill};
+    use peniko::{Color, Fill};
 
     use super::*;
-    use crate::Composite;
-    use crate::MaskMode;
-    use crate::Painter;
     use crate::record::{
         AppliedMask, Clip, ContextId, Draw, Geometry, Group, Mask, ResolvedSourceLocation,
     };
+    use crate::{Brush, Composite, MaskMode, Painter};
 
     #[test]
     fn diagnose_reports_empty_scopes_and_transparent_draws() {

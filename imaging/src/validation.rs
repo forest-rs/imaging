@@ -71,12 +71,11 @@
 //! ```
 
 use crate::{
-    AppliedMaskRef, BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef,
-    PaintSink, StrokeRef,
+    AppliedMaskRef, BlurredRoundedRect, BrushRef, ClipRef, Composite, FillRef, Filter, GlyphRunRef,
+    GroupRef, ImageRef, PaintSink, StrokeRef,
     record::{self, Geometry, Glyph},
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
-use peniko::BrushRef;
 
 /// Decision returned by a [`ValidatingSink`] violation hook.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -447,25 +446,32 @@ where
         }
     }
 
-    fn validate_image_brush(
-        &mut self,
-        image_brush: peniko::ImageBrush<&peniko::ImageData>,
-    ) -> bool {
+    fn validate_image_brush(&mut self, image_brush: crate::ImageBrushRef<'_>) -> bool {
         if !(image_brush.sampler.alpha.is_finite() && image_brush.sampler.alpha >= 0.0) {
             return !self.violate(ValidationError::InvalidBrush {
                 what: "Brush::Image::alpha",
             });
         }
 
-        let image = image_brush.image;
-        if image
-            .format
-            .size_in_bytes(image.width, image.height)
-            .is_none_or(|expected| expected != image.data.len())
-        {
-            return !self.violate(ValidationError::InvalidBrush {
-                what: "Brush::Image::data_len",
-            });
+        match image_brush.image {
+            ImageRef::Raster(image) => {
+                if image
+                    .format
+                    .size_in_bytes(image.width, image.height)
+                    .is_none_or(|expected| expected != image.data.len())
+                {
+                    return !self.violate(ValidationError::InvalidBrush {
+                        what: "Brush::Image::data_len",
+                    });
+                }
+            }
+            ImageRef::Scene(scene) => {
+                if scene.scene().validate().is_err() {
+                    return !self.violate(ValidationError::InvalidBrush {
+                        what: "Brush::Image::scene",
+                    });
+                }
+            }
         }
 
         true
@@ -689,6 +695,18 @@ where
         }
         self.inner.blurred_rounded_rect(draw);
     }
+
+    fn scene_picture(&mut self, picture: &crate::ScenePicture, transform: Affine) {
+        if self.aborted {
+            return;
+        }
+        if !self.validate_affine("Draw::ScenePicture::transform", &transform)
+            || !self.validate_recorded_scene_stream(picture.scene())
+        {
+            return;
+        }
+        self.inner.scene_picture(picture, transform);
+    }
 }
 
 #[cfg(test)]
@@ -853,7 +871,7 @@ mod tests {
     fn image_brushes_validate_byte_length() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
-        let paint = Brush::Image(ImageBrush::new(ImageData {
+        let paint = Brush::Image(ImageBrush::from(ImageData {
             data: Blob::from(vec![0_u8; 3]),
             format: ImageFormat::Rgba8,
             alpha_type: ImageAlphaType::Alpha,

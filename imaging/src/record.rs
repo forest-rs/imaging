@@ -9,11 +9,11 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
-use peniko::{Brush, Fill, FontData, Style};
+use peniko::{Fill, FontData, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef, MaskMode,
-    NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef,
+    BlurredRoundedRect, Brush, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef,
+    MaskMode, NormalizedCoord, PaintSink, ScenePicture, SourceLocationRef, StrokeRef,
 };
 
 /// A geometry payload stored in a recording.
@@ -329,6 +329,13 @@ pub enum Draw {
     GlyphRun(GlyphRun),
     /// Draw a solid-color rounded rectangle blurred with a gaussian filter.
     BlurredRoundedRect(BlurredRoundedRect),
+    /// Replay a retained scene picture.
+    ScenePicture {
+        /// Transform applied while replaying the retained picture.
+        transform: Affine,
+        /// Retained scene picture to replay.
+        picture: ScenePicture,
+    },
 }
 
 /// A single command in a [`Scene`].
@@ -732,6 +739,17 @@ impl PaintSink for Scene {
     #[inline]
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
         let _ = Self::draw(self, Draw::BlurredRoundedRect(draw));
+    }
+
+    #[inline]
+    fn scene_picture(&mut self, picture: &ScenePicture, transform: Affine) {
+        let _ = Self::draw(
+            self,
+            Draw::ScenePicture {
+                transform,
+                picture: picture.clone(),
+            },
+        );
     }
 }
 

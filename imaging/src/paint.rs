@@ -8,10 +8,10 @@
 //! semantic recording format.
 
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
-use peniko::{BrushRef, Fill, Style};
+use peniko::{Fill, Style};
 
 use crate::{
-    BlurredRoundedRect, Composite, Filter, MaskMode, NormalizedCoord,
+    BlurredRoundedRect, BrushRef, Composite, Filter, MaskMode, NormalizedCoord, ScenePicture,
     record::{
         AppliedMask, Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group,
         GroupId, Mask, MaskId, Scene,
@@ -654,6 +654,13 @@ pub enum DrawRef<'a> {
     GlyphRun(GlyphRunRef<'a>),
     /// Draw a solid-color rounded rectangle blurred with a gaussian filter.
     BlurredRoundedRect(BlurredRoundedRect),
+    /// Replay a retained scene picture.
+    ScenePicture {
+        /// Transform applied while replaying the retained picture.
+        transform: Affine,
+        /// Retained scene picture to replay.
+        picture: &'a ScenePicture,
+    },
 }
 
 /// Borrowed source location carried by a context annotation.
@@ -701,6 +708,10 @@ impl<'a> DrawRef<'a> {
             Self::Stroke(draw) => draw.to_owned(),
             Self::GlyphRun(draw) => Draw::GlyphRun(draw.to_owned(glyphs)),
             Self::BlurredRoundedRect(draw) => Draw::BlurredRoundedRect(draw),
+            Self::ScenePicture { transform, picture } => Draw::ScenePicture {
+                transform,
+                picture: picture.clone(),
+            },
         }
     }
 }
@@ -734,6 +745,10 @@ pub trait PaintSink {
     fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>);
     /// Emit a blurred rounded rect draw.
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect);
+    /// Replay a retained scene picture.
+    fn scene_picture(&mut self, picture: &ScenePicture, transform: Affine) {
+        replay_transformed(picture.scene(), self, transform);
+    }
 }
 
 impl Geometry {
@@ -869,6 +884,10 @@ impl Draw {
             }),
             Self::GlyphRun(glyph_run) => DrawRef::GlyphRun(glyph_run.as_ref()),
             Self::BlurredRoundedRect(draw) => DrawRef::BlurredRoundedRect(*draw),
+            Self::ScenePicture { transform, picture } => DrawRef::ScenePicture {
+                transform: *transform,
+                picture,
+            },
         }
     }
 }
@@ -924,6 +943,11 @@ where
         self.inner
             .blurred_rounded_rect(draw.prepend_transform(self.transform));
     }
+
+    fn scene_picture(&mut self, picture: &ScenePicture, transform: Affine) {
+        self.inner
+            .scene_picture(picture, self.transform * transform);
+    }
 }
 
 fn replay_clip<S>(scene: &Scene, id: ClipId, sink: &mut S)
@@ -949,10 +973,14 @@ where
             let mut glyphs = glyph_run.glyphs.iter().copied();
             sink.glyph_run(glyph_run.as_ref(), &mut glyphs);
         }
+        Draw::ScenePicture { transform, picture } => sink.scene_picture(picture, *transform),
         draw => match draw.as_ref() {
             DrawRef::Fill(draw) => sink.fill(draw),
             DrawRef::Stroke(draw) => sink.stroke(draw),
             DrawRef::BlurredRoundedRect(draw) => sink.blurred_rounded_rect(draw),
+            DrawRef::ScenePicture { .. } => {
+                unreachable!("scene-picture draws are handled using the retained picture")
+            }
             DrawRef::GlyphRun(_) => {
                 unreachable!("glyph runs are handled using the owned glyph slice")
             }
@@ -996,8 +1024,8 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::{Composite, record::Geometry};
-    use peniko::{Brush, FontData};
+    use crate::{Brush, Composite, ScenePicture, record::Geometry};
+    use peniko::FontData;
 
     #[test]
     fn clip_ref_prepend_transform_prefixes_clip_transform() {
@@ -1053,12 +1081,9 @@ mod tests {
 
     #[test]
     fn fill_ref_prepend_transform_prefixes_draw_transform_only() {
-        let draw = FillRef::new(
-            Rect::new(0.0, 0.0, 3.0, 4.0),
-            Brush::Solid(peniko::Color::WHITE),
-        )
-        .transform(Affine::translate((1.0, 2.0)))
-        .brush_transform(Some(Affine::translate((3.0, 4.0))));
+        let draw = FillRef::new(Rect::new(0.0, 0.0, 3.0, 4.0), peniko::Color::WHITE)
+            .transform(Affine::translate((1.0, 2.0)))
+            .brush_transform(Some(Affine::translate((3.0, 4.0))));
 
         assert_eq!(
             draw.prepend_transform(Affine::translate((5.0, 6.0))),
@@ -1075,10 +1100,7 @@ mod tests {
 
     #[test]
     fn fill_ref_prepend_transform_preserves_missing_brush_transform() {
-        let draw = FillRef::new(
-            Rect::new(0.0, 0.0, 3.0, 4.0),
-            Brush::Solid(peniko::Color::WHITE),
-        );
+        let draw = FillRef::new(Rect::new(0.0, 0.0, 3.0, 4.0), peniko::Color::WHITE);
 
         assert_eq!(
             draw.prepend_transform(Affine::translate((5.0, 6.0)))
@@ -1091,7 +1113,7 @@ mod tests {
     fn glyph_run_ref_prepend_transform_only_prefixes_run_transform() {
         let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
         let style = Style::Fill(Fill::NonZero);
-        let draw = GlyphRunRef::new(&font, &style, Brush::Solid(peniko::Color::BLACK));
+        let draw = GlyphRunRef::new(&font, &style, peniko::Color::BLACK);
         let draw = GlyphRunRef {
             transform: Affine::translate((1.0, 2.0)),
             glyph_transform: Some(Affine::translate((3.0, 4.0))),
@@ -1168,6 +1190,11 @@ mod tests {
             std_dev: 2.0,
             composite: Composite::default(),
         }));
+        let picture = ScenePicture::new(Scene::new(), Rect::new(25.0, 26.0, 31.0, 32.0));
+        let picture_id = source.draw(Draw::ScenePicture {
+            transform: Affine::translate((27.0, 28.0)),
+            picture: picture.clone(),
+        });
         source.pop_group();
         source.pop_clip();
 
@@ -1243,6 +1270,13 @@ mod tests {
                 std_dev: 2.0,
                 composite: Composite::default(),
             })
+        );
+        assert_eq!(
+            replayed.draw_op(picture_id),
+            &Draw::ScenePicture {
+                transform: transform * Affine::translate((27.0, 28.0)),
+                picture,
+            }
         );
     }
 }

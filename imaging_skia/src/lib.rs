@@ -11,6 +11,10 @@
 //! This crate provides a CPU raster renderer that consumes `imaging::record::Scene` or native
 //! Skia draw targets and produces an RGBA8 image buffer using Skia.
 //!
+//! `imaging_skia` supports scene-backed [`imaging::SceneImage`] brushes natively by lowering the
+//! retained subscene to Skia picture/image-shader machinery, so `Pad`, `Repeat`, and `Reflect`
+//! operate on scene content without first rasterizing through another backend.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then hand the scene to [`SkiaCpuRenderer`].
@@ -168,7 +172,8 @@ mod vulkan;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios")))]
 use foreign_types_shared as _;
 use imaging::{
-    Filter, GeometryRef, GlyphRunRef, RgbaImage,
+    BrushRef, Filter, GeometryRef, GlyphRunRef, ImageRef, RgbaImage, ScenePicture,
+    ScenePictureWeak,
     record::{Scene, ValidateError, replay},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
@@ -177,9 +182,7 @@ use imaging::{
 };
 use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection};
-use peniko::{
-    BrushRef, ImageAlphaType, ImageData, ImageFormat, ImageQuality, InterpolationAlphaSpace,
-};
+use peniko::{ImageAlphaType, ImageData, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
 use std::{
     cell::{RefCell, RefMut},
@@ -310,6 +313,13 @@ struct CachedImage {
     bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+struct CachedPicture {
+    picture_id: u64,
+    scene_picture: ScenePictureWeak,
+    picture: sk::Picture,
+}
+
 #[derive(Debug)]
 struct ImageCache {
     bytes_used: usize,
@@ -389,6 +399,52 @@ impl Default for ImageCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct PictureCache {
+    entries: VecDeque<CachedPicture>,
+}
+
+impl PictureCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn touch(&mut self, index: usize) {
+        if index + 1 == self.entries.len() {
+            return;
+        }
+        if let Some(entry) = self.entries.remove(index) {
+            self.entries.push_back(entry);
+        }
+    }
+
+    fn prune_dead(&mut self) {
+        self.entries
+            .retain(|entry| entry.scene_picture.upgrade().is_some());
+    }
+
+    fn get_or_create(&mut self, scene_picture: &ScenePicture) -> Option<sk::Picture> {
+        self.prune_dead();
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.picture_id == scene_picture.id())
+        {
+            let cached = self.entries.get(index)?.picture.clone();
+            self.touch(index);
+            return Some(cached);
+        }
+
+        let picture = make_skia_picture_from_scene(scene_picture)?;
+        self.entries.push_back(CachedPicture {
+            picture_id: scene_picture.id(),
+            scene_picture: scene_picture.downgrade(),
+            picture: picture.clone(),
+        });
+        Some(picture)
+    }
+}
+
 /// Shared cache bundle for Skia renderers.
 ///
 /// This exists so renderer construction does not grow a new constructor every time more shareable
@@ -397,6 +453,7 @@ impl Default for ImageCache {
 pub struct SkiaCaches {
     font_cache: SkiaFontCache,
     image_cache: Rc<RefCell<ImageCache>>,
+    picture_cache: Rc<RefCell<PictureCache>>,
     mask_cache: Rc<RefCell<MaskCache>>,
 }
 
@@ -407,6 +464,7 @@ impl SkiaCaches {
         Self {
             font_cache: SkiaFontCache::new(),
             image_cache: Rc::new(RefCell::new(ImageCache::default())),
+            picture_cache: Rc::new(RefCell::new(PictureCache::default())),
             mask_cache: Rc::new(RefCell::new(MaskCache::default())),
         }
     }
@@ -425,6 +483,9 @@ impl SkiaCaches {
     fn image_cache(&self) -> Rc<RefCell<ImageCache>> {
         Rc::clone(&self.image_cache)
     }
+    fn picture_cache(&self) -> Rc<RefCell<PictureCache>> {
+        Rc::clone(&self.picture_cache)
+    }
     fn mask_cache(&self) -> Rc<RefCell<MaskCache>> {
         Rc::clone(&self.mask_cache)
     }
@@ -432,6 +493,7 @@ impl SkiaCaches {
     fn clear(&self) {
         self.font_cache.clear();
         self.image_cache.borrow_mut().clear();
+        self.picture_cache.borrow_mut().clear();
         self.mask_cache.borrow_mut().clear();
     }
 
@@ -692,6 +754,7 @@ impl SkiaCpuRenderer {
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
             Some(self.caches.image_cache()),
+            self.caches.picture_cache(),
             self.caches.mask_cache(),
             self.caches.font_cache(),
         );
@@ -765,6 +828,7 @@ impl ImageRenderer for SkiaCpuRenderer {
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
             Some(self.caches.image_cache()),
+            self.caches.picture_cache(),
             self.caches.mask_cache(),
             self.caches.font_cache(),
         );
@@ -783,11 +847,17 @@ fn encode_source_to_picture<S: RenderSource + ?Sized>(
     height: u32,
     tolerance: f64,
     image_cache: Rc<RefCell<ImageCache>>,
+    picture_cache: Rc<RefCell<PictureCache>>,
     font_cache: SkiaFontCache,
 ) -> Result<sk::Picture, Error> {
     source.validate().map_err(Error::InvalidScene)?;
     let bounds = kurbo::Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
-    let mut sink = SkPictureRecorderSink::new_with_caches(bounds, Some(image_cache), font_cache);
+    let mut sink = SkPictureRecorderSink::new_with_caches(
+        bounds,
+        Some(image_cache),
+        picture_cache,
+        font_cache,
+    );
     sink.set_tolerance(tolerance);
     source.paint_into(&mut sink);
     sink.finish_picture()
@@ -901,6 +971,7 @@ impl SkiaGpuRendererState {
         let mut sink = SkCanvasSink::new_with_caches(
             surface.canvas(),
             Some(self.caches.image_cache()),
+            self.caches.picture_cache(),
             self.caches.mask_cache(),
             self.caches.font_cache(),
         );
@@ -989,6 +1060,7 @@ impl SkiaRenderer {
             height,
             self.state.tolerance,
             self.state.caches.image_cache(),
+            self.state.caches.picture_cache(),
             self.state.caches.font_cache(),
         )
     }
@@ -1156,6 +1228,7 @@ impl ImageRenderer for SkiaRenderer {
             target.height,
             self.state.tolerance,
             self.state.caches.image_cache(),
+            self.state.caches.picture_cache(),
             self.state.caches.font_cache(),
         )
         .map_err(map_image_renderer_error)?;
@@ -1802,6 +1875,7 @@ fn brush_to_paint(
     opacity: f32,
     paint_xf: Affine,
     image_cache: Option<&Rc<RefCell<ImageCache>>>,
+    picture_cache: Option<&Rc<RefCell<PictureCache>>>,
 ) -> Option<sk::Paint> {
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
@@ -1922,15 +1996,31 @@ fn brush_to_paint(
             }
         }
         BrushRef::Image(image_brush) => {
-            let image = skia_image_from_peniko(image_brush.image, image_cache)?;
-            let shader = image.to_shader(
-                Some((
-                    tile_mode_from_extend(image_brush.sampler.x_extend),
-                    tile_mode_from_extend(image_brush.sampler.y_extend),
-                )),
-                sampling_options_from_quality(image_brush.sampler.quality),
-                Some(&affine_to_matrix(paint_xf)),
-            )?;
+            let tile_modes = Some((
+                tile_mode_from_extend(image_brush.sampler.x_extend),
+                tile_mode_from_extend(image_brush.sampler.y_extend),
+            ));
+            let shader = match image_brush.image {
+                ImageRef::Raster(image) => skia_image_from_peniko(image, image_cache)?.to_shader(
+                    tile_modes,
+                    sampling_options_from_quality(image_brush.sampler.quality),
+                    Some(&affine_to_matrix(paint_xf)),
+                )?,
+                ImageRef::Scene(scene) => {
+                    let picture = skia_picture_from_scene(scene.picture(), picture_cache)?;
+                    picture.to_shader(
+                        tile_modes,
+                        filter_mode_from_quality(image_brush.sampler.quality),
+                        Some(&affine_to_matrix(paint_xf)),
+                        Some(&sk::Rect::new(
+                            0.0,
+                            0.0,
+                            scene.width() as f32,
+                            scene.height() as f32,
+                        )),
+                    )
+                }
+            };
             paint.set_shader(shader);
             paint.set_alpha_f((image_brush.sampler.alpha * alpha_scale).clamp(0.0, 1.0));
         }
@@ -1947,6 +2037,22 @@ fn skia_image_from_peniko(
         Some(image_cache) => image_cache.borrow_mut().get_or_create(image),
         None => make_skia_image_from_peniko(image),
     }
+}
+
+fn skia_picture_from_scene(
+    scene_picture: &ScenePicture,
+    picture_cache: Option<&Rc<RefCell<PictureCache>>>,
+) -> Option<sk::Picture> {
+    match picture_cache {
+        Some(picture_cache) => picture_cache.borrow_mut().get_or_create(scene_picture),
+        None => make_skia_picture_from_scene(scene_picture),
+    }
+}
+
+fn make_skia_picture_from_scene(scene_picture: &ScenePicture) -> Option<sk::Picture> {
+    let mut sink = SkPictureRecorderSink::new(scene_picture.bounds());
+    replay(scene_picture.scene(), &mut sink);
+    sink.finish_picture().ok()
 }
 
 fn make_skia_image_from_peniko(image: &ImageData) -> Option<sk::Image> {
@@ -1977,6 +2083,13 @@ fn sampling_options_from_quality(quality: ImageQuality) -> sk::SamplingOptions {
         ImageQuality::Low => sk::SamplingOptions::from(sk::FilterMode::Nearest),
         ImageQuality::Medium => sk::SamplingOptions::from(sk::FilterMode::Linear),
         ImageQuality::High => sk::SamplingOptions::from(sk::CubicResampler::mitchell()),
+    }
+}
+
+fn filter_mode_from_quality(quality: ImageQuality) -> sk::FilterMode {
+    match quality {
+        ImageQuality::Low => sk::FilterMode::Nearest,
+        ImageQuality::Medium | ImageQuality::High => sk::FilterMode::Linear,
     }
 }
 
@@ -2082,13 +2195,13 @@ fn build_filter_chain(filters: &[Filter]) -> Option<sk::ImageFilter> {
 mod tests {
     use super::*;
     use imaging::{
-        GroupRef, MaskMode, Painter,
+        Brush, GroupRef, ImageBrush, MaskMode, Painter, SceneImage,
         record::Glyph,
         render::{ImageBufferTarget, ImageTargetError},
     };
     use kurbo::Rect;
     use peniko::{
-        Blob, Brush, Color, Fill, FontData, ImageAlphaType, ImageData, ImageFormat, Style,
+        Blob, Color, Extend, Fill, FontData, ImageAlphaType, ImageData, ImageFormat, Style,
     };
     use std::sync::{Arc, OnceLock};
     #[cfg(feature = "gpu")]
@@ -2148,7 +2261,7 @@ mod tests {
     }
 
     fn image_scene() -> Scene {
-        let brush = Brush::Image(peniko::ImageBrush::new(test_image()));
+        let brush = Brush::Image(ImageBrush::from(test_image()));
         let mut scene = Scene::new();
         {
             let mut painter = Painter::new(&mut scene);
@@ -2223,6 +2336,45 @@ mod tests {
 
         renderer.clear_cached_images();
         assert_eq!(renderer.caches.image_cache().borrow().len(), 0);
+    }
+
+    #[test]
+    fn scene_image_brush_reflects_in_skia() {
+        let mut source = Scene::new();
+        {
+            let mut painter = Painter::new(&mut source);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                Color::from_rgb8(0xff, 0x00, 0x00),
+            );
+            painter.fill_rect(
+                Rect::new(1.0, 0.0, 2.0, 1.0),
+                Color::from_rgb8(0x00, 0xff, 0x00),
+            );
+        }
+
+        let scene_image = SceneImage::new(source, 2, 1);
+        let brush = Brush::Image(
+            ImageBrush::from(scene_image)
+                .with_extend(Extend::Reflect)
+                .with_quality(ImageQuality::Low),
+        );
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 4.0, 1.0), &brush).draw();
+        }
+
+        let mut renderer = SkiaCpuRenderer::new();
+        let image = renderer.render_scene(&scene, 4, 1).unwrap();
+        assert_eq!(
+            &image.data[..16],
+            &[
+                0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00,
+                0x00, 0xff
+            ]
+        );
     }
 
     #[test]

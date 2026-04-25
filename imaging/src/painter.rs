@@ -6,11 +6,12 @@
 use core::borrow::Borrow;
 
 use kurbo::{Affine, BezPath, CubicBez, Line, QuadBez, Rect, RoundedRect, Stroke, Vec2};
-use peniko::{BrushRef, ImageBrushRef, Style};
+use peniko::Style;
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GeometryRef, GlyphRunRef,
-    GroupRef, MaskMode, NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef, record,
+    BlurredRoundedRect, BrushRef, ClipRef, Composite, ContextRef, FillRef, GeometryRef,
+    GlyphRunRef, GroupRef, ImageBrushRef, MaskMode, NormalizedCoord, PaintSink, ScenePicture,
+    SourceLocationRef, StrokeRef, record,
 };
 
 const DEFAULT_SHAPE_TOLERANCE: f64 = 0.1;
@@ -244,10 +245,15 @@ where
         let rect = Rect::new(
             0.0,
             0.0,
-            image.image.width as f64,
-            image.image.height as f64,
+            image.image.width() as f64,
+            image.image.height() as f64,
         );
         self.fill(rect, image).transform(transform).draw();
+    }
+
+    /// Replay a retained scene picture with the given transform.
+    pub fn draw_scene_picture(&mut self, picture: &ScenePicture, transform: Affine) {
+        self.sink.scene_picture(picture, transform);
     }
 
     /// Push a context annotation onto the context stack.
@@ -494,7 +500,7 @@ mod tests {
     use kurbo::{Circle, Point, Shape as _, Vec2};
     use peniko::Fill;
 
-    use crate::{BlurredRoundedRect, GroupRef};
+    use crate::{BlurredRoundedRect, GroupRef, ScenePicture};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -602,10 +608,38 @@ mod tests {
             &record::Draw::Fill {
                 transform,
                 fill_rule: Fill::NonZero,
-                brush: peniko::Brush::Image(peniko::ImageBrush::new(image)),
+                brush: crate::Brush::Image(crate::ImageBrush::from(image)),
                 brush_transform: None,
                 shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
                 composite: Composite::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn draw_scene_picture_records_retained_picture_draw() {
+        let mut source = record::Scene::new();
+        source.draw(record::Draw::Fill {
+            transform: Affine::IDENTITY,
+            fill_rule: Fill::NonZero,
+            brush: crate::Brush::Solid(peniko::Color::WHITE),
+            brush_transform: None,
+            shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 3.0)),
+            composite: Composite::default(),
+        });
+        let picture = ScenePicture::new(source, Rect::new(4.0, 5.0, 14.0, 16.0));
+
+        let mut scene = record::Scene::new();
+        let mut painter = Painter::new(&mut scene);
+        let transform = Affine::translate((8.0, 9.0));
+
+        painter.draw_scene_picture(&picture, transform);
+
+        assert_eq!(
+            scene.draw_op(record::DrawId(0)),
+            &record::Draw::ScenePicture {
+                transform,
+                picture: picture.clone(),
             }
         );
     }
@@ -616,7 +650,7 @@ mod tests {
         source.draw(record::Draw::Fill {
             transform: Affine::IDENTITY,
             fill_rule: Fill::NonZero,
-            brush: peniko::Brush::Solid(peniko::Color::WHITE),
+            brush: crate::Brush::Solid(peniko::Color::WHITE),
             brush_transform: None,
             shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 3.0)),
             composite: Composite::default(),
