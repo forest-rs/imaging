@@ -21,57 +21,26 @@
 //! retained payloads.
 //!
 //! ```rust
-//! use imaging::{
-//!     BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, StrokeRef,
-//! };
+//! use imaging::{record::Scene, Painter};
 //! use kurbo::Rect;
 //! use peniko::Color;
 //!
-//! #[derive(Default)]
-//! struct CountingSink {
-//!     fills: usize,
-//!     clips: usize,
-//! }
-//!
-//! impl PaintSink for CountingSink {
-//!     fn push_clip(&mut self, _clip: ClipRef<'_>) {
-//!         self.clips += 1;
-//!     }
-//!
-//!     fn pop_clip(&mut self) {}
-//!
-//!     fn push_group(&mut self, _group: GroupRef<'_>) {}
-//!
-//!     fn pop_group(&mut self) {}
-//!
-//!     fn fill(&mut self, _draw: FillRef<'_>) {
-//!         self.fills += 1;
-//!     }
-//!
-//!     fn stroke(&mut self, _draw: StrokeRef<'_>) {}
-//!
-//!     fn glyph_run(
-//!         &mut self,
-//!         _draw: GlyphRunRef<'_>,
-//!         _glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
-//!     ) {}
-//!
-//!     fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
-//! }
-//!
-//! let mut sink = CountingSink::default();
+//! let mut scene = Scene::new();
 //!
 //! {
-//!     let mut painter = Painter::new(&mut sink);
+//!     let mut painter = Painter::new(&mut scene);
 //!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
 //!     painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |p| {
 //!         p.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
 //!     });
 //! }
 //!
-//! assert_eq!(sink.fills, 2);
-//! assert_eq!(sink.clips, 1);
+//! scene.validate()?;
+//! # Ok::<(), imaging::record::ValidateError>(())
 //! ```
+//!
+//! For a complete custom [`PaintSink`] implementation, see
+//! `imaging_examples/examples/counting_sink.rs`.
 //!
 //! # Recording
 //!
@@ -103,6 +72,8 @@
 //! Low-level retained payloads like [`record::Draw`], [`record::Clip`], and [`record::Group`] are
 //! also public under [`record`] when you need exact control over the recorded representation.
 //!
+//! If you are new to the crate, start with [`guide::learning_path`].
+//!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 
 #![no_std]
@@ -114,6 +85,22 @@ use kurbo::{Affine, Rect};
 use peniko::BlendMode;
 
 pub mod diagnostics;
+#[cfg(doc)]
+pub mod guide {
+    //! Short guides for learning the crate.
+    //!
+    //! These pages are built for rustdoc and docs.rs. They keep the conceptual material close to
+    //! the public API without adding anything to normal builds.
+
+    #[doc = include_str!("guide/learning_path.md")]
+    pub mod learning_path {}
+
+    #[doc = include_str!("guide/mental_model.md")]
+    pub mod mental_model {}
+
+    #[doc = include_str!("guide/backends.md")]
+    pub mod backends {}
+}
 mod paint;
 mod painter;
 pub mod record;

@@ -1,0 +1,19 @@
+[package]
+name = "imaging_examples"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Small learning examples for the imaging command stream."
+publish = false
+
+[dependencies]
+image = { features = ["png"], workspace = true }
+imaging = { features = ["std"], workspace = true }
+imaging_vello_cpu = { features = ["std"], workspace = true }
+kurbo = { default-features = true, workspace = true }
+peniko = { default-features = true, workspace = true }
+
+[lints]
+workspace = true

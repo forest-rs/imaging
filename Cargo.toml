@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "imaging",
     "imaging_conformance",
+    "imaging_examples",
     "imaging_skia",
     "imaging_snapshot_tests",
     "imaging_tiny_skia",
