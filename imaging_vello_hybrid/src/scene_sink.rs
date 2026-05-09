@@ -165,6 +165,8 @@ impl<'a> VelloHybridSceneSink<'a> {
             return;
         };
         self.scene.set_transform(glyph_run.transform);
+        self.scene
+            .set_paint_transform(glyph_run.brush_transform.unwrap_or(Affine::IDENTITY));
         self.scene.set_blend_mode(glyph_run.composite.blend);
         self.scene.set_paint(paint);
 

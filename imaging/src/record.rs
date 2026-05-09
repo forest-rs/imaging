@@ -251,6 +251,10 @@ pub struct GlyphRun {
     pub transform: Affine,
     /// Optional per-glyph transform applied before the glyph offset translation.
     pub glyph_transform: Option<Affine>,
+    /// Optional brush-space transform applied after the global run transform.
+    ///
+    /// This affects transformed brushes such as gradients and images; solid colors ignore it.
+    pub brush_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
     /// Synthetic embolden amount applied to glyph outlines in X/Y device units.
@@ -277,6 +281,7 @@ impl GlyphRun {
             font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
+            brush_transform: None,
             font_size: 16.0,
             font_embolden: Vec2::ZERO,
             hint: false,
@@ -907,6 +912,7 @@ mod tests {
             font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
+            brush_transform: None,
             font_size: 12.0,
             font_embolden: Vec2::ZERO,
             hint: false,

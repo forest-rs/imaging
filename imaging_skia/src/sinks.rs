@@ -317,7 +317,7 @@ fn draw_glyph_run(
     let Some(mut sk_paint) = brush_to_paint(
         glyph_run.brush,
         glyph_run.composite.alpha,
-        Affine::IDENTITY,
+        glyph_run.brush_transform.unwrap_or(Affine::IDENTITY),
         image_cache,
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));

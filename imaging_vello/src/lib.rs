@@ -154,6 +154,8 @@ pub enum Error {
     UnsupportedMask,
     /// Glyph draws with non-default blend modes are not supported by this backend yet.
     UnsupportedGlyphBlend,
+    /// Glyph brush transforms are not supported until Vello exposes them on glyph runs.
+    UnsupportedGlyphBrushTransform,
     /// Blurred rounded rect draws with non-default blend modes are not supported by this backend yet.
     UnsupportedBlurredRoundedRectBlend,
     /// The clip/group stack was not well-nested for this backend.
@@ -480,6 +482,9 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         }
         Error::UnsupportedMask => TextureRendererError::Unsupported(RenderUnsupportedError::Mask),
         Error::UnsupportedGlyphBlend => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::Glyph)
+        }
+        Error::UnsupportedGlyphBrushTransform => {
             TextureRendererError::Unsupported(RenderUnsupportedError::Glyph)
         }
         Error::UnsupportedBlurredRoundedRectBlend => {

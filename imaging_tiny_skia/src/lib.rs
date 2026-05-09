@@ -3596,13 +3596,13 @@ fn draw_brushed_glyphs_into_layer<'a>(
             f64::from(mask_bounds.height()),
         ),
     );
+    let brush_transform =
+        Affine::translate((f64::from(mask_bounds.x()), f64::from(mask_bounds.y())))
+            * run.brush_transform.unwrap_or(Affine::IDENTITY);
     content_layer.fill_with_brush_transform_and_mode(
         &canvas_rect,
         run.brush,
-        Some(Affine::translate((
-            f64::from(mask_bounds.x()),
-            f64::from(mask_bounds.y()),
-        ))),
+        Some(brush_transform),
         1.0,
         TinyBlendMode::SourceOver,
     );

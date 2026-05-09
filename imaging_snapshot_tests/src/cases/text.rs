@@ -77,6 +77,54 @@ impl SnapshotCase for GmGlyphRunsGradientFill {
     }
 }
 
+pub(super) struct GmGlyphRunsGradientBrushTransform;
+
+impl SnapshotCase for GmGlyphRunsGradientBrushTransform {
+    fn name(&self) -> &'static str {
+        "gm_glyph_runs_gradient_brush_transform"
+    }
+
+    fn supports_backend(&self, backend: &str) -> bool {
+        matches!(backend, "skia" | "tiny_skia" | "vello_cpu" | "vello_hybrid")
+    }
+
+    fn skia_max_diff_pixels(&self) -> u64 {
+        8
+    }
+
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
+        background(sink, width, height, Color::from_rgba8(247, 241, 232, 255));
+        let mut painter = Painter::new(sink);
+        let font = test_font();
+        let glyphs = glyphs_for_text(&font, 42.0, "GRAD");
+        // The gradient starts to the right of the text. Without a brush transform,
+        // pad extension clamps the whole run to red; with the transform below, the
+        // gradient is translated over the glyphs and becomes visibly red-green-blue.
+        let brush = Brush::Gradient(
+            peniko::Gradient::new_linear((200.0, 0.0), (320.0, 0.0)).with_stops([
+                (0.0, Color::from_rgba8(196, 42, 38, 255)),
+                (0.5, Color::from_rgba8(76, 168, 63, 255)),
+                (1.0, Color::from_rgba8(42, 80, 176, 255)),
+            ]),
+        );
+        let style = Style::Fill(Fill::NonZero);
+
+        painter
+            .glyphs(&font, &brush)
+            .transform(Affine::translate((18.0, height * 0.42)))
+            .font_size(42.0)
+            .hint(true)
+            .draw(&style, &glyphs);
+        painter
+            .glyphs(&font, &brush)
+            .transform(Affine::translate((18.0, height * 0.72)))
+            .brush_transform(Some(Affine::translate((-200.0, 0.0))))
+            .font_size(42.0)
+            .hint(true)
+            .draw(&style, &glyphs);
+    }
+}
+
 pub(super) struct GmGlyphRunsEmbolden;
 
 impl SnapshotCase for GmGlyphRunsEmbolden {

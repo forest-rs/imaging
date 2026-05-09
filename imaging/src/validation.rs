@@ -480,6 +480,9 @@ where
             && glyph_run.glyph_transform.as_ref().is_none_or(|transform| {
                 self.validate_affine("GlyphRun::glyph_transform", transform)
             })
+            && glyph_run.brush_transform.as_ref().is_none_or(|transform| {
+                self.validate_affine("GlyphRun::brush_transform", transform)
+            })
             && font_size_ok
             && glyphs_ok
             && self.validate_brush(glyph_run.brush)
@@ -791,6 +794,7 @@ mod tests {
                 font: &font,
                 transform: Affine::IDENTITY,
                 glyph_transform: None,
+                brush_transform: None,
                 font_size: -1.0,
                 font_embolden: kurbo::Vec2::ZERO,
                 hint: false,
@@ -805,6 +809,32 @@ mod tests {
             sink.first_error(),
             Some(&ValidationError::InvalidGlyphRun {
                 what: "GlyphRun::font_size",
+            })
+        );
+    }
+
+    #[test]
+    fn glyph_runs_validate_brush_transform() {
+        let inner = Scene::new();
+        let mut sink = ValidatingSink::new(inner);
+        let font = FontData::new(Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
+        let style = peniko::Style::Fill(Fill::NonZero);
+        let glyphs = vec![Glyph {
+            id: 1,
+            x: 0.0,
+            y: 0.0,
+        }];
+        let paint = Brush::Solid(Color::BLACK);
+        sink.glyph_run(
+            GlyphRunRef::new(&font, &style, &paint)
+                .brush_transform(Some(Affine::translate((f64::NAN, 0.0)))),
+            &mut glyphs.into_iter(),
+        );
+
+        assert_eq!(
+            sink.first_error(),
+            Some(&ValidationError::NonFinite {
+                what: "GlyphRun::brush_transform"
             })
         );
     }

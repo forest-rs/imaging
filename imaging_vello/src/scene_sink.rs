@@ -124,6 +124,10 @@ impl<'a> VelloSceneSink<'a> {
             self.set_error_once(Error::UnsupportedGlyphBlend);
             return;
         }
+        if glyph_run.brush_transform.is_some() {
+            self.set_error_once(Error::UnsupportedGlyphBrushTransform);
+            return;
+        }
 
         let Some(paint) = self.brush_to_brush(glyph_run.brush, glyph_run.composite) else {
             return;
@@ -528,7 +532,8 @@ impl PaintSink for VelloSceneSink<'_> {
 mod tests {
     use super::*;
     use imaging::{Filter, MaskMode, MaskRef};
-    use peniko::Color;
+    use peniko::{Blob, Color, Fill, FontData, Style};
+    use std::sync::Arc;
 
     #[test]
     fn vello_scene_sink_reports_unbalanced_layer_stack() {
@@ -544,6 +549,30 @@ mod tests {
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+    }
+
+    #[test]
+    fn vello_scene_sink_rejects_glyph_brush_transforms_until_vello_supports_them() {
+        let font = FontData::new(Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
+        let style = Style::Fill(Fill::NonZero);
+        let mut glyphs = [imaging::record::Glyph {
+            id: 1,
+            x: 0.0,
+            y: 0.0,
+        }]
+        .into_iter();
+
+        let mut scene = vello::Scene::new();
+        let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
+        sink.glyph_run(
+            GlyphRunRef::new(&font, &style, Color::BLACK)
+                .brush_transform(Some(Affine::translate((-200.0, 0.0)))),
+            &mut glyphs,
+        );
+        assert!(matches!(
+            sink.finish(),
+            Err(Error::UnsupportedGlyphBrushTransform)
+        ));
     }
 
     #[test]

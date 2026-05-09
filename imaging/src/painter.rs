@@ -205,6 +205,7 @@ where
     /// Defaults:
     /// - run transform: [`Affine::IDENTITY`]
     /// - per-glyph transform: `None`
+    /// - brush transform: `None`
     /// - font size: `16.0`
     /// - hinting: `false`
     /// - normalized variation coordinates: `&[]`
@@ -219,6 +220,7 @@ where
             font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
+            brush_transform: None,
             font_size: 16.0,
             font_embolden: Vec2::ZERO,
             hint: false,
@@ -867,6 +869,7 @@ pub struct GlyphRunBuilder<'a, S: ?Sized> {
     font: &'a peniko::FontData,
     transform: Affine,
     glyph_transform: Option<Affine>,
+    brush_transform: Option<Affine>,
     font_size: f32,
     font_embolden: Vec2,
     hint: bool,
@@ -888,6 +891,12 @@ where
     /// Set the per-glyph transform.
     pub fn glyph_transform(mut self, glyph_transform: Option<Affine>) -> Self {
         self.glyph_transform = glyph_transform;
+        self
+    }
+
+    /// Set the optional brush-space transform.
+    pub fn brush_transform(mut self, brush_transform: Option<Affine>) -> Self {
+        self.brush_transform = brush_transform;
         self
     }
 
@@ -933,6 +942,7 @@ where
                 font: self.font,
                 transform: self.transform,
                 glyph_transform: self.glyph_transform,
+                brush_transform: self.brush_transform,
                 font_size: self.font_size,
                 font_embolden: self.font_embolden,
                 hint: self.hint,

@@ -114,6 +114,7 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &text::GmGlyphRuns,
     &text::GmGlyphRunsEmbolden,
     &text::GmGlyphRunsGradientFill,
+    &text::GmGlyphRunsGradientBrushTransform,
     &text::GmGlyphRunsGradientStroke,
     &text::GmGlyphRunsImageFill,
     &text::GmGlyphRunsImageStroke,

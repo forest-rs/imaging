@@ -409,6 +409,8 @@ impl VelloCpuRenderer {
             return;
         };
         self.ctx.set_transform(glyph_run.transform);
+        self.ctx
+            .set_paint_transform(glyph_run.brush_transform.unwrap_or(Affine::IDENTITY));
         self.ctx.set_paint(paint);
         self.ctx.set_blend_mode(glyph_run.composite.blend);
 

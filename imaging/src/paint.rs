@@ -570,6 +570,10 @@ pub struct GlyphRunRef<'a> {
     pub transform: Affine,
     /// Optional per-glyph transform applied before the glyph offset translation.
     pub glyph_transform: Option<Affine>,
+    /// Optional brush-space transform applied after the global run transform.
+    ///
+    /// This affects transformed brushes such as gradients and images; solid colors ignore it.
+    pub brush_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
     /// Synthetic embolden amount applied to glyph outlines in X/Y device units.
@@ -592,6 +596,7 @@ impl<'a> GlyphRunRef<'a> {
     /// Defaults:
     /// - run transform: [`Affine::IDENTITY`]
     /// - per-glyph transform: `None`
+    /// - brush transform: `None`
     /// - font size: `16.0`
     /// - hinting: `false`
     /// - normalized variation coordinates: `&[]`
@@ -606,6 +611,7 @@ impl<'a> GlyphRunRef<'a> {
             font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
+            brush_transform: None,
             font_size: 16.0,
             font_embolden: Vec2::ZERO,
             hint: false,
@@ -616,6 +622,13 @@ impl<'a> GlyphRunRef<'a> {
         }
     }
 
+    /// Set the optional brush-space transform.
+    #[must_use]
+    pub fn brush_transform(mut self, brush_transform: Option<Affine>) -> Self {
+        self.brush_transform = brush_transform;
+        self
+    }
+
     /// Convert a borrowed glyph run into an owned [`GlyphRun`].
     #[must_use]
     pub fn to_owned(self, glyphs: impl IntoIterator<Item = Glyph>) -> GlyphRun {
@@ -623,6 +636,7 @@ impl<'a> GlyphRunRef<'a> {
             font: self.font.clone(),
             transform: self.transform,
             glyph_transform: self.glyph_transform,
+            brush_transform: self.brush_transform,
             font_size: self.font_size,
             font_embolden: self.font_embolden,
             hint: self.hint,
@@ -821,6 +835,7 @@ impl GlyphRun {
             font: &self.font,
             transform: self.transform,
             glyph_transform: self.glyph_transform,
+            brush_transform: self.brush_transform,
             font_size: self.font_size,
             font_embolden: self.font_embolden,
             hint: self.hint,
@@ -1095,6 +1110,7 @@ mod tests {
         let draw = GlyphRunRef {
             transform: Affine::translate((1.0, 2.0)),
             glyph_transform: Some(Affine::translate((3.0, 4.0))),
+            brush_transform: Some(Affine::translate((7.0, 8.0))),
             font_size: 12.0,
             font_embolden: Vec2::new(0.5, 1.5),
             ..draw
@@ -1105,6 +1121,10 @@ mod tests {
         assert_eq!(
             transformed.glyph_transform,
             Some(Affine::translate((3.0, 4.0)))
+        );
+        assert_eq!(
+            transformed.brush_transform,
+            Some(Affine::translate((7.0, 8.0)))
         );
     }
 
@@ -1147,6 +1167,7 @@ mod tests {
             font,
             transform: Affine::translate((19.0, 20.0)),
             glyph_transform: Some(Affine::translate((21.0, 22.0))),
+            brush_transform: Some(Affine::translate((11.0, 12.0))),
             font_size: 12.0,
             font_embolden: Vec2::new(1.0, 2.0),
             hint: false,
@@ -1228,6 +1249,10 @@ mod tests {
                 assert_eq!(
                     glyph_run.glyph_transform,
                     Some(Affine::translate((21.0, 22.0)))
+                );
+                assert_eq!(
+                    glyph_run.brush_transform,
+                    Some(Affine::translate((11.0, 12.0)))
                 );
                 assert_eq!(glyph_run.brush, Brush::Solid(peniko::Color::BLACK));
             }
