@@ -33,6 +33,11 @@ pub struct SvgDocument {
 }
 
 impl SvgDocument {
+    /// Parse an SVG document from [`usvg::Tree`].
+    pub fn from_tree(tree: usvg::Tree) -> Self {
+        Self { tree }
+    }
+
     /// Parse an SVG document from raw bytes.
     pub fn from_data(data: &[u8], options: &ParseOptions<'_>) -> Result<Self, Error> {
         Ok(Self {
