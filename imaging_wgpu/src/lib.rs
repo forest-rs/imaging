@@ -98,8 +98,6 @@ pub enum TextureRendererError {
     Content(imaging::render::RenderContentError),
     /// Caller target-related failure.
     Target(TextureTargetError),
-    /// Unsupported-feature failure.
-    Unsupported(imaging::render::RenderUnsupportedError),
     /// Backend-specific rendering error.
     Backend(Box<dyn core::error::Error + Send + Sync + 'static>),
 }
@@ -117,7 +115,6 @@ impl core::fmt::Display for TextureRendererError {
         match self {
             Self::Content(error) => core::fmt::Display::fmt(error, f),
             Self::Target(error) => core::fmt::Display::fmt(error, f),
-            Self::Unsupported(error) => core::fmt::Display::fmt(error, f),
             Self::Backend(error) => core::fmt::Display::fmt(error, f),
         }
     }
@@ -128,7 +125,6 @@ impl core::error::Error for TextureRendererError {
         match self {
             Self::Content(error) => Some(error),
             Self::Target(error) => Some(error),
-            Self::Unsupported(error) => Some(error),
             Self::Backend(error) => Some(error.as_ref()),
         }
     }

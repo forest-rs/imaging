@@ -123,7 +123,7 @@ use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
 use imaging::render::{
     GpuReadbackError, ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError,
-    ImageTargetError, RenderContentError, RenderSource, RenderUnsupportedError,
+    ImageTargetError, RenderContentError, RenderSource,
 };
 use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError, TextureViewTarget};
 use kurbo::Rect;
@@ -146,16 +146,6 @@ pub use scene_sink::VelloSceneSink;
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
-    /// A filter configuration could not be translated.
-    UnsupportedFilter,
-    /// A mask mode or masking primitive is not supported by this backend.
-    UnsupportedMask,
-    /// Glyph draws with non-default blend modes are not supported by this backend yet.
-    UnsupportedGlyphBlend,
-    /// Blurred rounded rect draws with non-default blend modes are not supported by this backend yet.
-    UnsupportedBlurredRoundedRectBlend,
     /// The clip/group stack was not well-nested for this backend.
     ///
     /// Vello uses a single layer stack for both clipping and blending; `imaging` tracks these as
@@ -472,22 +462,6 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
-        }
-        Error::UnsupportedFilter => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::Filter)
-        }
-        Error::UnsupportedMask => TextureRendererError::Unsupported(RenderUnsupportedError::Mask),
-        Error::UnsupportedGlyphBlend => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::Glyph)
-        }
-        Error::UnsupportedBlurredRoundedRectBlend => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::BlurredRoundedRect)
-        }
-        Error::UnbalancedLayerStack => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::UnbalancedLayerStack)
-        }
         Error::Internal("render width too large" | "render height too large") => {
             TextureRendererError::Target(TextureTargetError::DimensionsTooLarge)
         }
@@ -522,7 +496,6 @@ fn map_texture_to_image_error(error: TextureRendererError) -> ImageRendererError
                 ))
             }
         },
-        TextureRendererError::Unsupported(error) => ImageRendererError::Unsupported(error),
         TextureRendererError::Backend(error) => ImageRendererError::Backend(error),
     }
 }

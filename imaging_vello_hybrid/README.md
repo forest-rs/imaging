@@ -15,8 +15,8 @@ This backend supports both headless image rendering and host-owned `wgpu` textur
   limited to non-image brushes.
 - Use `VelloHybridSceneSink::new` for solid/gradient-only native scene recording.
 - Use `VelloHybridSceneSink::with_renderer` for native scene recording that needs image brushes.
-- Group-level filters are currently not supported by `vello_hybrid`; `imaging_vello_hybrid`
-  returns `Error::UnsupportedFilter` if a scene uses them.
+- Group-level filters and masks currently degrade to best-effort rendering on the native-scene
+  sink paths instead of aborting the frame.
 - Workaround for vello#1408: `Compose::Copy` with a fully transparent solid paint is mapped to
   `Compose::Clear` to avoid a vello_hybrid optimization that skips generating strips for invisible
   paints.

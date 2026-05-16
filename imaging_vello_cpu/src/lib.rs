@@ -73,7 +73,7 @@ use imaging::{
     record::{Scene, ValidateError, replay, replay_transformed},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
-        RenderContentError, RenderSource, RenderUnsupportedError,
+        RenderContentError, RenderSource,
     },
 };
 use kurbo::{Affine, Rect, Shape as _};
@@ -89,10 +89,6 @@ use vello_cpu::{Pixmap, RenderContext, RenderMode, RenderSettings};
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
-    /// A filter configuration could not be translated.
-    UnsupportedFilter,
     /// An internal invariant was violated.
     Internal(&'static str),
 }
@@ -391,9 +387,6 @@ impl VelloCpuRenderer {
         }
         if let Some(out) = last {
             graph.set_output(out);
-        } else {
-            self.set_error_once(Error::UnsupportedFilter);
-            return None;
         }
         Some(VelloFilter {
             graph: Arc::new(graph),
@@ -571,10 +564,6 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         Error::InvalidScene(error) => {
             ImageRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
-        }
-        Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
         Error::Internal("image target dimensions do not match renderer output") => {
             ImageRendererError::Target(ImageTargetError::InvalidTarget(
                 "image target dimensions do not match renderer output",

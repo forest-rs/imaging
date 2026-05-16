@@ -258,9 +258,6 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
     } else {
         build_filter_chain(group.filters)
     };
-    if !group.filters.is_empty() && filter.is_none() {
-        state.set_error_once(Error::UnsupportedFilter);
-    }
 
     let clip_path = group.clip.and_then(|clip| clip_path(canvas, state, clip));
     let mut restores = 0_u8;
@@ -566,13 +563,10 @@ fn draw_masked_group(
     paint.set_anti_alias(true);
     paint.set_blend_mode(map_blend_mode(&masked.composite.blend));
     paint.set_alpha_f(masked.composite.alpha);
-    if !masked.filters.is_empty() {
-        if let Some(filter) = build_filter_chain(&masked.filters) {
-            paint.set_image_filter(filter);
-        } else {
-            state.set_error_once(Error::UnsupportedFilter);
-            return;
-        }
+    if !masked.filters.is_empty()
+        && let Some(filter) = build_filter_chain(&masked.filters)
+    {
+        paint.set_image_filter(filter);
     }
 
     let clip_path = masked

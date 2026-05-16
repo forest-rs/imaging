@@ -90,42 +90,6 @@ impl core::error::Error for RenderContentError {
     }
 }
 
-/// Shared unsupported-feature failures surfaced by renderer traits.
-#[derive(Debug)]
-pub enum RenderUnsupportedError {
-    /// An image brush was encountered on a backend that cannot render it.
-    ImageBrush,
-    /// A filter configuration could not be translated for the active backend.
-    Filter,
-    /// A mask mode or masking primitive is unsupported by the active backend.
-    Mask,
-    /// Glyph rendering requested a blend mode or transform unsupported by the active backend.
-    Glyph,
-    /// A blurred rounded-rect primitive is unsupported by the active backend.
-    BlurredRoundedRect,
-    /// The source used clip/group nesting the active backend cannot represent.
-    UnbalancedLayerStack,
-}
-
-impl core::fmt::Display for RenderUnsupportedError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::ImageBrush => f.write_str("backend does not support image brushes"),
-            Self::Filter => f.write_str("backend does not support this filter"),
-            Self::Mask => f.write_str("backend does not support this mask"),
-            Self::Glyph => f.write_str("backend does not support this glyph operation"),
-            Self::BlurredRoundedRect => {
-                f.write_str("backend does not support this blurred rounded rect operation")
-            }
-            Self::UnbalancedLayerStack => {
-                f.write_str("scene uses clip/group nesting unsupported by this backend")
-            }
-        }
-    }
-}
-
-impl core::error::Error for RenderUnsupportedError {}
-
 /// Shared GPU readback failures surfaced by image renderers.
 #[derive(Debug)]
 pub enum GpuReadbackError {
@@ -222,8 +186,6 @@ pub enum ImageRendererError {
     Content(RenderContentError),
     /// Caller target-related failure.
     Target(ImageTargetError),
-    /// Unsupported-feature failure.
-    Unsupported(RenderUnsupportedError),
     /// GPU readback failure.
     Readback(GpuReadbackError),
     /// Backend-specific rendering error.
@@ -243,7 +205,6 @@ impl core::fmt::Display for ImageRendererError {
         match self {
             Self::Content(error) => core::fmt::Display::fmt(error, f),
             Self::Target(error) => core::fmt::Display::fmt(error, f),
-            Self::Unsupported(error) => core::fmt::Display::fmt(error, f),
             Self::Readback(error) => core::fmt::Display::fmt(error, f),
             Self::Backend(error) => core::fmt::Display::fmt(error, f),
         }
@@ -255,7 +216,6 @@ impl core::error::Error for ImageRendererError {
         match self {
             Self::Content(error) => Some(error),
             Self::Target(error) => Some(error),
-            Self::Unsupported(error) => Some(error),
             Self::Readback(error) => Some(error),
             Self::Backend(error) => Some(error.as_ref()),
         }

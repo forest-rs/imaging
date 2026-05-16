@@ -166,7 +166,7 @@ use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
 use imaging::render::{
     GpuReadbackError, ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError,
-    ImageTargetError, RenderContentError, RenderSource, RenderUnsupportedError,
+    ImageTargetError, RenderContentError, RenderSource,
 };
 pub use imaging_wgpu::wgpu;
 use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError, TextureViewTarget};
@@ -185,14 +185,6 @@ pub use scene_sink::VelloHybridSceneSink;
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered on a sink path that has no renderer-backed image resolver.
-    UnsupportedImageBrush,
-    /// A filter configuration could not be translated.
-    UnsupportedFilter,
-    /// Masks are not supported by this backend yet.
-    UnsupportedMask,
-    /// Blurred rounded rect draws are not supported by this backend yet.
-    UnsupportedBlurredRoundedRect,
     /// Vello hybrid returned a render error.
     Render(RenderError),
     /// An internal invariant was violated.
@@ -570,16 +562,6 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
-        }
-        Error::UnsupportedFilter => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::Filter)
-        }
-        Error::UnsupportedMask => TextureRendererError::Unsupported(RenderUnsupportedError::Mask),
-        Error::UnsupportedBlurredRoundedRect => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::BlurredRoundedRect)
-        }
         Error::Internal("render width too large" | "render height too large") => {
             TextureRendererError::Target(TextureTargetError::DimensionsTooLarge)
         }
@@ -614,7 +596,6 @@ fn map_texture_to_image_error(error: TextureRendererError) -> ImageRendererError
                 ))
             }
         },
-        TextureRendererError::Unsupported(error) => ImageRendererError::Unsupported(error),
         TextureRendererError::Backend(error) => ImageRendererError::Backend(error),
     }
 }
