@@ -56,7 +56,7 @@ impl Dx12Backend {
             memory_allocator: None,
             protected_context: sk::gpu::Protected::No,
         };
-        let context = unsafe { sk::gpu::DirectContext::new_d3d(&backend_context, None) }.ok_or(
+        let context = unsafe { sk::gpu::direct_contexts::make_d3d(&backend_context, None) }.ok_or(
             Error::CreateGpuContext("unable to create Skia D3D12 context"),
         )?;
         Ok(Self { context })
@@ -80,13 +80,14 @@ impl Dx12Backend {
         let resource: ID3D12Resource = unsafe { hal_texture.raw_resource().clone() };
         let texture_info = sk::gpu::d3d::TextureResourceInfo::from_resource(resource)
             .with_state(D3D12_RESOURCE_STATE_COMMON);
-        let backend_texture = sk::gpu::BackendTexture::new_d3d(
+        let backend_texture = sk::gpu::backend_textures::make_d3d(
             (width, height),
             &sk::gpu::d3d::TextureResourceInfo {
                 format: dxgi_format_for_wgpu_texture_format(format)?,
                 level_count: 1,
                 ..texture_info
             },
+            "imaging_skia d3d texture",
         );
         sk::gpu::surfaces::wrap_backend_texture(
             self.direct_context(),

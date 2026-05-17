@@ -1753,8 +1753,8 @@ fn tile_mode_from_extend(extend: peniko::Extend) -> sk::TileMode {
 
 fn gradient_shader_cs_from_cs_tag(
     color_space: ColorSpaceTag,
-) -> sk::gradient_shader::interpolation::ColorSpace {
-    use sk::gradient_shader::interpolation::ColorSpace as SkCs;
+) -> sk::gradient::interpolation::ColorSpace {
+    use sk::gradient::interpolation::ColorSpace as SkCs;
 
     match color_space {
         ColorSpaceTag::Srgb => SkCs::SRGB,
@@ -1775,8 +1775,8 @@ fn gradient_shader_cs_from_cs_tag(
 
 fn gradient_shader_hue_method_from_hue_direction(
     direction: HueDirection,
-) -> sk::gradient_shader::interpolation::HueMethod {
-    use sk::gradient_shader::interpolation::HueMethod as SkHue;
+) -> sk::gradient::interpolation::HueMethod {
+    use sk::gradient::interpolation::HueMethod as SkHue;
 
     match direction {
         HueDirection::Shorter => SkHue::Shorter,
@@ -1841,31 +1841,29 @@ fn brush_to_paint(
             let tile_mode = tile_mode_from_extend(grad.extend);
             let local = affine_to_matrix(paint_xf);
 
-            let interpolation = sk::gradient_shader::Interpolation {
+            let interpolation = sk::gradient::Interpolation {
                 color_space: gradient_shader_cs_from_cs_tag(grad.interpolation_cs),
                 in_premul: match grad.interpolation_alpha_space {
                     InterpolationAlphaSpace::Premultiplied => {
-                        sk::gradient_shader::interpolation::InPremul::Yes
+                        sk::gradient::interpolation::InPremul::Yes
                     }
                     InterpolationAlphaSpace::Unpremultiplied => {
-                        sk::gradient_shader::interpolation::InPremul::No
+                        sk::gradient::interpolation::InPremul::No
                     }
                 },
                 hue_method: gradient_shader_hue_method_from_hue_direction(grad.hue_direction),
             };
+            let gradient_colors =
+                sk::gradient::Colors::new(&colors[..], Some(&pos[..]), tile_mode, None);
+            let gradient = sk::gradient::Gradient::new(gradient_colors, interpolation);
 
             match &grad.kind {
                 peniko::GradientKind::Linear(line) => {
                     let p0 = sk::Point::new(f64_to_f32(line.start.x), f64_to_f32(line.start.y));
                     let p1 = sk::Point::new(f64_to_f32(line.end.x), f64_to_f32(line.end.y));
-                    if let Some(shader) = sk::gradient_shader::linear_with_interpolation(
-                        (p0, p1),
-                        (&colors[..], None),
-                        &pos[..],
-                        tile_mode,
-                        interpolation,
-                        Some(&local),
-                    ) {
+                    if let Some(shader) =
+                        sk::gradient::shaders::linear_gradient((p0, p1), &gradient, Some(&local))
+                    {
                         paint.set_shader(shader);
                     }
                 }
@@ -1879,13 +1877,10 @@ fn brush_to_paint(
                         sk::Point::new(f64_to_f32(rad.end_center.x), f64_to_f32(rad.end_center.y));
                     let end_radius = rad.end_radius;
 
-                    if let Some(shader) = sk::gradient_shader::two_point_conical_with_interpolation(
+                    if let Some(shader) = sk::gradient::shaders::two_point_conical_gradient(
                         (start_center, start_radius),
                         (end_center, end_radius),
-                        (&colors[..], None),
-                        &pos[..],
-                        tile_mode,
-                        interpolation,
+                        &gradient,
                         Some(&local),
                     ) {
                         paint.set_shader(shader);
@@ -1897,13 +1892,10 @@ fn brush_to_paint(
                     // `peniko` uses radians; Skia uses degrees for sweep gradient angles.
                     let start = rad_to_deg(sweep.start_angle);
                     let end = rad_to_deg(sweep.end_angle);
-                    if let Some(shader) = sk::gradient_shader::sweep_with_interpolation(
+                    if let Some(shader) = sk::gradient::shaders::sweep_gradient(
                         center,
-                        (&colors[..], None),
-                        Some(&pos[..]),
-                        tile_mode,
-                        Some((start, end)),
-                        interpolation,
+                        (start, end),
+                        &gradient,
                         Some(&local),
                     ) {
                         paint.set_shader(shader);
@@ -2504,6 +2496,7 @@ mod tests {
         sink.finish_picture().unwrap()
     }
 
+    #[cfg(feature = "gpu")]
     fn assert_solid_rgba_image(image: &RgbaImage, expected: [u8; 4]) {
         assert_eq!(
             image.data.len(),

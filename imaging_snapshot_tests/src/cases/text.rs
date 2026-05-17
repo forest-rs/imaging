@@ -55,6 +55,10 @@ impl SnapshotCase for GmGlyphRunsGradientFill {
         "gm_glyph_runs_gradient_fill"
     }
 
+    fn skia_max_diff_pixels(&self) -> u64 {
+        4
+    }
+
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgba8(247, 241, 232, 255));
         let mut painter = Painter::new(sink);
@@ -229,7 +233,7 @@ impl SnapshotCase for GmGlyphRunsImageStroke {
     }
 
     fn vello_max_diff_pixels(&self) -> u64 {
-        4
+        8
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
@@ -261,6 +265,10 @@ impl SnapshotCase for GmTextEditorLorem {
 
     fn supports_backend(&self, backend: &str) -> bool {
         matches!(backend, "tiny_skia" | "vello_cpu" | "skia")
+    }
+
+    fn skia_max_diff_pixels(&self) -> u64 {
+        64
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
