@@ -1060,6 +1060,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "imaging_examples"
+version = "0.0.1"
+dependencies = [
+ "image",
+ "imaging",
+ "imaging_vello_cpu",
+ "kurbo",
+ "peniko",
+]
+
+[[package]]
 name = "imaging_skia"
 version = "0.0.1"
 dependencies = [

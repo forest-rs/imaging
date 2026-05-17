@@ -4,6 +4,9 @@ Backend-agnostic 2D imaging recording + streaming API.
 
 This crate is `no_std` by default (uses `alloc`); enable the `std` feature when needed.
 
+If you are reading this on docs.rs, start with the `guide` module for the project-level learning
+path, backend map, and mental model.
+
 ## API shape
 
 `imaging` has two primary public layers:
