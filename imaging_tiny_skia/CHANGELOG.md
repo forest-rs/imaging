@@ -8,12 +8,12 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 # Changelog
 
-The latest published `imaging_tiny_skia` release is [0.0.1](#001-2026-05-18), which was released
-on 2026-05-18. You can find its changes [documented below](#001-2026-05-18).
+The latest published `imaging_tiny_skia` release is [0.0.1](#001-2026-xx-xx), which was released
+on 2026-XX-XX. You can find its changes [documented below](#001-2026-xx-xx).
 
 ## [Unreleased]
 
-## [0.0.1][] (2026-05-18)
+## [0.0.1][] (2026-XX-XX)
 
 This release has an [MSRV][] of 1.92.
 

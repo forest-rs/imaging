@@ -19,6 +19,7 @@ env:
     -p imaging_vello
     -p imaging_vello_cpu
     -p imaging_vello_hybrid
+    -p imaging_wgpu
     -p svg_imaging
   # List of packages that don't support `no_std`.
   RUST_STD_ONLY_PKGS: >-

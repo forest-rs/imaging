@@ -7,7 +7,8 @@ license.workspace = true
 repository.workspace = true
 description = "Vello CPU backend for the imaging command stream."
 readme = "README.md"
-publish = false
+keywords = ["graphics", "imaging", "rendering", "vello"]
+categories = ["graphics", "rendering"]
 
 [dependencies]
 imaging.workspace = true
@@ -31,3 +32,7 @@ libm = [
     "vello_cpu/libm",
 ]
 f32_pipeline = ["vello_cpu/f32_pipeline"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = []

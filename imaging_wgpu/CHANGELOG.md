@@ -8,18 +8,18 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 # Changelog
 
-The latest published `imaging_skia` release is [0.0.1](#001-2026-xx-xx), which was released on
-2026-XX-XX. You can find its changes [documented below](#001-2026-xx-xx).
+The latest published `imaging_wgpu` release is [0.0.1](#001-2026-05-21), which was released on
+2026-05-21. You can find its changes [documented below](#001-2026-05-21).
 
 ## [Unreleased]
 
-## [0.0.1][] (2026-XX-XX)
+## [0.0.1][] (2026-05-21)
 
 This release has an [MSRV][] of 1.92.
 
 This is the initial release.
 
-[Unreleased]: https://github.com/forest-rs/imaging/compare/imaging_skia-v0.0.1...HEAD
-[0.0.1]: https://github.com/forest-rs/imaging/releases/tag/imaging_skia-v0.0.1
+[Unreleased]: https://github.com/forest-rs/imaging/compare/imaging_wgpu-v0.0.1...HEAD
+[0.0.1]: https://github.com/forest-rs/imaging/releases/tag/imaging_wgpu-v0.0.1
 
 [MSRV]: README.md#minimum-supported-rust-version-msrv

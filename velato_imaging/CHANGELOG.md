@@ -8,12 +8,12 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 # Changelog
 
-The latest published `velato_imaging` release is [0.0.1](#001-2026-05-18), which was released on
-2026-05-18. You can find its changes [documented below](#001-2026-05-18).
+The latest published `velato_imaging` release is [0.0.1](#001-2026-05-21), which was released on
+2026-05-21. You can find its changes [documented below](#001-2026-05-21).
 
 ## [Unreleased]
 
-## [0.0.1][] (2026-05-18)
+## [0.0.1][] (2026-05-21)
 
 This release has an [MSRV][] of 1.92.
 

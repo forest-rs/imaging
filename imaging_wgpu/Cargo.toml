@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "wgpu texture rendering traits for imaging backends."
-publish = false
+readme = "README.md"
+keywords = ["graphics", "imaging", "rendering", "wgpu"]
+categories = ["graphics", "rendering"]
 
 [features]
 default = []
@@ -22,3 +24,8 @@ wgpu_28 = { default-features = false, features = ["std"], optional = true, packa
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features = ["wgpu-28"]
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
