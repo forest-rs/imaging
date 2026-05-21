@@ -233,6 +233,16 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            gpu: 'yes'
+          - os: macos-latest
+            gpu: 'yes'
+          - os: windows-latest
+            # Windows hosted runners do not provide a reliable Vello GPU runtime.
+            gpu: 'no'
+    env:
+      IMAGING_CI_GPU_SUPPORT: ${{ matrix.gpu }}
     steps:
       - uses: actions/checkout@v6
 

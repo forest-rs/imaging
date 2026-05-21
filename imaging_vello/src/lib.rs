@@ -605,6 +605,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn render_renders_encoded_scene() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -628,6 +629,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn render_source_renders_scene() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -678,6 +680,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn texture_view_render_smoke() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -721,6 +724,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn render_source_to_texture_smoke() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -767,6 +771,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn render_source_texture_returns_independent_texture() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -791,6 +796,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn render_source_into_rejects_short_row_stride_as_target_error() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -822,6 +828,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn render_source_into_rejects_short_buffer_as_target_error() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
@@ -859,6 +866,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
     fn app_owned_wgpu_renders() {
         let Ok((device, queue)) = try_init_device_and_queue() else {
             return;
