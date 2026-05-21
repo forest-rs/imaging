@@ -111,7 +111,7 @@ jobs:
     name: formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -169,7 +169,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -201,7 +201,7 @@ jobs:
     name: cargo clippy (wasm32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -233,7 +233,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install native dependencies
         if: runner.os == 'Linux'
@@ -282,7 +282,7 @@ jobs:
     name: cargo package --list
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -321,7 +321,7 @@ jobs:
     name: cargo test (wasm32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -352,7 +352,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install msrv toolchain
         uses: dtolnay/rust-toolchain@master
@@ -380,7 +380,7 @@ jobs:
     name: cargo check (msrv) (wasm32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install msrv toolchain
         uses: dtolnay/rust-toolchain@master
@@ -407,7 +407,7 @@ jobs:
     #       If we get per-platform docs (win/macos/linux/wasm32/..) then doc jobs should match that.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -437,7 +437,7 @@ jobs:
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: check typos
         uses: crate-ci/typos@v1.46.2
