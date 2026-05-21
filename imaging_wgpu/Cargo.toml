@@ -11,7 +11,7 @@ keywords = ["graphics", "imaging", "rendering", "wgpu"]
 categories = ["graphics", "rendering"]
 
 [features]
-default = []
+default = ["wgpu-28"]
 # Normal consumers should enable exactly one version feature. If both are enabled by a
 # workspace-wide `--all-features` build, the crate exports `wgpu-28` deterministically.
 wgpu-27 = ["dep:wgpu_27"]

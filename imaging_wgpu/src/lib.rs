@@ -3,7 +3,9 @@
 
 //! `wgpu` texture rendering traits for `imaging` backends.
 //!
-//! Enable exactly one of the crate features `wgpu-27` or `wgpu-28` for normal use.
+//! The default feature set enables `wgpu-28`. Consumers that need `wgpu-27` should disable
+//! default features and enable `wgpu-27`.
+//!
 //! Workspace-wide `--all-features` builds enable both, so this crate resolves that case
 //! deterministically by exporting `wgpu-28` as [`wgpu`] and keeping `wgpu-27` linked only to
 //! satisfy older dependents that may still request it transitively.

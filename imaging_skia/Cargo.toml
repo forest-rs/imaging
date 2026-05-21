@@ -7,7 +7,8 @@ license.workspace = true
 repository.workspace = true
 description = "Skia backend for the imaging command stream."
 readme = "README.md"
-publish = false
+keywords = ["graphics", "imaging", "rendering", "skia"]
+categories = ["graphics", "rendering"]
 
 [features]
 default = []
@@ -57,3 +58,8 @@ skia-safe = { version = "0.93.1", features = ["vulkan"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = []

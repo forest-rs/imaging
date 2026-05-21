@@ -124,6 +124,15 @@ assert_eq!(scene, replayed);
 Low-level retained payloads like [`record::Draw`], [`record::Clip`], and [`record::Group`] are
 also public under [`record`] when you need exact control over the recorded representation.
 
+# Feature Flags
+
+The default feature set enables `std` support in the geometry and color dependencies. For
+`no_std` builds, disable default features and enable `libm`:
+
+```toml
+imaging = { version = "0.0.1", default-features = false, features = ["libm"] }
+```
+
 The API is intentionally small and experimental; expect breaking changes while we iterate.
 
 <!-- cargo-rdme end -->
