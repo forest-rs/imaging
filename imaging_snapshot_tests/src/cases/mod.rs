@@ -101,6 +101,10 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &gradients::GmGradientsSweep,
     &gradients::GmGradientsTwoPointRadial,
     &images::GmImageBrushes,
+    // Keep the Vello GPU glyph image-brush snapshots adjacent to the image-brush
+    // case until the Vello 0.9 atlas invalidation fix is released.
+    &text::GmGlyphRunsImageFill,
+    &text::GmGlyphRunsImageStroke,
     &masks::GmMaskAlpha,
     &masks::GmMaskLuminance,
     &clips::GmClipNonIsolated,
@@ -116,8 +120,6 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &text::GmGlyphRunsGradientFill,
     &text::GmGlyphRunsGradientBrushTransform,
     &text::GmGlyphRunsGradientStroke,
-    &text::GmGlyphRunsImageFill,
-    &text::GmGlyphRunsImageStroke,
     &text::GmTextEditorLorem,
     &svg::GmSvgLayeredCard,
     &svg::GmSvgLuminanceMask,

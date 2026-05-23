@@ -274,20 +274,26 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo nextest run -p imaging_snapshot_tests --locked --all-features --no-fail-fast
 
+      - name: cargo nextest (imaging_vello, vello-0-7)
+        run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-7 --no-fail-fast
+
       - name: cargo nextest (imaging_vello, vello-0-8)
         run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-8 --no-fail-fast
 
-      - name: cargo nextest (imaging_vello, vello-0-7)
-        run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-7 --no-fail-fast
+      - name: cargo nextest (imaging_vello, vello-0-9)
+        run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-9 --no-fail-fast
 
       - name: cargo test --doc
         run: cargo test --doc ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} --workspace --locked --all-features --no-fail-fast
 
+      - name: cargo test --doc (imaging_vello, vello-0-7)
+        run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-7 --no-fail-fast
+
       - name: cargo test --doc (imaging_vello, vello-0-8)
         run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-8 --no-fail-fast
 
-      - name: cargo test --doc (imaging_vello, vello-0-7)
-        run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-7 --no-fail-fast
+      - name: cargo test --doc (imaging_vello, vello-0-9)
+        run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-9 --no-fail-fast
 
   package:
     name: cargo package --list
@@ -434,13 +440,18 @@ jobs:
         env:
           RUSTDOCFLAGS: '--cfg docsrs -D warnings'
 
-      - name: cargo doc (imaging_vello, vello-0-8)
-        run: cargo doc -p imaging_vello --locked --no-default-features --features vello-0-8 --no-deps --document-private-items
+      - name: cargo doc (imaging_vello, vello-0-9)
+        run: cargo doc -p imaging_vello --locked --no-default-features --features vello-0-9 --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: '--cfg docsrs -D warnings'
 
       - name: cargo doc (imaging_vello, vello-0-7)
         run: cargo doc -p imaging_vello --locked --no-default-features --features vello-0-7 --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: '--cfg docsrs -D warnings'
+
+      - name: cargo doc (imaging_vello, vello-0-8)
+        run: cargo doc -p imaging_vello --locked --no-default-features --features vello-0-8 --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: '--cfg docsrs -D warnings'
 

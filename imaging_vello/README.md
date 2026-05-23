@@ -32,10 +32,11 @@ Semantic [`imaging::record::Scene`] values can be lowered to native Vello scenes
 In UI integrations, the host application should usually own the `wgpu` device, queue, and
 presentation targets, then pass those handles into [`VelloRenderer`].
 
-Enable exactly one backend compatibility feature:
+Enable a Vello compatibility feature:
 
-- `vello-0-8` (default)
-- `vello-0-7`
+- `vello-0-9` (default)
+- `vello-0-8` for integrations that still use `wgpu` 28
+- `vello-0-7` for integrations that still use `wgpu` 27
 
 # Render A Recorded Scene
 

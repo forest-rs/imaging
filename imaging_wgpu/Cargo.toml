@@ -11,21 +11,23 @@ keywords = ["graphics", "imaging", "rendering", "wgpu"]
 categories = ["graphics", "rendering"]
 
 [features]
-default = ["wgpu-28"]
-# Normal consumers should enable exactly one version feature. If both are enabled by a
-# workspace-wide `--all-features` build, the crate exports `wgpu-28` deterministically.
+default = ["wgpu-29"]
+# Normal consumers should enable exactly one version feature. If multiple are enabled by a
+# workspace-wide `--all-features` build, the crate exports `wgpu-29` deterministically.
 wgpu-27 = ["dep:wgpu_27"]
 wgpu-28 = ["dep:wgpu_28"]
+wgpu-29 = ["dep:wgpu_29"]
 
 [dependencies]
 imaging = { features = ["std"], workspace = true }
 wgpu_27 = { default-features = false, features = ["std"], optional = true, package = "wgpu", version = "27.0.1" }
 wgpu_28 = { default-features = false, features = ["std"], optional = true, package = "wgpu", version = "28.0.0" }
+wgpu_29 = { default-features = false, features = ["std"], optional = true, package = "wgpu", version = "29.0.3" }
 
 [lints]
 workspace = true
 
 [package.metadata.docs.rs]
-features = ["wgpu-28"]
+features = ["wgpu-29"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = []

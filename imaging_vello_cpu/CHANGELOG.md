@@ -13,11 +13,20 @@ on 2026-05-21. You can find its changes [documented below](#001-2026-05-21).
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the backend to `vello_cpu` 0.0.9 and `vello_common` 0.0.9.
+  ([#64][] by [@waywardmonkeys][])
+
 ## [0.0.1][] (2026-05-21)
 
 This release has an [MSRV][] of 1.92.
 
 This is the initial release.
+
+[@waywardmonkeys]: https://github.com/waywardmonkeys
+
+[#64]: https://github.com/forest-rs/imaging/pull/64
 
 [Unreleased]: https://github.com/forest-rs/imaging/compare/imaging_vello_cpu-v0.0.1...HEAD
 [0.0.1]: https://github.com/forest-rs/imaging/releases/tag/imaging_vello_cpu-v0.0.1

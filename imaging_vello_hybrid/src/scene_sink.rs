@@ -3,22 +3,37 @@
 
 use super::Error;
 use crate::{VelloHybridRenderer, image_registry::HybridImageUploadSession};
+use glifo::Glyph as VelloGlyph;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
     StrokeRef,
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, BrushRef, ImageBrush, Style};
-use vello_common::glyph::Glyph as VelloGlyph;
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`vello_hybrid::Scene`].
 pub struct VelloHybridSceneSink<'a> {
     scene: &'a mut vello_hybrid::Scene,
+    resources: SceneSinkResources<'a>,
     image_upload: Option<HybridImageUploadSession<'a>>,
     tolerance: f64,
     error: Option<Error>,
     clip_depth: u32,
     group_depth: u32,
+}
+
+enum SceneSinkResources<'a> {
+    Owned(Box<vello_hybrid::Resources>),
+    Borrowed(&'a mut vello_hybrid::Resources),
+}
+
+impl SceneSinkResources<'_> {
+    fn as_mut(&mut self) -> &mut vello_hybrid::Resources {
+        match self {
+            Self::Owned(resources) => resources.as_mut(),
+            Self::Borrowed(resources) => resources,
+        }
+    }
 }
 
 impl core::fmt::Debug for VelloHybridSceneSink<'_> {
@@ -37,6 +52,7 @@ impl<'a> VelloHybridSceneSink<'a> {
     pub fn new(scene: &'a mut vello_hybrid::Scene) -> Self {
         Self {
             scene,
+            resources: SceneSinkResources::Owned(Box::new(vello_hybrid::Resources::new())),
             image_upload: None,
             tolerance: 0.1,
             error: None,
@@ -54,11 +70,23 @@ impl<'a> VelloHybridSceneSink<'a> {
         scene: &'a mut vello_hybrid::Scene,
         renderer: &'a mut VelloHybridRenderer,
     ) -> Self {
+        let state = &mut renderer.state;
+        let encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("imaging_vello_hybrid scene upload images"),
+            });
+        let image_upload = state.image_registry.begin_upload_session(
+            &mut state.resources,
+            &mut state.renderer,
+            &state.device,
+            &state.queue,
+            encoder,
+        );
         Self {
             scene,
-            image_upload: Some(
-                renderer.begin_image_upload_session("imaging_vello_hybrid scene upload images"),
-            ),
+            resources: SceneSinkResources::Borrowed(&mut state.resources),
+            image_upload: Some(image_upload),
             tolerance: 0.1,
             error: None,
             clip_depth: 0,
@@ -84,7 +112,7 @@ impl<'a> VelloHybridSceneSink<'a> {
         };
 
         if let Some(mut image_upload) = self.image_upload.take() {
-            image_upload.finish(result.is_ok());
+            image_upload.finish(self.resources.as_mut(), result.is_ok());
         }
 
         result
@@ -114,7 +142,7 @@ impl<'a> VelloHybridSceneSink<'a> {
             self.set_error_once(Error::UnsupportedImageBrush);
             return None;
         };
-        match image_upload.resolve_image_brush(image) {
+        match image_upload.resolve_image_brush(self.resources.as_mut(), image) {
             Ok(image) => Some(image),
             Err(err) => {
                 self.set_error_once(err);
@@ -169,13 +197,23 @@ impl<'a> VelloHybridSceneSink<'a> {
             .set_paint_transform(glyph_run.brush_transform.unwrap_or(Affine::IDENTITY));
         self.scene.set_blend_mode(glyph_run.composite.blend);
         self.scene.set_paint(paint);
+        // TODO: Revisit this allocation. `PaintSink` currently gives us a
+        // one-shot iterator, while glifo's glyph builders need a cloneable
+        // glyph source.
+        let glyphs = glyphs
+            .map(|glyph| VelloGlyph {
+                id: glyph.id,
+                x: glyph.x,
+                y: glyph.y,
+            })
+            .collect::<Vec<_>>();
 
         match glyph_run.style {
             Style::Fill(fill_rule) => {
                 self.scene.set_fill_rule(*fill_rule);
                 let builder = self
                     .scene
-                    .glyph_run(glyph_run.font)
+                    .glyph_run(self.resources.as_mut(), glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
@@ -184,18 +222,13 @@ impl<'a> VelloHybridSceneSink<'a> {
                 } else {
                     builder
                 };
-                let glyphs = glyphs.map(|glyph| VelloGlyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
-                builder.fill_glyphs(glyphs);
+                builder.fill_glyphs(glyphs.into_iter());
             }
             Style::Stroke(stroke) => {
                 self.scene.set_stroke(stroke.clone());
                 let builder = self
                     .scene
-                    .glyph_run(glyph_run.font)
+                    .glyph_run(self.resources.as_mut(), glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
@@ -204,12 +237,7 @@ impl<'a> VelloHybridSceneSink<'a> {
                 } else {
                     builder
                 };
-                let glyphs = glyphs.map(|glyph| VelloGlyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
-                builder.stroke_glyphs(glyphs);
+                builder.stroke_glyphs(glyphs.into_iter());
             }
         }
     }

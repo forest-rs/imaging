@@ -76,13 +76,14 @@ use imaging::{
         RenderContentError, RenderSource, RenderUnsupportedError,
     },
 };
-use kurbo::{Affine, Rect, Shape as _};
+use kurbo::{Affine, Shape as _};
 use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
-use vello_common::glyph::Glyph as VelloGlyph;
 use vello_common::paint::{Image as VelloImage, ImageSource};
 use vello_cpu::kurbo::{BezPath, StrokeOpts, stroke};
-use vello_cpu::{Pixmap, RenderContext, RenderMode, RenderSettings};
+use vello_cpu::{
+    Glyph as VelloGlyph, Pixmap, RenderContext, RenderMode, RenderSettings, Resources,
+};
 
 /// Errors that can occur when rendering via Vello CPU.
 #[derive(Debug)]
@@ -109,6 +110,7 @@ impl core::error::Error for Error {}
 #[derive(Debug)]
 pub struct VelloCpuRenderer {
     ctx: RenderContext,
+    resources: Resources,
     width: u16,
     height: u16,
     tolerance: f64,
@@ -149,6 +151,7 @@ impl VelloCpuRenderer {
         let ctx = RenderContext::new_with(width, height, Self::render_settings());
         Self {
             ctx,
+            resources: Resources::new(),
             width,
             height,
             tolerance: 0.1,
@@ -190,6 +193,7 @@ impl VelloCpuRenderer {
         }
 
         self.ctx = RenderContext::new_with(width, height, Self::render_settings());
+        self.resources = Resources::new();
         self.width = width;
         self.height = height;
         self.clear_cached_masks();
@@ -240,6 +244,7 @@ impl VelloCpuRenderer {
         image.resize(u32::from(self.width), u32::from(self.height));
         self.ctx.flush();
         self.ctx.render_to_buffer(
+            &mut self.resources,
             image.data.as_mut_slice(),
             self.width,
             self.height,
@@ -280,6 +285,7 @@ impl VelloCpuRenderer {
 
         self.ctx.flush();
         self.ctx.render_to_buffer(
+            &mut self.resources,
             &mut target.data[..required_len],
             self.width,
             self.height,
@@ -300,14 +306,6 @@ impl VelloCpuRenderer {
         if self.error.is_none() {
             self.error = Some(err);
         }
-    }
-
-    fn rect_fits_viewport_fast_path(&self, rect: &Rect, transform: Affine) -> bool {
-        let transformed = transform.transform_rect_bbox(*rect);
-        transformed.x0 >= 0.0
-            && transformed.y0 >= 0.0
-            && transformed.x1 <= f64::from(self.width)
-            && transformed.y1 <= f64::from(self.height)
     }
 
     fn brush_to_paint(
@@ -413,13 +411,23 @@ impl VelloCpuRenderer {
             .set_paint_transform(glyph_run.brush_transform.unwrap_or(Affine::IDENTITY));
         self.ctx.set_paint(paint);
         self.ctx.set_blend_mode(glyph_run.composite.blend);
+        // TODO: Revisit this allocation. `PaintSink` currently gives us a
+        // one-shot iterator, while glifo's glyph builders need a cloneable
+        // glyph source.
+        let glyphs = glyphs
+            .map(|glyph| VelloGlyph {
+                id: glyph.id,
+                x: glyph.x,
+                y: glyph.y,
+            })
+            .collect::<Vec<_>>();
 
         match glyph_run.style {
             Style::Fill(fill_rule) => {
                 self.ctx.set_fill_rule(*fill_rule);
                 let builder = self
                     .ctx
-                    .glyph_run(glyph_run.font)
+                    .glyph_run(&mut self.resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
@@ -428,18 +436,13 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                let glyphs = glyphs.map(|glyph| VelloGlyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
-                builder.fill_glyphs(glyphs);
+                builder.fill_glyphs(glyphs.into_iter());
             }
             Style::Stroke(stroke) => {
                 self.ctx.set_stroke(stroke.clone());
                 let builder = self
                     .ctx
-                    .glyph_run(glyph_run.font)
+                    .glyph_run(&mut self.resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
@@ -448,12 +451,7 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                let glyphs = glyphs.map(|glyph| VelloGlyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
-                builder.stroke_glyphs(glyphs);
+                builder.stroke_glyphs(glyphs.into_iter());
             }
         }
     }
@@ -498,7 +496,9 @@ impl VelloCpuRenderer {
 
         let mut pixmap = Pixmap::new(self.width, self.height);
         renderer.ctx.flush();
-        renderer.ctx.render_to_pixmap(&mut pixmap);
+        renderer
+            .ctx
+            .render_to_pixmap(&mut renderer.resources, &mut pixmap);
         let mask = match mode {
             MaskMode::Alpha => vello_cpu::Mask::new_alpha(&pixmap),
             MaskMode::Luminance => vello_cpu::Mask::new_luminance(&pixmap),
@@ -708,16 +708,7 @@ impl PaintSink for VelloCpuRenderer {
         self.ctx.set_paint(paint);
 
         match draw.shape {
-            GeometryRef::Rect(r) => {
-                if self.rect_fits_viewport_fast_path(&r, draw.transform) {
-                    self.ctx.fill_rect(&r);
-                } else {
-                    // Work around a vello_cpu 0.0.7 rect fast-path panic for strips that land
-                    // outside the viewport. Fall back to path filling until the upstream fix lands.
-                    let path = r.to_path(self.tolerance);
-                    self.ctx.fill_path(&path);
-                }
-            }
+            GeometryRef::Rect(r) => self.ctx.fill_rect(&r),
             GeometryRef::RoundedRect(rr) => {
                 let path = rr.to_path(self.tolerance);
                 self.ctx.fill_path(&path);

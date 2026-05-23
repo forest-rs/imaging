@@ -194,7 +194,9 @@ use crate::gpu_readback::{
     ReadbackError, ScratchTexture, read_texture_into, read_texture_into_target,
 };
 #[cfg(feature = "gpu")]
-use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError};
+use imaging_wgpu::v28::TextureRenderer;
+#[cfg(feature = "gpu")]
+use imaging_wgpu::{TextureRendererError, TextureTargetError};
 use sinks::MaskCache;
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 #[cfg(feature = "gpu")]

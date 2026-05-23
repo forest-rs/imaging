@@ -23,18 +23,20 @@ Full documentation at https://github.com/orium/cargo-rdme -->
 
 `wgpu` texture rendering traits for `imaging` backends.
 
-The default feature set enables `wgpu-28`. Consumers that need `wgpu-27` should disable
-default features and enable `wgpu-27`.
+The default feature set enables `wgpu-29`. Consumers that need `wgpu-27` or `wgpu-28`
+should disable default features and enable the matching version feature.
 
-Workspace-wide `--all-features` builds enable both, so this crate resolves that case
-deterministically by exporting `wgpu-28` as [`wgpu`] and keeping `wgpu-27` linked only to
-satisfy older dependents that may still request it transitively.
+Workspace-wide `--all-features` builds enable multiple lanes, so this crate resolves that case
+deterministically by exporting `wgpu-29` as [`wgpu`]. Backends that must stay on an older
+`wgpu` version should use the explicit [`v27`] or [`v28`] module.
 
 This crate is `std`-only because it depends on `wgpu`.
 
 <!-- cargo-rdme end -->
 
 [`wgpu`]: https://docs.rs/imaging_wgpu/latest/imaging_wgpu/wgpu/
+[`v27`]: https://docs.rs/imaging_wgpu/latest/imaging_wgpu/v27/
+[`v28`]: https://docs.rs/imaging_wgpu/latest/imaging_wgpu/v28/
 
 ## Minimum supported Rust Version (MSRV)
 

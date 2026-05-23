@@ -20,7 +20,7 @@ kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 skrifa = "0.40.0"
 svg_imaging = { workspace = true }
-vello_hybrid = { default-features = true, optional = true, version = "0.0.7" }
+vello_hybrid = { default-features = true, optional = true, version = "0.0.9" }
 
 [lints]
 workspace = true

@@ -31,6 +31,7 @@ impl HybridImageRegistry {
 
     pub(crate) fn begin_upload_session<'a>(
         &'a mut self,
+        resources: &mut vello_hybrid::Resources,
         renderer: &'a mut vello_hybrid::Renderer,
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
@@ -42,7 +43,7 @@ impl HybridImageRegistry {
         // and the exact memory usage isn't as important. While doing it at resolve time
         // can lead to situations where we evict something from the same session,
         // which would mean dangling image references in draw calls.
-        self.evict_to_budget(renderer, device, queue, &mut encoder);
+        self.evict_to_budget(resources, renderer, device, queue, &mut encoder);
 
         HybridImageUploadSession {
             registry: self,
@@ -68,6 +69,7 @@ impl HybridImageRegistry {
 
     fn evict_to_budget(
         &mut self,
+        resources: &mut vello_hybrid::Resources,
         renderer: &mut vello_hybrid::Renderer,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -78,19 +80,20 @@ impl HybridImageRegistry {
                 break;
             };
             self.bytes_used = self.bytes_used.saturating_sub(oldest.bytes);
-            renderer.destroy_image(device, queue, encoder, oldest.id);
+            renderer.destroy_image(resources, device, queue, encoder, oldest.id);
         }
     }
 
     pub(crate) fn clear(
         &mut self,
+        resources: &mut vello_hybrid::Resources,
         renderer: &mut vello_hybrid::Renderer,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) {
         for image in self.live.drain(..) {
-            renderer.destroy_image(device, queue, encoder, image.id);
+            renderer.destroy_image(resources, device, queue, encoder, image.id);
         }
         self.bytes_used = 0;
     }
@@ -106,7 +109,11 @@ pub(crate) struct HybridImageUploadSession<'a> {
 }
 
 impl HybridImageUploadSession<'_> {
-    pub(crate) fn resolve_image_brush(&mut self, brush: &ImageBrush) -> Result<VelloImage, Error> {
+    pub(crate) fn resolve_image_brush(
+        &mut self,
+        resources: &mut vello_hybrid::Resources,
+        brush: &ImageBrush,
+    ) -> Result<VelloImage, Error> {
         let key = ImageKey::derive(&brush.image);
         let image = if let Some(image) = self.pending.iter().find(|ri| ri.key == key).copied() {
             image
@@ -121,6 +128,7 @@ impl HybridImageUploadSession<'_> {
                 ));
             };
             let id = self.renderer.upload_image(
+                resources,
                 self.device,
                 self.queue,
                 self.encoder
@@ -131,7 +139,7 @@ impl HybridImageUploadSession<'_> {
             let image = RegisteredImage {
                 key,
                 id,
-                may_have_opacities: pixmap.may_have_opacities(),
+                may_have_transparency: pixmap.may_have_transparency(),
                 bytes: brush
                     .image
                     .format
@@ -143,12 +151,15 @@ impl HybridImageUploadSession<'_> {
         };
 
         Ok(VelloImage {
-            image: ImageSource::opaque_id_with_opacity_hint(image.id, image.may_have_opacities),
+            image: ImageSource::opaque_id_with_transparency_hint(
+                image.id,
+                image.may_have_transparency,
+            ),
             sampler: brush.sampler,
         })
     }
 
-    pub(crate) fn finish(&mut self, success: bool) {
+    pub(crate) fn finish(&mut self, resources: &mut vello_hybrid::Resources, success: bool) {
         if success {
             for image in self.pending.drain(..) {
                 self.registry.live.push_back(image);
@@ -157,6 +168,7 @@ impl HybridImageUploadSession<'_> {
         } else {
             for image in self.pending.drain(..) {
                 self.renderer.destroy_image(
+                    resources,
                     self.device,
                     self.queue,
                     self.encoder
@@ -177,7 +189,7 @@ impl HybridImageUploadSession<'_> {
 struct RegisteredImage {
     key: ImageKey,
     id: ImageId,
-    may_have_opacities: bool,
+    may_have_transparency: bool,
     bytes: usize,
 }
 
@@ -255,13 +267,13 @@ mod tests {
         let a_ri = RegisteredImage {
             key: a_key,
             id: ImageId::new(0),
-            may_have_opacities: true,
+            may_have_transparency: true,
             bytes: a.data.len(),
         };
         let b_ri = RegisteredImage {
             key: b_key,
             id: ImageId::new(1),
-            may_have_opacities: true,
+            may_have_transparency: true,
             bytes: b.data.len(),
         };
 

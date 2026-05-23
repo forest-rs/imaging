@@ -89,7 +89,10 @@ impl SnapshotCase for GmGlyphRunsGradientBrushTransform {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "tiny_skia" | "vello_cpu" | "vello_hybrid")
+        matches!(
+            backend,
+            "skia" | "tiny_skia" | "vello" | "vello_cpu" | "vello_hybrid"
+        )
     }
 
     fn skia_max_diff_pixels(&self) -> u64 {
@@ -205,6 +208,13 @@ impl SnapshotCase for GmGlyphRunsImageFill {
         "gm_glyph_runs_image_fill"
     }
 
+    fn supports_backend(&self, backend: &str) -> bool {
+        matches!(
+            backend,
+            "skia" | "tiny_skia" | "vello" | "vello_cpu" | "vello_hybrid"
+        )
+    }
+
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgba8(247, 243, 236, 255));
         let mut painter = Painter::new(sink);
@@ -230,6 +240,13 @@ pub(super) struct GmGlyphRunsImageStroke;
 impl SnapshotCase for GmGlyphRunsImageStroke {
     fn name(&self) -> &'static str {
         "gm_glyph_runs_image_stroke"
+    }
+
+    fn supports_backend(&self, backend: &str) -> bool {
+        matches!(
+            backend,
+            "skia" | "tiny_skia" | "vello" | "vello_cpu" | "vello_hybrid"
+        )
     }
 
     fn vello_max_diff_pixels(&self) -> u64 {
