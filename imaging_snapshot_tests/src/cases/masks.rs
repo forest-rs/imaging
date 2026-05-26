@@ -122,7 +122,10 @@ impl SnapshotCase for GmMaskAlpha {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "tiny_skia" | "vello_cpu")
+        matches!(
+            backend,
+            "skia" | "tiny_skia" | "vello_cpu" | "vello" | "vello_hybrid"
+        )
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
@@ -137,7 +140,10 @@ impl SnapshotCase for GmMaskLuminance {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        matches!(backend, "skia" | "tiny_skia" | "vello_cpu" | "vello")
+        matches!(
+            backend,
+            "skia" | "tiny_skia" | "vello_cpu" | "vello" | "vello_hybrid"
+        )
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
