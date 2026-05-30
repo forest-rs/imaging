@@ -14,10 +14,11 @@ categories = ["graphics", "rendering"]
 default = []
 gpu = [
     "dep:imaging_wgpu",
-    "imaging_wgpu/wgpu-28",
-    "dep:foreign-types-shared",
+    "imaging_wgpu/wgpu-29",
     "dep:wgpu",
     "dep:ash",
+    "dep:objc2",
+    "dep:objc2-metal",
     "dep:windows",
 ]
 
@@ -27,10 +28,15 @@ imaging_wgpu = { default-features = false, optional = true, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 skia-safe = { version = "0.97.0" }
-wgpu = { optional = true, version = "28.0.0" }
+wgpu = { optional = true, version = "29.0.3" }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-foreign-types-shared = { version = "0.3", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "MTLCommandQueue",
+    "MTLDevice",
+    "MTLTexture",
+], optional = true }
 oaty = "0.1"
 skia-safe = { version = "0.97.0", features = ["metal"] }
 
