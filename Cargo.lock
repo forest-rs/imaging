@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "imaging_vello"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "imaging",
  "imaging_wgpu",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "imaging_vello_cpu"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "imaging",
  "kurbo",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "imaging_vello_hybrid"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "glifo",
  "imaging",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "imaging_wgpu"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "imaging",
  "wgpu 27.0.1",

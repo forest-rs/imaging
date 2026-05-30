@@ -31,10 +31,10 @@ repository = "https://github.com/forest-rs/imaging"
 imaging = { default-features = false, path = "imaging", version = "0.0.1" }
 imaging_skia = { path = "imaging_skia", version = "0.0.1" }
 imaging_tiny_skia = { path = "imaging_tiny_skia", version = "0.0.1" }
-imaging_vello = { path = "imaging_vello", version = "0.0.1" }
-imaging_vello_cpu = { path = "imaging_vello_cpu", version = "0.0.1" }
-imaging_vello_hybrid = { path = "imaging_vello_hybrid", version = "0.0.1" }
-imaging_wgpu = { default-features = false, path = "imaging_wgpu", version = "0.0.1" }
+imaging_vello = { path = "imaging_vello", version = "0.0.2" }
+imaging_vello_cpu = { path = "imaging_vello_cpu", version = "0.0.2" }
+imaging_vello_hybrid = { path = "imaging_vello_hybrid", version = "0.0.2" }
+imaging_wgpu = { default-features = false, path = "imaging_wgpu", version = "0.0.2" }
 svg_imaging = { path = "svg_imaging", version = "0.0.1" }
 velato_imaging = { path = "velato_imaging", version = "0.0.1" }
 
