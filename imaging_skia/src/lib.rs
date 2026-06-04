@@ -165,8 +165,6 @@ mod sinks;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios"))))]
 mod vulkan;
 
-#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios")))]
-use foreign_types_shared as _;
 use imaging::{
     Filter, GeometryRef, GlyphRunRef, RgbaImage,
     record::{Scene, ValidateError, replay},
@@ -194,7 +192,7 @@ use crate::gpu_readback::{
     ReadbackError, ScratchTexture, read_texture_into, read_texture_into_target,
 };
 #[cfg(feature = "gpu")]
-use imaging_wgpu::v28::TextureRenderer;
+use imaging_wgpu::v29::TextureRenderer;
 #[cfg(feature = "gpu")]
 use imaging_wgpu::{TextureRendererError, TextureTargetError};
 use sinks::MaskCache;
@@ -851,7 +849,7 @@ impl SkiaGpuRendererState {
                 "Skia GPU renderer requires RENDER_ATTACHMENT texture usage",
             ));
         }
-        initialize_texture_for_wgpu(&self.device, &self.queue, texture);
+        initialize_texture_for_wgpu(&self.device, &self.queue, texture)?;
         Ok(())
     }
 
@@ -1162,7 +1160,8 @@ impl ImageRenderer for SkiaRenderer {
         )
         .map_err(map_image_renderer_error)?;
         let texture = self.scratch_texture_for_format(target.width, target.height, texture_format);
-        initialize_texture_for_wgpu(&self.state.device, &self.state.queue, &texture);
+        initialize_texture_for_wgpu(&self.state.device, &self.state.queue, &texture)
+            .map_err(map_image_renderer_error)?;
         let mut surface = self
             .state
             .backend
@@ -1281,7 +1280,7 @@ fn initialize_texture_for_wgpu(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
-) {
+) -> Result<(), Error> {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("imaging_skia texture init"),
@@ -1304,6 +1303,10 @@ fn initialize_texture_for_wgpu(
     });
     drop(_pass);
     queue.submit([encoder.finish()]);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|_| Error::Internal("wgpu texture initialization poll failed"))?;
+    Ok(())
 }
 
 #[allow(

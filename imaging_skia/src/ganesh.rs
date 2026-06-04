@@ -138,8 +138,20 @@ impl GaneshBackend {
     }
 
     pub(crate) fn flush_surface(&mut self, surface: &mut sk::Surface) {
-        self.direct_context()
-            .flush_and_submit_surface(surface, sk::gpu::SyncCpu::No);
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Self::Metal(backend) => backend
+                .direct_context()
+                .flush_and_submit_surface(surface, sk::gpu::SyncCpu::Yes),
+            #[cfg(windows)]
+            Self::Dx12(backend) => backend
+                .direct_context()
+                .flush_and_submit_surface(surface, sk::gpu::SyncCpu::No),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            Self::Vulkan(backend) => backend
+                .direct_context()
+                .flush_and_submit_surface(surface, sk::gpu::SyncCpu::No),
+        }
     }
 
     pub(crate) fn flush_surface_for_readback(&mut self, surface: &mut sk::Surface) {

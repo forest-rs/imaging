@@ -3,7 +3,10 @@
 
 #![allow(unsafe_code, reason = "Metal interop requires raw handle bridging")]
 
-use foreign_types_shared::ForeignType;
+use core::ptr::NonNull;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice as _};
 use skia_safe as sk;
 
 use crate::{Error, color_space_for_wgpu_texture_format, color_type_for_wgpu_texture_format};
@@ -11,31 +14,37 @@ use crate::{Error, color_space_for_wgpu_texture_format, color_type_for_wgpu_text
 #[derive(Debug)]
 pub(crate) struct MetalBackend {
     context: sk::gpu::DirectContext,
+    _command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
 impl MetalBackend {
-    pub(crate) fn from_wgpu(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self, Error> {
+    pub(crate) fn from_wgpu(device: &wgpu::Device, _queue: &wgpu::Queue) -> Result<Self, Error> {
         let device = unsafe {
             device
                 .as_hal::<wgpu::hal::api::Metal>()
                 .ok_or(Error::CreateGpuContext("missing Metal device"))?
         };
-        let queue = unsafe {
-            queue
-                .as_hal::<wgpu::hal::api::Metal>()
-                .ok_or(Error::CreateGpuContext("missing Metal queue"))?
-        };
+        let command_queue =
+            device
+                .raw_device()
+                .newCommandQueue()
+                .ok_or(Error::CreateGpuContext(
+                    "unable to create Metal command queue",
+                ))?;
 
         let backend = unsafe {
             sk::gpu::mtl::BackendContext::new(
-                device.raw_device().as_ptr() as sk::gpu::mtl::Handle,
-                queue.as_raw().lock().as_ptr() as sk::gpu::mtl::Handle,
+                Retained::as_ptr(device.raw_device()) as sk::gpu::mtl::Handle,
+                Retained::as_ptr(&command_queue) as sk::gpu::mtl::Handle,
             )
         };
         let context = sk::gpu::direct_contexts::make_metal(&backend, None).ok_or(
             Error::CreateGpuContext("unable to create Skia Metal context"),
         )?;
-        Ok(Self { context })
+        Ok(Self {
+            context,
+            _command_queue: command_queue,
+        })
     }
 
     pub(crate) fn direct_context(&mut self) -> &mut sk::gpu::DirectContext {
@@ -53,8 +62,8 @@ impl MetalBackend {
                 .as_hal::<wgpu::hal::api::Metal>()
                 .ok_or(Error::CreateGpuSurface)?
         };
-        let texture_info =
-            unsafe { sk::gpu::mtl::TextureInfo::new(hal_texture.raw_handle().as_ptr() as _) };
+        let texture_handle = NonNull::from(hal_texture.raw_handle()).as_ptr();
+        let texture_info = unsafe { sk::gpu::mtl::TextureInfo::new(texture_handle as _) };
         let backend_texture = unsafe {
             sk::gpu::backend_textures::make_mtl(
                 (width, height),

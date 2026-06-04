@@ -1145,14 +1145,15 @@ name = "imaging_skia"
 version = "0.0.1"
 dependencies = [
  "ash",
- "foreign-types-shared",
  "imaging",
  "imaging_wgpu",
  "kurbo",
  "oaty",
+ "objc2",
+ "objc2-metal",
  "peniko",
  "skia-safe",
- "wgpu 28.0.0",
+ "wgpu 29.0.3",
  "windows 0.62.2",
 ]
 
