@@ -17,17 +17,15 @@ imaging_wgpu = { default-features = false, features = ["wgpu-29"], workspace = t
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 vello_common = { default-features = true, version = "0.0.9" }
-vello_hybrid = { default-features = true, version = "0.0.9" }
-wgpu = { default-features = false, features = [
-    "std",
-    "wgsl",
-], version = "29.0.3" }
+vello_hybrid = { default-features = false, features = ["text", "wgpu"], version = "0.0.9" }
+wgpu = { default-features = false, version = "29.0.3" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 pollster = "0.4.0"
+wgpu = { version = "29.0.3" }
 
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"
