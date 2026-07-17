@@ -153,7 +153,7 @@ where
         record::replay(scene, self.sink);
     }
 
-    /// Start configuring a fill draw.
+    /// Start configuring a fill draw. Default field values can be changed in the returned `FillBuilder`.
     ///
     /// Defaults:
     /// - geometry transform: [`Affine::IDENTITY`]
@@ -182,7 +182,7 @@ where
         self.sink.fill(FillRef::new(rect, brush));
     }
 
-    /// Start configuring a stroke draw.
+    /// Start configuring a stroke draw. Default field values can be changed in the returned `StrokeBuilder`.
     ///
     /// Defaults:
     /// - geometry transform: [`Affine::IDENTITY`]
@@ -200,7 +200,7 @@ where
         }
     }
 
-    /// Start configuring a glyph run.
+    /// Start configuring a glyph run. Default field values can be changed in the returned `GlyphRunBuilder`.
     ///
     /// Defaults:
     /// - run transform: [`Affine::IDENTITY`]
