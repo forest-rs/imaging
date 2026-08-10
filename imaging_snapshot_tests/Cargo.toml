@@ -27,10 +27,15 @@ workspace = true
 
 [dev-dependencies]
 kompari = { git = "https://github.com/linebender/kompari.git", rev = "4b851413e1b17307064aa48c50e59d7e29656543" }
+png = "0.18"
 pollster = "0.4.0"
 
 [[example]]
 name = "text_effects"
+required-features = ["vello_cpu"]
+
+[[example]]
+name = "text_effects_animated"
 required-features = ["vello_cpu"]
 
 [features]

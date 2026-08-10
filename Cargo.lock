@@ -1169,6 +1169,7 @@ dependencies = [
  "kompari",
  "kurbo",
  "peniko",
+ "png 0.18.1",
  "pollster",
  "skrifa 0.40.0",
  "svg_imaging",
