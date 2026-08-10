@@ -21,6 +21,7 @@ peniko = { default-features = true, workspace = true }
 skrifa = "0.40.0"
 svg_imaging = { workspace = true }
 vello_hybrid = { default-features = true, optional = true, version = "0.0.9" }
+webp-animation = { version = "0.10.0", optional = true }
 
 [lints]
 workspace = true
@@ -45,3 +46,4 @@ skia = ["dep:imaging_skia"]
 tiny_skia = ["dep:imaging_tiny_skia"]
 vello_hybrid = ["dep:imaging_vello_hybrid", "dep:vello_hybrid"]
 vello = ["dep:imaging_vello"]
+webp = ["dep:webp-animation"]

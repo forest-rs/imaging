@@ -29,4 +29,7 @@ use vello_hybrid as _;
 #[cfg(feature = "vello")]
 use imaging_vello as _;
 
+#[cfg(feature = "webp")]
+use webp_animation as _;
+
 pub mod cases;

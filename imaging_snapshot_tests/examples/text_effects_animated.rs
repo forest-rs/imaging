@@ -20,7 +20,9 @@
 //!     --example text_effects_animated -- "Imaging"
 //! ```
 //!
-//! Output goes to `target/text_effects_animated/` (override with a second argument).
+//! Output goes to `target/text_effects_animated/` (override with a second argument). Build with
+//! the additional `webp` feature (`--features vello_cpu,webp`) to also encode each effect as an
+//! animated WebP.
 //!
 //! [TerminalTextEffects]: https://github.com/ChrisBuilds/terminaltexteffects
 
@@ -99,6 +101,8 @@ fn main() {
         );
         std::fs::write(format!("{out_dir}/{name}_preview.png"), preview_png)
             .expect("write preview png");
+        #[cfg(feature = "webp")]
+        write_webp(&format!("{out_dir}/{name}.webp"), &frames);
         println!("wrote {apng_path} ({FRAMES} frames @ {FPS} fps)");
     }
 }
@@ -123,6 +127,20 @@ fn write_apng(path: &str, frames: &[Vec<u8>]) {
         writer.write_image_data(frame).expect("write apng frame");
     }
     writer.finish().expect("finish apng");
+}
+
+#[cfg(feature = "webp")]
+fn write_webp(path: &str, frames: &[Vec<u8>]) {
+    let mut encoder = webp_animation::Encoder::new((u32::from(WIDTH), u32::from(HEIGHT)))
+        .expect("create webp encoder");
+    let frame_ms = 1000 / i32::from(FPS);
+    for (index, frame) in frames.iter().enumerate() {
+        let timestamp = i32::try_from(index).expect("frame index fits in i32") * frame_ms;
+        encoder.add_frame(frame, timestamp).expect("add webp frame");
+    }
+    let end = i32::try_from(frames.len()).expect("frame count fits in i32") * frame_ms;
+    let data = encoder.finalize(end).expect("finalize webp");
+    std::fs::write(path, &data).expect("write webp");
 }
 
 // --- deterministic pseudo-randomness -------------------------------------------------------
