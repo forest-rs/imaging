@@ -3,12 +3,12 @@
 
 //! `wgpu` texture rendering traits for `imaging` backends.
 //!
-//! The default feature set enables `wgpu-29`. Consumers that need `wgpu-27` or `wgpu-28`
+//! The default feature set enables `wgpu-30`. Consumers that need an older `wgpu` version
 //! should disable default features and enable the matching version feature.
 //!
 //! Workspace-wide `--all-features` builds enable multiple lanes, so this crate resolves that case
-//! deterministically by exporting `wgpu-29` as [`wgpu`]. Backends that must stay on an older
-//! `wgpu` version should use the explicit [`v27`] or [`v28`] module.
+//! deterministically by exporting `wgpu-30` as [`wgpu`]. Backends that must stay on an older
+//! `wgpu` version should use the explicit [`v27`], [`v28`], or [`v29`] module.
 //!
 //! This crate is `std`-only because it depends on `wgpu`.
 
@@ -17,8 +17,13 @@
 
 use std::boxed::Box;
 
-#[cfg(not(any(feature = "wgpu-27", feature = "wgpu-28", feature = "wgpu-29")))]
-compile_error!("Enable one of `wgpu-27`, `wgpu-28`, or `wgpu-29`.");
+#[cfg(not(any(
+    feature = "wgpu-27",
+    feature = "wgpu-28",
+    feature = "wgpu-29",
+    feature = "wgpu-30"
+)))]
+compile_error!("Enable one of `wgpu-27`, `wgpu-28`, `wgpu-29`, or `wgpu-30`.");
 
 /// Shared texture-render-target failures surfaced by texture renderers.
 #[derive(Debug)]
@@ -181,13 +186,21 @@ define_wgpu_lane!(v27, wgpu_27);
 define_wgpu_lane!(v28, wgpu_28);
 #[cfg(feature = "wgpu-29")]
 define_wgpu_lane!(v29, wgpu_29);
+#[cfg(feature = "wgpu-30")]
+define_wgpu_lane!(v30, wgpu_30);
 
 #[cfg(all(
-    not(any(feature = "wgpu-28", feature = "wgpu-29")),
+    not(any(feature = "wgpu-28", feature = "wgpu-29", feature = "wgpu-30")),
     feature = "wgpu-27"
 ))]
 pub use v27::{TextureRenderer, TextureViewTarget, wgpu};
-#[cfg(all(not(feature = "wgpu-29"), feature = "wgpu-28"))]
+#[cfg(all(
+    not(any(feature = "wgpu-29", feature = "wgpu-30")),
+    feature = "wgpu-28"
+))]
 pub use v28::{TextureRenderer, TextureViewTarget, wgpu};
-#[cfg(feature = "wgpu-29")]
+#[cfg(all(not(feature = "wgpu-30"), feature = "wgpu-29"))]
 pub use v29::{TextureRenderer, TextureViewTarget, wgpu};
+
+#[cfg(feature = "wgpu-30")]
+pub use v30::{TextureRenderer, TextureViewTarget, wgpu};

@@ -11,9 +11,9 @@ use imaging::{
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, BrushRef, ImageBrush, Style};
 
-/// Borrowed adapter that streams `imaging` commands into an existing [`vello_hybrid::Scene`].
+/// Borrowed adapter that streams `imaging` commands into an existing [`vello_gpu::Scene`].
 pub struct VelloHybridSceneSink<'a> {
-    scene: &'a mut vello_hybrid::Scene,
+    scene: &'a mut vello_gpu::Scene,
     resources: SceneSinkResources<'a>,
     image_upload: Option<HybridImageUploadSession<'a>>,
     tolerance: f64,
@@ -23,16 +23,65 @@ pub struct VelloHybridSceneSink<'a> {
 }
 
 enum SceneSinkResources<'a> {
-    Owned(Box<vello_hybrid::Resources>),
-    Borrowed(&'a mut vello_hybrid::Resources),
+    Owned(Box<glifo::GlyphPrepCache>),
+    Borrowed(&'a mut vello_gpu::Resources),
 }
 
-impl SceneSinkResources<'_> {
-    fn as_mut(&mut self) -> &mut vello_hybrid::Resources {
-        match self {
-            Self::Owned(resources) => resources.as_mut(),
-            Self::Borrowed(resources) => resources,
-        }
+// A standalone sink records glyph outlines without allocating renderer-owned atlas resources.
+struct UncachedGlyphBackend<'a> {
+    scene: &'a mut vello_gpu::Scene,
+    cache: &'a mut glifo::GlyphPrepCache,
+}
+
+impl<'a> glifo::GlyphRunBackend<'a> for UncachedGlyphBackend<'a> {
+    fn atlas_cache(self, _enabled: bool) -> Self {
+        self
+    }
+
+    fn fill_glyphs<G>(
+        self,
+        run: glifo::GlyphRun<'a>,
+        glyphs: G,
+    ) -> Result<(), glifo::GlyphRenderError>
+    where
+        G: Iterator<Item = VelloGlyph> + Clone,
+    {
+        run.build(glyphs, self.cache.as_mut(), glifo::AtlasCacher::Disabled)
+            .fill_glyphs(self.scene)
+    }
+
+    fn stroke_glyphs<G>(
+        self,
+        run: glifo::GlyphRun<'a>,
+        glyphs: G,
+    ) -> Result<(), glifo::GlyphRenderError>
+    where
+        G: Iterator<Item = VelloGlyph> + Clone,
+    {
+        let mut run = run.build(glyphs, self.cache.as_mut(), glifo::AtlasCacher::Disabled);
+        let stroke = self.scene.stroke().clone();
+        let mut adjusted = stroke.clone();
+        adjusted.width *= run.stroke_adjustment();
+        self.scene.set_stroke(adjusted);
+        let result = run.stroke_glyphs(self.scene);
+        self.scene.set_stroke(stroke);
+        result
+    }
+
+    fn render_decoration<G>(
+        self,
+        run: glifo::GlyphRun<'a>,
+        glyphs: G,
+        x_range: core::ops::RangeInclusive<f32>,
+        baseline_y: f32,
+        offset: f32,
+        size: f32,
+        buffer: f32,
+    ) where
+        G: Iterator<Item = VelloGlyph> + Clone,
+    {
+        run.build(glyphs, self.cache.as_mut(), glifo::AtlasCacher::Disabled)
+            .render_decoration(x_range, baseline_y, offset, size, buffer, self.scene);
     }
 }
 
@@ -48,11 +97,11 @@ impl core::fmt::Debug for VelloHybridSceneSink<'_> {
 }
 
 impl<'a> VelloHybridSceneSink<'a> {
-    /// Wrap an existing [`vello_hybrid::Scene`].
-    pub fn new(scene: &'a mut vello_hybrid::Scene) -> Self {
+    /// Wrap an existing [`vello_gpu::Scene`].
+    pub fn new(scene: &'a mut vello_gpu::Scene) -> Self {
         Self {
             scene,
-            resources: SceneSinkResources::Owned(Box::new(vello_hybrid::Resources::new())),
+            resources: SceneSinkResources::Owned(Box::default()),
             image_upload: None,
             tolerance: 0.1,
             error: None,
@@ -61,13 +110,13 @@ impl<'a> VelloHybridSceneSink<'a> {
         }
     }
 
-    /// Wrap an existing [`vello_hybrid::Scene`] and use `renderer` to upload image brushes on
+    /// Wrap an existing [`vello_gpu::Scene`] and use `renderer` to upload image brushes on
     /// demand.
     ///
     /// This is the native-scene path for image brushes. Uploaded images are cached on the
     /// renderer and reused across subsequent recordings and renders.
     pub fn with_renderer(
-        scene: &'a mut vello_hybrid::Scene,
+        scene: &'a mut vello_gpu::Scene,
         renderer: &'a mut VelloHybridRenderer,
     ) -> Self {
         let state = &mut renderer.state;
@@ -111,8 +160,10 @@ impl<'a> VelloHybridSceneSink<'a> {
             Ok(())
         };
 
-        if let Some(mut image_upload) = self.image_upload.take() {
-            image_upload.finish(self.resources.as_mut(), result.is_ok());
+        if let Some(mut image_upload) = self.image_upload.take()
+            && let SceneSinkResources::Borrowed(resources) = &mut self.resources
+        {
+            image_upload.finish(resources, result.is_ok());
         }
 
         result
@@ -142,7 +193,15 @@ impl<'a> VelloHybridSceneSink<'a> {
             self.set_error_once(Error::UnsupportedImageBrush);
             return None;
         };
-        match image_upload.resolve_image_brush(self.resources.as_mut(), image) {
+        match image_upload.resolve_image_brush(
+            match &mut self.resources {
+                SceneSinkResources::Borrowed(resources) => resources,
+                SceneSinkResources::Owned(_) => {
+                    unreachable!("image upload requires renderer resources")
+                }
+            },
+            image,
+        ) {
             Ok(image) => Some(image),
             Err(err) => {
                 self.set_error_once(err);
@@ -189,6 +248,10 @@ impl<'a> VelloHybridSceneSink<'a> {
         glyph_run: GlyphRunRef<'_>,
         glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
     ) {
+        if glyph_run.composite.blend.is_destructive() {
+            self.set_error_once(Error::UnsupportedGlyphBlend);
+            return;
+        }
         let Some(paint) = self.brush_to_paint(glyph_run.brush, glyph_run.composite) else {
             return;
         };
@@ -209,11 +272,14 @@ impl<'a> VelloHybridSceneSink<'a> {
             .collect::<Vec<_>>();
 
         match glyph_run.style {
-            Style::Fill(fill_rule) => {
-                self.scene.set_fill_rule(*fill_rule);
+            Style::Fill(fill) => self.scene.set_fill_rule(*fill),
+            Style::Stroke(stroke) => self.scene.set_stroke(stroke.clone()),
+        }
+        let result = match &mut self.resources {
+            SceneSinkResources::Borrowed(resources) => {
                 let builder = self
                     .scene
-                    .glyph_run(self.resources.as_mut(), glyph_run.font)
+                    .glyph_run(resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
@@ -222,28 +288,69 @@ impl<'a> VelloHybridSceneSink<'a> {
                 } else {
                     builder
                 };
-                builder.fill_glyphs(glyphs.into_iter());
+                match glyph_run.style {
+                    Style::Fill(_) => builder.fill_glyphs(glyphs.into_iter()),
+                    Style::Stroke(_) => builder.stroke_glyphs(glyphs.into_iter()),
+                }
             }
-            Style::Stroke(stroke) => {
-                self.scene.set_stroke(stroke.clone());
-                let builder = self
-                    .scene
-                    .glyph_run(self.resources.as_mut(), glyph_run.font)
-                    .font_size(glyph_run.font_size)
-                    .hint(glyph_run.hint)
-                    .normalized_coords(glyph_run.normalized_coords);
+            SceneSinkResources::Owned(cache) => {
+                let builder = glifo::GlyphRunBuilder::new(
+                    glyph_run.font.clone(),
+                    glyph_run.transform,
+                    glyph_run.brush_transform.unwrap_or(Affine::IDENTITY),
+                    UncachedGlyphBackend {
+                        scene: self.scene,
+                        cache,
+                    },
+                )
+                .font_size(glyph_run.font_size)
+                .hint(glyph_run.hint)
+                .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
                     builder.glyph_transform(transform)
                 } else {
                     builder
                 };
-                builder.stroke_glyphs(glyphs.into_iter());
+                match glyph_run.style {
+                    Style::Fill(_) => builder.fill_glyphs(glyphs.into_iter()),
+                    Style::Stroke(_) => builder.stroke_glyphs(glyphs.into_iter()),
+                }
             }
+        };
+        if result.is_err() {
+            self.set_error_once(Error::Internal("glyph rendering failed"));
         }
     }
 
     fn draw_blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {
         self.set_error_once(Error::UnsupportedBlurredRoundedRect);
+    }
+
+    fn fill_destructive(
+        &mut self,
+        clip: ClipRef<'_>,
+        blend: peniko::BlendMode,
+        paint: vello_common::paint::PaintType,
+        paint_transform: Affine,
+    ) {
+        let (transform, path, fill_rule) = self.clip_to_path(clip);
+        self.scene.set_transform(transform);
+        self.scene.set_fill_rule(fill_rule);
+        self.scene
+            .push_layer(Some(&path), Some(blend), None, None, None);
+        self.scene.set_blend_mode(peniko::BlendMode::default());
+        self.scene.set_transform(Affine::IDENTITY);
+        self.scene.set_paint_transform(paint_transform);
+        self.scene.set_paint(paint);
+        // The layer clip supplies shape coverage. Painting the whole layer avoids applying
+        // antialiasing twice and keeps destructive composition confined to the draw geometry.
+        self.scene.fill_rect(&kurbo::Rect::new(
+            0.0,
+            0.0,
+            f64::from(self.scene.width()),
+            f64::from(self.scene.height()),
+        ));
+        self.scene.pop_layer();
     }
 }
 
@@ -267,7 +374,7 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             self.set_error_once(Error::Internal("pop_clip underflow"));
             return;
         }
-        self.scene.pop_clip_path();
+        self.scene.pop_clip();
         self.clip_depth -= 1;
     }
 
@@ -330,6 +437,19 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             _ => (draw.composite.blend, paint),
         };
 
+        if blend.is_destructive() {
+            self.fill_destructive(
+                ClipRef::Fill {
+                    transform: draw.transform,
+                    shape: draw.shape,
+                    fill_rule: draw.fill_rule,
+                },
+                blend,
+                paint,
+                draw.transform * draw.brush_transform.unwrap_or(Affine::IDENTITY),
+            );
+            return;
+        }
         self.scene.set_blend_mode(blend);
         self.scene.set_paint(paint);
 
@@ -365,6 +485,19 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             _ => (draw.composite.blend, paint),
         };
 
+        if blend.is_destructive() {
+            self.fill_destructive(
+                ClipRef::Stroke {
+                    transform: draw.transform,
+                    shape: draw.shape,
+                    stroke: draw.stroke,
+                },
+                blend,
+                paint,
+                draw.transform * draw.brush_transform.unwrap_or(Affine::IDENTITY),
+            );
+            return;
+        }
         self.scene.set_blend_mode(blend);
         self.scene.set_paint(paint);
 
@@ -407,7 +540,7 @@ mod tests {
 
     #[test]
     fn hybrid_scene_sink_reports_clip_underflow() {
-        let mut scene = vello_hybrid::Scene::new(32, 32);
+        let mut scene = vello_gpu::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.pop_clip();
@@ -419,7 +552,7 @@ mod tests {
 
     #[test]
     fn hybrid_scene_sink_rejects_filters() {
-        let mut scene = vello_hybrid::Scene::new(32, 32);
+        let mut scene = vello_gpu::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
@@ -428,7 +561,7 @@ mod tests {
 
     #[test]
     fn hybrid_scene_sink_rejects_image_brushes_without_resolver() {
-        let mut scene = vello_hybrid::Scene::new(32, 32);
+        let mut scene = vello_gpu::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         let image = Brush::Image(ImageBrush::new(ImageData {
@@ -440,6 +573,47 @@ mod tests {
         }));
         sink.fill(FillRef::new(kurbo::Rect::new(0.0, 0.0, 8.0, 8.0), &image));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedImageBrush)));
+    }
+
+    #[test]
+    fn hybrid_scene_sink_reports_unrenderable_glyphs() {
+        let font = peniko::FontData::new(
+            Blob::new(Arc::new(include_bytes!(
+                "../../test_assets/fonts/NotoSans-Regular.ttf"
+            ))),
+            0,
+        );
+        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut sink = VelloHybridSceneSink::new(&mut scene);
+        imaging::Painter::new(&mut sink)
+            .glyphs(&font, peniko::Color::BLACK)
+            .draw(
+                &Style::Fill(peniko::Fill::NonZero),
+                [record::Glyph {
+                    id: u32::MAX,
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            );
+        assert!(matches!(
+            sink.finish(),
+            Err(Error::Internal("glyph rendering failed"))
+        ));
+    }
+
+    #[test]
+    fn hybrid_scene_sink_rejects_destructive_glyph_blends() {
+        let font = peniko::FontData::new(Blob::new(Arc::new([0_u8; 4])), 0);
+        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut sink = VelloHybridSceneSink::new(&mut scene);
+        imaging::Painter::new(&mut sink)
+            .glyphs(&font, peniko::Color::BLACK)
+            .composite(Composite::new(peniko::Compose::Copy.into(), 1.0))
+            .draw(
+                &Style::Fill(peniko::Fill::NonZero),
+                core::iter::empty::<record::Glyph>(),
+            );
+        assert!(matches!(sink.finish(), Err(Error::UnsupportedGlyphBlend)));
     }
 
     #[test]
@@ -455,7 +629,7 @@ mod tests {
             peniko::Color::BLACK,
         ));
 
-        let mut scene = vello_hybrid::Scene::new(32, 32);
+        let mut scene = vello_gpu::Scene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Luminance, &mask)));

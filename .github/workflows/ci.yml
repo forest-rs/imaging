@@ -283,6 +283,9 @@ jobs:
       - name: cargo nextest (imaging_vello, vello-0-9)
         run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-9 --no-fail-fast
 
+      - name: cargo nextest (imaging_vello, vello-0-11)
+        run: cargo nextest run -p imaging_vello --locked --no-default-features --features vello-0-11 --no-fail-fast
+
       - name: cargo test --doc
         run: cargo test --doc ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} --workspace --locked --all-features --no-fail-fast
 
@@ -294,6 +297,9 @@ jobs:
 
       - name: cargo test --doc (imaging_vello, vello-0-9)
         run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-9 --no-fail-fast
+
+      - name: cargo test --doc (imaging_vello, vello-0-11)
+        run: cargo test --doc -p imaging_vello --locked --no-default-features --features vello-0-11 --no-fail-fast
 
   package:
     name: cargo package --list
@@ -437,6 +443,11 @@ jobs:
       # We test documentation using nightly to match docs.rs.
       - name: cargo doc
         run: cargo doc ${{ env.RUST_ALL_FEATURES_EXCLUDE_PKGS }} --workspace --locked --all-features --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: '--cfg docsrs -D warnings'
+
+      - name: cargo doc (imaging_vello, vello-0-11)
+        run: cargo doc -p imaging_vello --locked --no-default-features --features vello-0-11 --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: '--cfg docsrs -D warnings'
 

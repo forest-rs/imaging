@@ -16,11 +16,7 @@ fn try_init_device_and_queue()
     block_on(async {
         let instance = imaging_vello::wgpu::Instance::default();
         let adapter = instance
-            .request_adapter(&imaging_vello::wgpu::RequestAdapterOptions {
-                power_preference: imaging_vello::wgpu::PowerPreference::default(),
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
+            .request_adapter(&imaging_vello::wgpu::RequestAdapterOptions::default())
             .await
             .map_err(|_| ())?;
         adapter

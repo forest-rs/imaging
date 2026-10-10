@@ -18,12 +18,14 @@ peniko = { default-features = true, workspace = true }
 vello_07 = { default-features = true, optional = true, package = "vello", version = "0.7.0" }
 vello_08 = { default-features = true, optional = true, package = "vello", version = "0.8.0" }
 vello_09 = { default-features = true, optional = true, package = "vello", version = "0.9.0" }
+vello_011 = { default-features = true, optional = true, package = "vello", version = "0.11.0" }
 
 [features]
-default = ["vello-0-9"]
+default = ["vello-0-11"]
 vello-0-7 = ["dep:vello_07", "imaging_wgpu/wgpu-27"]
 vello-0-8 = ["dep:vello_08", "imaging_wgpu/wgpu-28"]
 vello-0-9 = ["dep:vello_09", "imaging_wgpu/wgpu-29"]
+vello-0-11 = ["dep:vello_011", "imaging_wgpu/wgpu-30"]
 
 [dev-dependencies]
 pollster = "0.4.0"
@@ -32,6 +34,6 @@ pollster = "0.4.0"
 workspace = true
 
 [package.metadata.docs.rs]
-features = ["vello-0-9"]
+features = ["vello-0-11"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = []

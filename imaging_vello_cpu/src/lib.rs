@@ -81,9 +81,7 @@ use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::paint::{Image as VelloImage, ImageSource};
 use vello_cpu::kurbo::{BezPath, StrokeOpts, stroke};
-use vello_cpu::{
-    Glyph as VelloGlyph, Pixmap, RenderContext, RenderMode, RenderSettings, Resources,
-};
+use vello_cpu::{Glyph as VelloGlyph, Pixmap, PixmapMut, RenderContext, RenderSettings, Resources};
 
 /// Errors that can occur when rendering via Vello CPU.
 #[derive(Debug)]
@@ -136,19 +134,12 @@ impl VelloCpuRenderer {
         Ok((width, height))
     }
 
-    fn render_settings() -> RenderSettings {
-        RenderSettings {
-            render_mode: RenderMode::OptimizeSpeed,
-            ..RenderSettings::default()
-        }
-    }
-
     /// Create a renderer with an initial target size.
     ///
     /// Scene rendering methods resize this target on demand. The renderer uses Vello CPU's
     /// `OptimizeSpeed` mode by default to keep snapshots stable.
     pub fn new(width: u16, height: u16) -> Self {
-        let ctx = RenderContext::new_with(width, height, Self::render_settings());
+        let ctx = RenderContext::new_with(width, height, RenderSettings::default());
         Self {
             ctx,
             resources: Resources::new(),
@@ -192,7 +183,7 @@ impl VelloCpuRenderer {
             return;
         }
 
-        self.ctx = RenderContext::new_with(width, height, Self::render_settings());
+        self.ctx = RenderContext::new_with(width, height, RenderSettings::default());
         self.resources = Resources::new();
         self.width = width;
         self.height = height;
@@ -243,12 +234,10 @@ impl VelloCpuRenderer {
 
         image.resize(u32::from(self.width), u32::from(self.height));
         self.ctx.flush();
-        self.ctx.render_to_buffer(
+        self.ctx.render(
+            PixmapMut::new(self.width, self.height, image.data.as_mut_slice())
+                .expect("image buffer matches render dimensions"),
             &mut self.resources,
-            image.data.as_mut_slice(),
-            self.width,
-            self.height,
-            Self::render_settings().render_mode,
         );
         unpremultiply_rgba8_in_place(image.data.as_mut_slice());
         Ok(())
@@ -284,12 +273,10 @@ impl VelloCpuRenderer {
         }
 
         self.ctx.flush();
-        self.ctx.render_to_buffer(
+        self.ctx.render(
+            PixmapMut::new(self.width, self.height, &mut target.data[..required_len])
+                .expect("validated target matches render dimensions"),
             &mut self.resources,
-            &mut target.data[..required_len],
-            self.width,
-            self.height,
-            Self::render_settings().render_mode,
         );
         unpremultiply_rgba8_in_place(&mut target.data[..required_len]);
         Ok(())
@@ -422,7 +409,7 @@ impl VelloCpuRenderer {
             })
             .collect::<Vec<_>>();
 
-        match glyph_run.style {
+        let result = match glyph_run.style {
             Style::Fill(fill_rule) => {
                 self.ctx.set_fill_rule(*fill_rule);
                 let builder = self
@@ -436,7 +423,7 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                builder.fill_glyphs(glyphs.into_iter());
+                builder.fill_glyphs(glyphs.into_iter())
             }
             Style::Stroke(stroke) => {
                 self.ctx.set_stroke(stroke.clone());
@@ -451,8 +438,11 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                builder.stroke_glyphs(glyphs.into_iter());
+                builder.stroke_glyphs(glyphs.into_iter())
             }
+        };
+        if result.is_err() {
+            self.set_error_once(Error::Internal("glyph rendering failed"));
         }
     }
 
@@ -465,6 +455,7 @@ impl VelloCpuRenderer {
             &draw.rect,
             f64_to_f32(draw.radius),
             f64_to_f32(draw.std_dev),
+            false,
         );
     }
 
@@ -496,9 +487,7 @@ impl VelloCpuRenderer {
 
         let mut pixmap = Pixmap::new(self.width, self.height);
         renderer.ctx.flush();
-        renderer
-            .ctx
-            .render_to_pixmap(&mut renderer.resources, &mut pixmap);
+        renderer.ctx.render(&mut pixmap, &mut renderer.resources);
         let mask = match mode {
             MaskMode::Alpha => vello_cpu::Mask::new_alpha(&pixmap),
             MaskMode::Luminance => vello_cpu::Mask::new_luminance(&pixmap),
@@ -650,12 +639,16 @@ impl PaintSink for VelloCpuRenderer {
             self.set_error_once(Error::Internal("pop_clip underflow"));
             return;
         }
-        self.ctx.pop_clip_path();
+        self.ctx.pop_clip();
         self.clip_depth -= 1;
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
+            return;
+        }
+        if group.filters.len() > 1 {
+            self.set_error_once(Error::UnsupportedFilter);
             return;
         }
         let (clip_path, clip_transform) = match group.clip {
@@ -885,6 +878,31 @@ mod tests {
     }
 
     #[test]
+    fn render_reports_unrenderable_glyphs() {
+        let font = peniko::FontData::new(
+            peniko::Blob::new(Arc::new(include_bytes!(
+                "../../test_assets/fonts/NotoSans-Regular.ttf"
+            ))),
+            0,
+        );
+        let mut renderer = VelloCpuRenderer::new(32, 32);
+        Painter::new(&mut renderer)
+            .glyphs(&font, Color::BLACK)
+            .draw(
+                &Style::Fill(Fill::NonZero),
+                [imaging::record::Glyph {
+                    id: u32::MAX,
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            );
+        assert!(matches!(
+            renderer.finish(),
+            Err(Error::Internal("glyph rendering failed"))
+        ));
+    }
+
+    #[test]
     fn render_source_renders_image() {
         let mut renderer = VelloCpuRenderer::new(48, 48);
         let mut scene = Scene::new();
@@ -974,5 +992,25 @@ mod tests {
             error,
             ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
         ));
+    }
+    #[test]
+    fn multiple_group_filters_return_unsupported_without_panicking() {
+        let mut scene = Scene::new();
+        scene.push_group(imaging::record::Group {
+            filters: vec![Filter::blur(1.0), Filter::blur(2.0)],
+            ..Default::default()
+        });
+        Painter::new(&mut scene).fill_rect(Rect::new(8.0, 8.0, 24.0, 24.0), Color::WHITE);
+        scene.pop_group();
+        scene.validate().unwrap();
+        let mut renderer = VelloCpuRenderer::new(32, 32);
+        assert!(matches!(
+            renderer.render_scene(&scene, 32, 32),
+            Err(Error::UnsupportedFilter)
+        ));
+        assert!(
+            renderer.render_scene(&Scene::new(), 32, 32).is_ok(),
+            "renderer must recover on the next frame"
+        );
     }
 }
