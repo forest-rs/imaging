@@ -20,7 +20,7 @@ kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 skrifa = "0.40.0"
 svg_imaging = { workspace = true }
-vello_hybrid = { default-features = true, optional = true, version = "0.0.9" }
+vello_gpu = { default-features = true, optional = true, version = "0.3.0" }
 
 [lints]
 workspace = true
@@ -34,5 +34,5 @@ default = []
 vello_cpu = ["dep:imaging_vello_cpu"]
 skia = ["dep:imaging_skia"]
 tiny_skia = ["dep:imaging_tiny_skia"]
-vello_hybrid = ["dep:imaging_vello_hybrid", "dep:vello_hybrid"]
+vello_hybrid = ["dep:imaging_vello_hybrid", "dep:vello_gpu"]
 vello = ["dep:imaging_vello"]

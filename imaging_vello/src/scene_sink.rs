@@ -125,16 +125,15 @@ impl<'a> VelloSceneSink<'a> {
             return;
         }
         #[cfg(all(
-            not(feature = "vello-0-9"),
+            not(any(feature = "vello-0-9", feature = "vello-0-11")),
             any(feature = "vello-0-7", feature = "vello-0-8")
         ))]
         if glyph_run.brush_transform.is_some() {
             self.set_error_once(Error::UnsupportedGlyphBrushTransform);
             return;
         }
-        let Some(paint) = self.brush_to_brush(glyph_run.brush, glyph_run.composite) else {
-            return;
-        };
+        // The glyph builder applies composite alpha, including to color glyphs.
+        let paint = glyph_run.brush.to_owned();
 
         let builder = self
             .scene
@@ -144,7 +143,7 @@ impl<'a> VelloSceneSink<'a> {
             .hint(glyph_run.hint)
             .normalized_coords(glyph_run.normalized_coords)
             .brush(&paint);
-        #[cfg(feature = "vello-0-9")]
+        #[cfg(any(feature = "vello-0-9", feature = "vello-0-11"))]
         let builder = builder.brush_transform(glyph_run.brush_transform);
         let builder = builder.brush_alpha(glyph_run.composite.alpha);
         let builder = builder.glyph_transform(glyph_run.glyph_transform);
@@ -557,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "vello-0-9")]
+    #[cfg(any(feature = "vello-0-9", feature = "vello-0-11"))]
     fn vello_scene_sink_accepts_glyph_brush_transforms() {
         const TEST_FONT_BYTES: &[u8] = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -585,7 +584,7 @@ mod tests {
 
     #[test]
     #[cfg(all(
-        not(feature = "vello-0-9"),
+        not(any(feature = "vello-0-9", feature = "vello-0-11")),
         any(feature = "vello-0-7", feature = "vello-0-8")
     ))]
     fn vello_scene_sink_rejects_glyph_brush_transforms_before_vello_0_9() {

@@ -24,8 +24,8 @@ Full documentation at https://github.com/orium/cargo-rdme -->
 Vello hybrid backend for `imaging`.
 
 This crate provides a headless CPU/GPU renderer that consumes native
-[`vello_hybrid::Scene`] values and renders them to GPU targets or RGBA8 image data using
-`vello_hybrid` + `wgpu`.
+[`vello_gpu::Scene`] values and renders them to GPU targets or RGBA8 image data using
+`vello_gpu` + `wgpu`.
 
 Semantic [`imaging::record::Scene`] values can be lowered to native hybrid scenes through
 [`VelloHybridRenderer::encode_scene`].
@@ -35,7 +35,7 @@ presentation targets, then pass those handles into [`VelloHybridRenderer`].
 
 Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
 and translated to backend-managed opaque image ids. Use [`VelloHybridSceneSink::with_renderer`]
-when recording directly into a native [`vello_hybrid::Scene`] and you want the same image
+when recording directly into a native [`vello_gpu::Scene`] and you want the same image
 support.
 
 # Render A Recorded Scene
@@ -66,10 +66,10 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
 }
 ```
 
-# Record Into `vello_hybrid::Scene`
+# Record Into `vello_gpu::Scene`
 
 If you want a backend-native retained scene without owning a full renderer, wrap an existing
-[`vello_hybrid::Scene`] with [`VelloHybridSceneSink`].
+[`vello_gpu::Scene`] with [`VelloHybridSceneSink`].
 
 ```rust
 use imaging::Painter;
@@ -79,7 +79,7 @@ use peniko::{Brush, Color};
 
 fn main() -> Result<(), imaging_vello_hybrid::Error> {
     let paint = Brush::Solid(Color::from_rgb8(0x1d, 0x4e, 0x89));
-    let mut scene = vello_hybrid::Scene::new(128, 128);
+    let mut scene = vello_gpu::Scene::new(128, 128);
     scene.reset();
 
     {
@@ -95,10 +95,10 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
 
 Use [`VelloHybridSceneSink::with_renderer`] instead when the scene uses image brushes.
 
-# Record Image Brushes Into `vello_hybrid::Scene`
+# Record Image Brushes Into `vello_gpu::Scene`
 
 Use [`VelloHybridSceneSink::with_renderer`] when recording image brushes directly into a
-native [`vello_hybrid::Scene`]. The sink uploads images through the renderer and reuses them
+native [`vello_gpu::Scene`]. The sink uploads images through the renderer and reuses them
 across later recordings and renders.
 
 ```rust
@@ -123,7 +123,7 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
     let brush = Brush::Image(ImageBrush::new(image));
 
     let mut renderer = VelloHybridRenderer::new(device, queue);
-    let mut scene = vello_hybrid::Scene::new(128, 128);
+    let mut scene = vello_gpu::Scene::new(128, 128);
     scene.reset();
 
     {
@@ -139,7 +139,7 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
 }
 ```
 
-# Render A Native `vello_hybrid::Scene`
+# Render A Native `vello_gpu::Scene`
 
 If you already have a native hybrid scene, hand it directly to [`VelloHybridRenderer`].
 
@@ -151,7 +151,7 @@ use peniko::{Brush, Color};
 
 fn main() -> Result<(), imaging_vello_hybrid::Error> {
     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
-    let mut scene = vello_hybrid::Scene::new(128, 128);
+    let mut scene = vello_gpu::Scene::new(128, 128);
     scene.reset();
 
     {
@@ -175,7 +175,7 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
 [`VelloHybridRenderer::encode_scene`]: https://docs.rs/imaging_vello_hybrid/latest/imaging_vello_hybrid/struct.VelloHybridRenderer.html#method.encode_scene
 [`VelloHybridSceneSink`]: https://docs.rs/imaging_vello_hybrid/latest/imaging_vello_hybrid/struct.VelloHybridSceneSink.html
 [`VelloHybridSceneSink::with_renderer`]: https://docs.rs/imaging_vello_hybrid/latest/imaging_vello_hybrid/struct.VelloHybridSceneSink.html#method.with_renderer
-[`vello_hybrid::Scene`]: https://docs.rs/vello_hybrid/latest/vello_hybrid/struct.Scene.html
+[`vello_gpu::Scene`]: https://docs.rs/vello_gpu/latest/vello_gpu/struct.Scene.html
 
 ## Minimum supported Rust Version (MSRV)
 

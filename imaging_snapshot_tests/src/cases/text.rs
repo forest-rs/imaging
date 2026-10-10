@@ -250,7 +250,8 @@ impl SnapshotCase for GmGlyphRunsImageStroke {
     }
 
     fn vello_max_diff_pixels(&self) -> u64 {
-        8
+        // Vello 0.11/wgpu 30 varies by one channel value on up to 14 sampling-edge pixels.
+        16
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {

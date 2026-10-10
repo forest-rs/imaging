@@ -150,7 +150,12 @@ pub(crate) fn read_texture_into_target(
         .map_err(|_| ReadbackError::CallbackDropped)?
         .map_err(|_| ReadbackError::BufferMap)?;
 
+    #[cfg(not(feature = "vello-0-11"))]
     let mapped = slice.get_mapped_range();
+    #[cfg(feature = "vello-0-11")]
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|_| ReadbackError::BufferMap)?;
     for (row, out_row) in mapped
         .chunks_exact(bytes_per_row as usize)
         .zip(data.chunks_exact_mut(bytes_per_row_out))

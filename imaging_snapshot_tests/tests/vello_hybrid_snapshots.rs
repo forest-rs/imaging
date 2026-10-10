@@ -26,11 +26,7 @@ fn try_init_device_and_queue() -> Result<
     block_on(async {
         let instance = imaging_vello_hybrid::wgpu::Instance::default();
         let adapter = instance
-            .request_adapter(&imaging_vello_hybrid::wgpu::RequestAdapterOptions {
-                power_preference: imaging_vello_hybrid::wgpu::PowerPreference::default(),
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
+            .request_adapter(&imaging_vello_hybrid::wgpu::RequestAdapterOptions::default())
             .await
             .map_err(|_| ())?;
         adapter
@@ -93,7 +89,7 @@ fn native_scene_sink_supports_image_brushes_with_renderer() {
         return;
     };
 
-    let mut scene = vello_hybrid::Scene::new(32, 32);
+    let mut scene = vello_gpu::Scene::new(32, 32);
     scene.reset();
     {
         let brush = Brush::Image(ImageBrush::new(ImageData {

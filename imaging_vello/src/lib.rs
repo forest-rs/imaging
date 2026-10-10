@@ -14,7 +14,8 @@
 //!
 //! Enable a Vello compatibility feature:
 //!
-//! - `vello-0-9` (default)
+//! - `vello-0-11` (default) with `wgpu` 30
+//! - `vello-0-9` for integrations that still use `wgpu` 29
 //! - `vello-0-8` for integrations that still use `wgpu` 28
 //! - `vello-0-7` for integrations that still use `wgpu` 27
 //!
@@ -114,8 +115,13 @@
 mod scene_sink;
 mod wgpu_support;
 
-#[cfg(not(any(feature = "vello-0-7", feature = "vello-0-8", feature = "vello-0-9")))]
-compile_error!("Enable one of `vello-0-7`, `vello-0-8`, or `vello-0-9`.");
+#[cfg(not(any(
+    feature = "vello-0-7",
+    feature = "vello-0-8",
+    feature = "vello-0-9",
+    feature = "vello-0-11"
+)))]
+compile_error!("Enable one of `vello-0-7`, `vello-0-8`, `vello-0-9`, or `vello-0-11`.");
 
 use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
@@ -124,30 +130,49 @@ use imaging::render::{
     ImageTargetError, RenderContentError, RenderSource, RenderUnsupportedError,
 };
 #[cfg(all(
-    not(any(feature = "vello-0-8", feature = "vello-0-9")),
+    not(any(feature = "vello-0-8", feature = "vello-0-9", feature = "vello-0-11")),
     feature = "vello-0-7"
 ))]
 use imaging_wgpu::v27::{TextureRenderer, TextureViewTarget};
-#[cfg(all(not(feature = "vello-0-9"), feature = "vello-0-8"))]
+#[cfg(all(
+    not(any(feature = "vello-0-9", feature = "vello-0-11")),
+    feature = "vello-0-8"
+))]
 use imaging_wgpu::v28::{TextureRenderer, TextureViewTarget};
-#[cfg(feature = "vello-0-9")]
+#[cfg(all(not(feature = "vello-0-11"), feature = "vello-0-9"))]
 use imaging_wgpu::v29::{TextureRenderer, TextureViewTarget};
+#[cfg(feature = "vello-0-11")]
+use imaging_wgpu::v30::{TextureRenderer, TextureViewTarget};
 use imaging_wgpu::{TextureRendererError, TextureTargetError};
 use kurbo::Rect;
 
-#[cfg(all(feature = "vello-0-7", feature = "vello-0-9"))]
+#[cfg(all(
+    feature = "vello-0-7",
+    any(feature = "vello-0-8", feature = "vello-0-9", feature = "vello-0-11")
+))]
 use vello_07 as _;
 #[cfg(all(
-    not(any(feature = "vello-0-8", feature = "vello-0-9")),
+    not(any(feature = "vello-0-8", feature = "vello-0-9", feature = "vello-0-11")),
     feature = "vello-0-7"
 ))]
 pub use vello_07 as vello;
-#[cfg(all(feature = "vello-0-8", feature = "vello-0-9"))]
+#[cfg(all(
+    feature = "vello-0-8",
+    any(feature = "vello-0-9", feature = "vello-0-11")
+))]
 use vello_08 as _;
-#[cfg(all(not(feature = "vello-0-9"), feature = "vello-0-8"))]
+#[cfg(all(
+    not(any(feature = "vello-0-9", feature = "vello-0-11")),
+    feature = "vello-0-8"
+))]
 pub use vello_08 as vello;
-#[cfg(feature = "vello-0-9")]
+#[cfg(all(not(feature = "vello-0-11"), feature = "vello-0-9"))]
 pub use vello_09 as vello;
+
+#[cfg(all(feature = "vello-0-9", feature = "vello-0-11"))]
+use vello_09 as _;
+#[cfg(feature = "vello-0-11")]
+pub use vello_011 as vello;
 
 pub use crate::vello::wgpu;
 use crate::vello::{AaConfig, RenderParams};
@@ -602,11 +627,7 @@ mod tests {
         block_on(async {
             let instance = wgpu::Instance::default();
             let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::default(),
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                })
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
                 .map_err(|_| ())?;
             adapter
@@ -904,5 +925,72 @@ mod tests {
         let image = renderer.render(&native, 16, 16).unwrap();
         assert_eq!(image.width, 16);
         assert_eq!(image.height, 16);
+    }
+    #[test]
+    #[cfg_attr(skip_gpu_tests, ignore)]
+    fn glyph_composite_alpha_is_applied_once() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            assert!(
+                std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() != Ok("yes"),
+                "GPU initialization failed"
+            );
+            return;
+        };
+        let mut renderer = VelloRenderer::new(device, queue).unwrap();
+        let font = peniko::FontData::new(
+            peniko::Blob::new(std::sync::Arc::new(
+                include_bytes!("../../test_assets/fonts/NotoSans-Regular.ttf").as_slice(),
+            )),
+            0,
+        );
+        let brushes = [
+            peniko::Brush::Solid(Color::WHITE),
+            peniko::Brush::Gradient(
+                peniko::Gradient::new_linear((0.0, 0.0), (64.0, 0.0))
+                    .with_stops([Color::WHITE, Color::BLACK]),
+            ),
+            peniko::Brush::Image(peniko::ImageBrush::new(peniko::ImageData {
+                data: peniko::Blob::new(std::sync::Arc::new([255_u8; 4])),
+                format: peniko::ImageFormat::Rgba8,
+                alpha_type: peniko::ImageAlphaType::Alpha,
+                width: 1,
+                height: 1,
+            })),
+        ];
+        for brush in &brushes {
+            for style in [
+                peniko::Style::Fill(peniko::Fill::NonZero),
+                peniko::Style::Stroke(kurbo::Stroke::new(3.0)),
+            ] {
+                let mut scene = Scene::new();
+                Painter::new(&mut scene)
+                    .glyphs(&font, brush)
+                    .font_size(48.0)
+                    .composite(imaging::Composite {
+                        alpha: 0.5,
+                        ..Default::default()
+                    })
+                    .draw(
+                        &style,
+                        [imaging::record::Glyph {
+                            id: 36,
+                            x: 8.0,
+                            y: 52.0,
+                        }],
+                    );
+                let native = renderer.encode_scene(&scene, 64, 64).unwrap();
+                let image = renderer.render(&native, 64, 64).unwrap();
+                let alpha = image
+                    .data
+                    .chunks_exact(4)
+                    .map(|pixel| pixel[3])
+                    .max()
+                    .unwrap();
+                assert!(
+                    (127..=128).contains(&alpha),
+                    "{brush:?}/{style:?}: maximum alpha was {alpha}"
+                );
+            }
+        }
     }
 }
