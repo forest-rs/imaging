@@ -307,15 +307,6 @@ impl PaintSink for VelloSceneSink<'_> {
             self.set_error_once(Error::UnsupportedFilter);
             return;
         }
-        if group
-            .mask
-            .as_ref()
-            .is_some_and(|mask| mask.mask.mode != MaskMode::Luminance)
-        {
-            self.set_error_once(Error::UnsupportedMask);
-            return;
-        }
-
         if let Some(clip) = group.clip {
             match clip {
                 ClipRef::Fill {
@@ -411,17 +402,23 @@ impl PaintSink for VelloSceneSink<'_> {
             return;
         };
         if let Some(mask) = mask {
-            debug_assert_eq!(
-                mask.mode,
-                MaskMode::Luminance,
-                "only luminance masks should reach Vello group-mask replay"
-            );
-            self.scene.push_luminance_mask_layer(
-                Fill::NonZero,
-                1.0,
-                Affine::IDENTITY,
-                &self.surface_clip,
-            );
+            match mask.mode {
+                MaskMode::Alpha => self.scene.push_layer(
+                    Fill::NonZero,
+                    peniko::Compose::DestIn,
+                    1.0,
+                    Affine::IDENTITY,
+                    &self.surface_clip,
+                ),
+                MaskMode::Luminance => self.scene.push_luminance_mask_layer(
+                    Fill::NonZero,
+                    1.0,
+                    Affine::IDENTITY,
+                    &self.surface_clip,
+                ),
+            }
+            // Render the mask normally into an isolated source. DestIn uses its final alpha,
+            // preserving overlap, blend modes, nested groups, and image sampling.
             self.replay_masked_subscene(&mask.scene, mask.transform);
             self.scene.pop_layer();
         }
@@ -677,13 +674,15 @@ mod tests {
     }
 
     #[test]
-    fn vello_scene_sink_rejects_alpha_masks() {
+    fn vello_scene_sink_supports_alpha_masks() {
         let mut mask = Scene::new();
         mask.fill(FillRef::new(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE));
 
         let mut scene = VelloScene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Alpha, &mask)));
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedMask)));
+        sink.fill(FillRef::new(Rect::new(4.0, 4.0, 20.0, 20.0), Color::BLACK));
+        sink.pop_group();
+        sink.finish().unwrap();
     }
 }

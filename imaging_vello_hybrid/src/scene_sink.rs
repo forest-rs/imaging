@@ -8,8 +8,9 @@ use crate::{
 };
 use glifo::Glyph as VelloGlyph;
 use imaging::{
-    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
+    PaintSink, StrokeRef,
+    record::{Scene, replay_transformed},
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, ImageBrush, Style};
@@ -28,8 +29,19 @@ pub struct VelloHybridSceneSink<'a> {
     image_upload: Option<HybridImageUploadSession<'a>>,
     tolerance: f64,
     error: Option<Error>,
-    clip_depth: u32,
-    group_depth: u32,
+    layer_stack: Vec<LayerFrame>,
+}
+
+#[derive(Debug)]
+struct PendingMask {
+    scene: Scene,
+    transform: Affine,
+}
+
+#[derive(Debug)]
+enum LayerFrame {
+    Clip,
+    Group { mask: Option<Box<PendingMask>> },
 }
 
 enum SceneSinkResources<'a> {
@@ -116,8 +128,7 @@ impl core::fmt::Debug for VelloHybridSceneSink<'_> {
         f.debug_struct("VelloHybridSceneSink")
             .field("tolerance", &self.tolerance)
             .field("error", &self.error)
-            .field("clip_depth", &self.clip_depth)
-            .field("group_depth", &self.group_depth)
+            .field("layer_stack_depth", &self.layer_stack.len())
             .finish_non_exhaustive()
     }
 }
@@ -136,8 +147,7 @@ impl<'a> VelloHybridSceneSink<'a> {
             image_upload: None,
             tolerance: 0.1,
             error: None,
-            clip_depth: 0,
-            group_depth: 0,
+            layer_stack: Vec::new(),
         }
     }
 
@@ -182,8 +192,7 @@ impl<'a> VelloHybridSceneSink<'a> {
             image_upload: Some(image_upload),
             tolerance: 0.1,
             error: None,
-            clip_depth: 0,
-            group_depth: 0,
+            layer_stack: Vec::new(),
         }
     }
 
@@ -199,10 +208,8 @@ impl<'a> VelloHybridSceneSink<'a> {
     pub fn finish(mut self) -> Result<(), Error> {
         let result = if let Some(err) = self.error.take() {
             Err(err)
-        } else if self.clip_depth != 0 {
-            Err(Error::Internal("unbalanced clip stack"))
-        } else if self.group_depth != 0 {
-            Err(Error::Internal("unbalanced group stack"))
+        } else if !self.layer_stack.is_empty() {
+            Err(Error::Internal("unbalanced layer stack"))
         } else {
             Ok(())
         };
@@ -465,26 +472,29 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         self.scene.set_transform(xf);
         self.scene.set_fill_rule(fill_rule);
         self.scene.push_clip_path(&path);
-        self.clip_depth += 1;
+        self.layer_stack.push(LayerFrame::Clip);
     }
 
     fn pop_clip(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if self.clip_depth == 0 {
-            self.set_error_once(Error::Internal("pop_clip underflow"));
+        if !matches!(self.layer_stack.pop(), Some(LayerFrame::Clip)) {
+            self.set_error_once(Error::Internal("unbalanced clip stack"));
             return;
         }
         self.scene.pop_clip();
-        self.clip_depth -= 1;
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
         if self.error.is_some() {
             return;
         }
-        if group.mask.is_some() {
+        if group
+            .mask
+            .as_ref()
+            .is_some_and(|mask| mask.mask.mode != MaskMode::Alpha)
+        {
             self.set_error_once(Error::UnsupportedMask);
             return;
         }
@@ -503,19 +513,33 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         let opacity = Some(group.composite.alpha);
         self.scene
             .push_layer(clip_path.as_ref(), blend, opacity, None, None);
-        self.group_depth += 1;
+        self.layer_stack.push(LayerFrame::Group {
+            mask: group.mask.map(|mask| {
+                Box::new(PendingMask {
+                    scene: mask.mask.scene.clone(),
+                    transform: mask.transform,
+                })
+            }),
+        });
     }
 
     fn pop_group(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if self.group_depth == 0 {
-            self.set_error_once(Error::Internal("pop_group underflow"));
+        let Some(LayerFrame::Group { mask }) = self.layer_stack.pop() else {
+            self.set_error_once(Error::Internal("unbalanced group stack"));
             return;
+        };
+        if let Some(mask) = mask {
+            // Keep the mask's original paints: only the alpha of the fully composited mask
+            // participates in DestIn. Converting individual draws changes blend semantics.
+            self.scene.set_transform(Affine::IDENTITY);
+            self.scene.push_blend_layer(peniko::Compose::DestIn.into());
+            replay_transformed(&mask.scene, self, mask.transform);
+            self.scene.pop_layer();
         }
         self.scene.pop_layer();
-        self.group_depth -= 1;
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -648,7 +672,20 @@ mod tests {
         sink.pop_clip();
         assert!(matches!(
             sink.finish(),
-            Err(Error::Internal("pop_clip underflow"))
+            Err(Error::Internal("unbalanced clip stack"))
+        ));
+    }
+
+    #[test]
+    fn hybrid_scene_sink_rejects_crossed_clip_and_group_stacks() {
+        let mut scene = VelloHybridScene::new(32, 32);
+        let mut sink = VelloHybridSceneSink::new(&mut scene);
+        sink.push_group(GroupRef::new());
+        sink.push_clip(ClipRef::fill(kurbo::Rect::new(0.0, 0.0, 16.0, 16.0)));
+        sink.pop_group();
+        assert!(matches!(
+            sink.finish(),
+            Err(Error::Internal("unbalanced group stack"))
         ));
     }
 
@@ -719,13 +756,13 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_scene_sink_rejects_masks() {
-        let mut mask = record::Scene::new();
+    fn hybrid_scene_sink_rejects_luminance_masks() {
+        let mut mask = Scene::new();
         mask.fill(FillRef::new(
             kurbo::Rect::new(0.0, 0.0, 8.0, 8.0),
             peniko::Color::WHITE,
         ));
-        let mut content = record::Scene::new();
+        let mut content = Scene::new();
         content.fill(FillRef::new(
             kurbo::Rect::new(1.0, 1.0, 7.0, 7.0),
             peniko::Color::BLACK,
