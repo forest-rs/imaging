@@ -42,6 +42,10 @@ support.
 Alpha masks render the mask scene into an isolated `DestIn` layer, preserving its paint,
 blending, and image bindings. Luminance masks remain unsupported by this backend.
 
+Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
+X/Y standard deviations; anisotropic filters return [`Error::UnsupportedFilter`].
+Blurred rounded rectangles use the renderer's native analytic draw.
+
 # Render A Recorded Scene
 
 Record commands into [`imaging::record::Scene`], then render them with

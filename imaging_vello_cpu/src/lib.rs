@@ -6,6 +6,9 @@
 //! This crate provides a CPU renderer that consumes `imaging::record::Scene` (or accepts commands
 //! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 //!
+//! Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
+//! X/Y standard deviations; anisotropic filters return [`Error::UnsupportedFilter`].
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with [`VelloCpuRenderer`].
@@ -64,7 +67,6 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use imaging::{
@@ -78,7 +80,7 @@ use imaging::{
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{BlendMode, Brush, Fill, Style};
-use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
+use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterPrimitive};
 use vello_common::paint::{Image as VelloImage, ImageSource};
 use vello_cpu::kurbo::{BezPath, StrokeOpts, stroke};
 use vello_cpu::{Glyph as VelloGlyph, Pixmap, PixmapMut, RenderContext, RenderSettings, Resources};
@@ -114,7 +116,7 @@ pub struct VelloCpuRenderer {
     tolerance: f64,
     error: Option<Error>,
     clip_depth: u32,
-    group_depth: u32,
+    group_layers: Vec<usize>,
     mask_cache: VecDeque<CachedMask>,
 }
 
@@ -148,7 +150,7 @@ impl VelloCpuRenderer {
             tolerance: 0.1,
             error: None,
             clip_depth: 0,
-            group_depth: 0,
+            group_layers: Vec::new(),
             mask_cache: VecDeque::new(),
         }
     }
@@ -166,7 +168,7 @@ impl VelloCpuRenderer {
         self.ctx.reset();
         self.error = None;
         self.clip_depth = 0;
-        self.group_depth = 0;
+        self.group_layers.clear();
     }
 
     /// Drop any realized mask artifacts cached by the renderer.
@@ -190,7 +192,7 @@ impl VelloCpuRenderer {
         self.clear_cached_masks();
         self.error = None;
         self.clip_depth = 0;
-        self.group_depth = 0;
+        self.group_layers.clear();
     }
 
     /// Render a recorded scene into an RGBA8 image (unpremultiplied).
@@ -228,7 +230,7 @@ impl VelloCpuRenderer {
         if self.clip_depth != 0 {
             return Err(Error::Internal("unbalanced clip stack"));
         }
-        if self.group_depth != 0 {
+        if !self.group_layers.is_empty() {
             return Err(Error::Internal("unbalanced group stack"));
         }
 
@@ -250,7 +252,7 @@ impl VelloCpuRenderer {
         if self.clip_depth != 0 {
             return Err(Error::Internal("unbalanced clip stack"));
         }
-        if self.group_depth != 0 {
+        if !self.group_layers.is_empty() {
             return Err(Error::Internal("unbalanced group stack"));
         }
         if target.width != u32::from(self.width) || target.height != u32::from(self.height) {
@@ -342,51 +344,6 @@ impl VelloCpuRenderer {
                 (transform, outline, Fill::NonZero)
             }
         }
-    }
-
-    fn filters_to_vello(&mut self, filters: &[Filter]) -> Option<VelloFilter> {
-        if filters.is_empty() {
-            return None;
-        }
-
-        let mut graph = FilterGraph::new();
-        let mut last = None;
-        for f in filters {
-            let primitive = match *f {
-                Filter::Flood { color } => FilterPrimitive::Flood { color },
-                Filter::Blur {
-                    std_deviation_x,
-                    std_deviation_y,
-                } => FilterPrimitive::GaussianBlur {
-                    std_deviation: std_deviation_x.max(std_deviation_y),
-                    edge_mode: EdgeMode::None,
-                },
-                Filter::DropShadow {
-                    dx,
-                    dy,
-                    std_deviation_x,
-                    std_deviation_y,
-                    color,
-                } => FilterPrimitive::DropShadow {
-                    dx,
-                    dy,
-                    std_deviation: std_deviation_x.max(std_deviation_y),
-                    color,
-                    edge_mode: EdgeMode::None,
-                },
-                Filter::Offset { dx, dy } => FilterPrimitive::Offset { dx, dy },
-            };
-            last = Some(graph.add(primitive, None));
-        }
-        if let Some(out) = last {
-            graph.set_output(out);
-        } else {
-            self.set_error_once(Error::UnsupportedFilter);
-            return None;
-        }
-        Some(VelloFilter {
-            graph: Arc::new(graph),
-        })
     }
 
     fn draw_glyph_run(
@@ -484,7 +441,7 @@ impl VelloCpuRenderer {
             self.set_error_once(Error::Internal("unbalanced clip stack in mask scene"));
             return None;
         }
-        if renderer.group_depth != 0 {
+        if !renderer.group_layers.is_empty() {
             self.set_error_once(Error::Internal("unbalanced group stack in mask scene"));
             return None;
         }
@@ -623,6 +580,44 @@ fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     u8::try_from(value.min(u32::from(u8::MAX))).expect("unpremultiplied channel must fit in u8")
 }
 
+fn filter_to_vello(filter: Filter) -> Result<VelloFilter, Error> {
+    let primitive = match filter {
+        Filter::Flood { color } => FilterPrimitive::Flood { color },
+        Filter::Blur {
+            std_deviation_x,
+            std_deviation_y,
+        } => {
+            if std_deviation_x != std_deviation_y {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::GaussianBlur {
+                std_deviation: std_deviation_x,
+                edge_mode: EdgeMode::None,
+            }
+        }
+        Filter::DropShadow {
+            dx,
+            dy,
+            std_deviation_x,
+            std_deviation_y,
+            color,
+        } => {
+            if std_deviation_x != std_deviation_y {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::DropShadow {
+                dx,
+                dy,
+                std_deviation: std_deviation_x,
+                color,
+                edge_mode: EdgeMode::None,
+            }
+        }
+        Filter::Offset { dx, dy } => FilterPrimitive::Offset { dx, dy },
+    };
+    Ok(VelloFilter::from_primitive(primitive))
+}
+
 impl PaintSink for VelloCpuRenderer {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         if self.error.is_some() {
@@ -651,10 +646,19 @@ impl PaintSink for VelloCpuRenderer {
         if self.error.is_some() {
             return;
         }
-        if group.filters.len() > 1 {
-            self.set_error_once(Error::UnsupportedFilter);
-            return;
-        }
+        let filters = match group
+            .filters
+            .iter()
+            .copied()
+            .map(filter_to_vello)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(filters) => filters,
+            Err(error) => {
+                self.set_error_once(error);
+                return;
+            }
+        };
         let (clip_path, clip_transform) = match group.clip {
             None => (None, Affine::IDENTITY),
             Some(clip) => {
@@ -671,22 +675,43 @@ impl PaintSink for VelloCpuRenderer {
         let mask = group
             .mask
             .and_then(|mask| self.render_mask(mask.mask.scene, mask.mask.mode, mask.transform));
-        let filter = self.filters_to_vello(group.filters);
         self.ctx
-            .push_layer(clip_path.as_ref(), blend, opacity, mask, filter);
-        self.group_depth += 1;
+            .push_layer(clip_path.as_ref(), blend, opacity, mask, None);
+        self.ctx.set_transform(Affine::IDENTITY);
+        let filter_layers = filters.len();
+        // Each native filter supports one primitive. Nest in reverse so the first filter runs first.
+        for filter in filters.into_iter().rev() {
+            let flood = matches!(filter.graph.primitives[0], FilterPrimitive::Flood { .. });
+            self.ctx.push_filter_layer(filter);
+            if flood {
+                // Flood has no source dependency. Seed full-surface bounds even for empty content.
+                self.ctx.set_fill_rule(Fill::NonZero);
+                self.ctx.set_blend_mode(BlendMode::default());
+                self.ctx.set_paint_transform(Affine::IDENTITY);
+                self.ctx.set_paint(Brush::Solid(peniko::Color::WHITE));
+                self.ctx.fill_rect(&kurbo::Rect::new(
+                    0.0,
+                    0.0,
+                    f64::from(self.width),
+                    f64::from(self.height),
+                ));
+            }
+        }
+        self.group_layers.push(filter_layers);
     }
 
     fn pop_group(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if self.group_depth == 0 {
+        let Some(filter_layers) = self.group_layers.pop() else {
             self.set_error_once(Error::Internal("pop_group underflow"));
             return;
+        };
+        for _ in 0..filter_layers {
+            self.ctx.pop_layer();
         }
         self.ctx.pop_layer();
-        self.group_depth -= 1;
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -763,6 +788,7 @@ impl PaintSink for VelloCpuRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
     use imaging::{
         Painter,
         render::{ImageBufferTarget, ImageTargetError},
@@ -998,10 +1024,10 @@ mod tests {
         ));
     }
     #[test]
-    fn multiple_group_filters_return_unsupported_without_panicking() {
+    fn anisotropic_group_filters_return_unsupported_without_panicking() {
         let mut scene = Scene::new();
         scene.push_group(imaging::record::Group {
-            filters: vec![Filter::blur(1.0), Filter::blur(2.0)],
+            filters: vec![Filter::blur(1.0), Filter::blur_xy(2.0, 1.0)],
             ..Default::default()
         });
         Painter::new(&mut scene).fill_rect(Rect::new(8.0, 8.0, 24.0, 24.0), Color::WHITE);

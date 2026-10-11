@@ -15,6 +15,7 @@ use imaging::{
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, ImageBrush, Style};
 use std::sync::Arc;
+use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterPrimitive};
 
 /// Borrowed adapter that streams `imaging` commands into an existing [`VelloHybridScene`].
 pub struct VelloHybridSceneSink<'a> {
@@ -41,7 +42,10 @@ struct PendingMask {
 #[derive(Debug)]
 enum LayerFrame {
     Clip,
-    Group { mask: Option<Box<PendingMask>> },
+    Group {
+        mask: Option<Box<PendingMask>>,
+        filter_layers: usize,
+    },
 }
 
 enum SceneSinkResources<'a> {
@@ -431,8 +435,24 @@ impl<'a> VelloHybridSceneSink<'a> {
         }
     }
 
-    fn draw_blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {
-        self.set_error_once(Error::UnsupportedBlurredRoundedRect);
+    fn draw_blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "native blur parameters use f32"
+        )]
+        let (radius, std_dev) = (draw.radius as f32, draw.std_dev as f32);
+        if !radius.is_finite() || !std_dev.is_finite() {
+            self.set_error_once(Error::UnsupportedBlurredRoundedRect);
+            return;
+        }
+        self.scene.set_transform(draw.transform);
+        self.scene.set_paint_transform(Affine::IDENTITY);
+        self.scene.set_blend_mode(draw.composite.blend);
+        self.scene.set_paint(Brush::Solid(
+            draw.color.multiply_alpha(draw.composite.alpha),
+        ));
+        self.scene
+            .fill_blurred_rounded_rect(&draw.rect, radius, std_dev, false);
     }
 
     fn fill_destructive(
@@ -461,6 +481,44 @@ impl<'a> VelloHybridSceneSink<'a> {
         ));
         self.scene.pop_layer();
     }
+}
+
+fn filter_to_vello(filter: imaging::Filter) -> Result<VelloFilter, Error> {
+    let primitive = match filter {
+        imaging::Filter::Flood { color } => FilterPrimitive::Flood { color },
+        imaging::Filter::Blur {
+            std_deviation_x,
+            std_deviation_y,
+        } => {
+            if std_deviation_x != std_deviation_y {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::GaussianBlur {
+                std_deviation: std_deviation_x,
+                edge_mode: EdgeMode::None,
+            }
+        }
+        imaging::Filter::DropShadow {
+            dx,
+            dy,
+            std_deviation_x,
+            std_deviation_y,
+            color,
+        } => {
+            if std_deviation_x != std_deviation_y {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::DropShadow {
+                dx,
+                dy,
+                std_deviation: std_deviation_x,
+                color,
+                edge_mode: EdgeMode::None,
+            }
+        }
+        imaging::Filter::Offset { dx, dy } => FilterPrimitive::Offset { dx, dy },
+    };
+    Ok(VelloFilter::from_primitive(primitive))
 }
 
 impl PaintSink for VelloHybridSceneSink<'_> {
@@ -498,10 +556,20 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             self.set_error_once(Error::UnsupportedMask);
             return;
         }
-        if !group.filters.is_empty() {
-            self.set_error_once(Error::UnsupportedFilter);
-            return;
-        }
+        let filters = match group
+            .filters
+            .iter()
+            .copied()
+            .map(filter_to_vello)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(filters) => filters,
+            Err(error) => {
+                self.set_error_once(error);
+                return;
+            }
+        };
+        self.scene.set_transform(Affine::IDENTITY);
         let clip_path = group.clip.map(|clip| {
             let (xf, path, fill_rule) = self.clip_to_path(clip);
             self.scene.set_transform(xf);
@@ -513,7 +581,27 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         let opacity = Some(group.composite.alpha);
         self.scene
             .push_layer(clip_path.as_ref(), blend, opacity, None, None);
+        self.scene.set_transform(Affine::IDENTITY);
+        let filter_layers = filters.len();
+        for filter in filters.into_iter().rev() {
+            let flood = matches!(filter.graph.primitives[0], FilterPrimitive::Flood { .. });
+            self.scene.push_filter_layer(filter);
+            if flood {
+                // Flood has no source dependency. Seed full-surface bounds even for empty content.
+                self.scene.set_fill_rule(peniko::Fill::NonZero);
+                self.scene.set_blend_mode(peniko::BlendMode::default());
+                self.scene.set_paint_transform(Affine::IDENTITY);
+                self.scene.set_paint(Brush::Solid(peniko::Color::WHITE));
+                self.scene.fill_rect(&kurbo::Rect::new(
+                    0.0,
+                    0.0,
+                    f64::from(self.scene.width()),
+                    f64::from(self.scene.height()),
+                ));
+            }
+        }
         self.layer_stack.push(LayerFrame::Group {
+            filter_layers,
             mask: group.mask.map(|mask| {
                 Box::new(PendingMask {
                     scene: mask.mask.scene.clone(),
@@ -527,10 +615,17 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         if self.error.is_some() {
             return;
         }
-        let Some(LayerFrame::Group { mask }) = self.layer_stack.pop() else {
+        let Some(LayerFrame::Group {
+            mask,
+            filter_layers,
+        }) = self.layer_stack.pop()
+        else {
             self.set_error_once(Error::Internal("unbalanced group stack"));
             return;
         };
+        for _ in 0..filter_layers {
+            self.scene.pop_layer();
+        }
         if let Some(mask) = mask {
             // Keep the mask's original paints: only the alpha of the fully composited mask
             // participates in DestIn. Converting individual draws changes blend semantics.
@@ -690,12 +785,30 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_scene_sink_rejects_filters() {
+    fn hybrid_scene_sink_rejects_anisotropic_filters() {
         let mut scene = VelloHybridScene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
-        sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
+        sink.push_group(GroupRef::new().with_filters(&[Filter::blur_xy(2.0, 1.0)]));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+    }
+
+    #[test]
+    fn hybrid_scene_sink_rejects_unrepresentable_blur_parameters() {
+        let mut scene = VelloHybridScene::new(32, 32);
+        let mut sink = VelloHybridSceneSink::new(&mut scene);
+        sink.blurred_rounded_rect(BlurredRoundedRect {
+            transform: Affine::IDENTITY,
+            rect: kurbo::Rect::new(4.0, 4.0, 28.0, 28.0),
+            color: peniko::Color::BLACK,
+            radius: 4.0,
+            std_dev: f64::MAX,
+            composite: Composite::default(),
+        });
+        assert!(matches!(
+            sink.finish(),
+            Err(Error::UnsupportedBlurredRoundedRect)
+        ));
     }
 
     #[test]
