@@ -85,8 +85,8 @@ mod tests {
     use alloc::{borrow::ToOwned, boxed::Box, vec, vec::Vec};
     use std::sync::Arc;
 
+    use imaging::Brush;
     use imaging::{MaskMode, Painter, record};
-    use peniko::Brush;
 
     use super::{ParseOptions, RenderOptions, SvgDocument};
 
@@ -543,8 +543,8 @@ mod tests {
                     *shape,
                     record::Geometry::Rect(kurbo::Rect::new(0.0, 0.0, 1.0, 1.0))
                 );
-                assert_eq!(image.image.width, 1);
-                assert_eq!(image.image.height, 1);
+                assert_eq!(image.image.width(), 1);
+                assert_eq!(image.image.height(), 1);
             }
             other => panic!("expected image fill draw, got {other:?}"),
         }

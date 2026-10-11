@@ -77,7 +77,7 @@ use imaging::{
     },
 };
 use kurbo::{Affine, Shape as _};
-use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
+use peniko::{BlendMode, Brush, Fill, Style};
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::paint::{Image as VelloImage, ImageSource};
 use vello_cpu::kurbo::{BezPath, StrokeOpts, stroke};
@@ -88,8 +88,8 @@ use vello_cpu::{Glyph as VelloGlyph, Pixmap, PixmapMut, RenderContext, RenderSet
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
+    /// This renderer cannot sample externally bound images.
+    UnsupportedExternalImage,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
     /// An internal invariant was violated.
@@ -297,9 +297,13 @@ impl VelloCpuRenderer {
 
     fn brush_to_paint(
         &mut self,
-        brush: BrushRef<'_>,
+        brush: imaging::BrushRef<'_>,
         composite: Composite,
     ) -> Option<vello_cpu::PaintType> {
+        let Some(brush) = brush.as_raster() else {
+            self.set_error_once(Error::UnsupportedExternalImage);
+            return None;
+        };
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
         let paint: vello_cpu::PaintType = match brush {
             Brush::Solid(c) => Brush::Solid(c),
@@ -562,8 +566,8 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         Error::InvalidScene(error) => {
             ImageRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        Error::UnsupportedExternalImage => {
+            ImageRendererError::Unsupported(RenderUnsupportedError::ExternalImage)
         }
         Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
         Error::Internal("image target dimensions do not match renderer output") => {

@@ -133,6 +133,12 @@ The default feature set enables `std` support in the geometry and color dependen
 imaging = { version = "0.0.1", default-features = false, features = ["libm"] }
 ```
 
+Images use [`ImageBrush`] and [`ImageBrushRef`] throughout fills, strokes, glyph runs, and
+[`Painter::draw_image`]. [`Image::Raster`] holds shared [`peniko::ImageData`] pixels;
+[`Image::External`] holds a typed resource handle bound by a renderer. Core recordings own
+handles without depending on GPU types. Encoded scenes keep the backend resources they sample
+alive, and unsupported or missing bindings produce explicit errors.
+
 The API is intentionally small and experimental; expect breaking changes while we iterate.
 
 <!-- cargo-rdme end -->

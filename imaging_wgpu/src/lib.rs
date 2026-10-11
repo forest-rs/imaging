@@ -15,6 +15,77 @@ use std::boxed::Box;
 
 pub use wgpu;
 
+/// Failure to bind a texture to an external image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextureImageError {
+    /// Texture dimensions, usage, or layout do not match the image.
+    InvalidTexture(&'static str),
+    /// The renderer cannot sample this texture format.
+    UnsupportedFormat,
+    /// The renderer cannot sample this alpha encoding without conversion.
+    UnsupportedAlphaType,
+    /// This handle already has a binding; unbind it before binding another resource.
+    AlreadyBound,
+}
+
+impl core::fmt::Display for TextureImageError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidTexture(message) => f.write_str(message),
+            Self::UnsupportedFormat => f.write_str("unsupported external image texture format"),
+            Self::UnsupportedAlphaType => f.write_str("unsupported external image alpha encoding"),
+            Self::AlreadyBound => f.write_str("external image is already bound"),
+        }
+    }
+}
+impl core::error::Error for TextureImageError {}
+
+/// Renderer capability for sampling caller-owned GPU images.
+///
+/// Bindings use the whole base mip of a single-layer, single-sample 2D texture from the same
+/// device as the renderer. Pixel dimensions and alpha encoding come from the image handle;
+/// texture formats and required usage flags are backend-specific.
+///
+/// Encoded scenes retain the binding they used. Unbinding prevents subsequent encodings from
+/// resolving the handle, while existing encoded scenes continue to work. Texture contents remain
+/// live: submit writes on the renderer's queue before rendering scenes that sample them.
+pub trait TextureImageRenderer {
+    /// Bind a texture to an image handle, retaining a reference to the texture.
+    fn bind_image(
+        &mut self,
+        image: &imaging::ExternalImage,
+        texture: &wgpu::Texture,
+    ) -> Result<(), TextureImageError>;
+
+    /// Remove a binding for future scene encodings. Return whether it existed.
+    fn unbind_image(&mut self, image: &imaging::ExternalImage) -> bool;
+}
+
+/// Validate the dimensions and base texture layout shared by texture-image backends.
+pub fn validate_image_texture(
+    image: &imaging::ExternalImage,
+    texture: &wgpu::Texture,
+) -> Result<(), TextureImageError> {
+    if image.width() == 0
+        || image.height() == 0
+        || texture.width() != image.width()
+        || texture.height() != image.height()
+    {
+        return Err(TextureImageError::InvalidTexture(
+            "external image dimensions must match a nonempty texture",
+        ));
+    }
+    if texture.dimension() != wgpu::TextureDimension::D2
+        || texture.depth_or_array_layers() != 1
+        || texture.sample_count() != 1
+    {
+        return Err(TextureImageError::InvalidTexture(
+            "external images require a single-layer, single-sample 2D texture",
+        ));
+    }
+    Ok(())
+}
+
 /// Shared texture-render-target failures surfaced by texture renderers.
 #[derive(Debug)]
 pub enum TextureTargetError {

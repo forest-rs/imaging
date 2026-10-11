@@ -4,12 +4,12 @@
 use crate::Error;
 use peniko::{ImageBrush, ImageData};
 use std::collections::VecDeque;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 use vello_common::paint::{Image as VelloImage, ImageId, ImageSource};
 
 #[derive(Debug)]
 pub(crate) struct HybridImageRegistry {
-    live: VecDeque<RegisteredImage>,
+    live: VecDeque<Arc<RegisteredImage>>,
     bytes_used: usize,
     max_bytes: usize,
 }
@@ -37,12 +37,8 @@ impl HybridImageRegistry {
         queue: &'a wgpu::Queue,
         mut encoder: wgpu::CommandEncoder,
     ) -> HybridImageUploadSession<'a> {
-        // We evict excess images at the start of the session,
-        // as opposed to keeping a strict limit during resolving.
-        // This is because our current goal is to avoid the AtlasLimitReached crash,
-        // and the exact memory usage isn't as important. While doing it at resolve time
-        // can lead to situations where we evict something from the same session,
-        // which would mean dangling image references in draw calls.
+        // The budget is soft: retained scenes pin their image allocations. Evict only
+        // unused images, before uploads for the next recording begin.
         self.evict_to_budget(resources, renderer, &mut encoder);
 
         HybridImageUploadSession {
@@ -73,13 +69,27 @@ impl HybridImageRegistry {
         renderer: &mut vello_gpu::Renderer,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        while self.bytes_used > self.max_bytes {
-            let Some(oldest) = self.live.pop_front() else {
-                break;
-            };
-            self.bytes_used = self.bytes_used.saturating_sub(oldest.bytes);
-            renderer.destroy_image(resources, encoder, oldest.id);
-        }
+        self.evict_unused(resources, renderer, encoder, self.max_bytes);
+    }
+
+    fn evict_unused(
+        &mut self,
+        resources: &mut vello_gpu::Resources,
+        renderer: &mut vello_gpu::Renderer,
+        encoder: &mut wgpu::CommandEncoder,
+        target_bytes: usize,
+    ) {
+        let mut bytes_used = self.bytes_used;
+        self.live.retain(|image| {
+            if bytes_used > target_bytes && Arc::strong_count(image) == 1 {
+                bytes_used = bytes_used.saturating_sub(image.bytes);
+                renderer.destroy_image(resources, encoder, image.id);
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes_used = bytes_used;
     }
 
     pub(crate) fn clear(
@@ -88,10 +98,7 @@ impl HybridImageRegistry {
         renderer: &mut vello_gpu::Renderer,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        for image in self.live.drain(..) {
-            renderer.destroy_image(resources, encoder, image.id);
-        }
-        self.bytes_used = 0;
+        self.evict_unused(resources, renderer, encoder, 0);
     }
 }
 
@@ -101,7 +108,7 @@ pub(crate) struct HybridImageUploadSession<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     encoder: Option<wgpu::CommandEncoder>,
-    pending: Vec<RegisteredImage>,
+    pending: Vec<Arc<RegisteredImage>>,
 }
 
 impl HybridImageUploadSession<'_> {
@@ -109,13 +116,13 @@ impl HybridImageUploadSession<'_> {
         &mut self,
         resources: &mut vello_gpu::Resources,
         brush: &ImageBrush,
-    ) -> Result<VelloImage, Error> {
+    ) -> Result<(VelloImage, Arc<RegisteredImage>), Error> {
         let key = ImageKey::derive(&brush.image);
-        let image = if let Some(image) = self.pending.iter().find(|ri| ri.key == key).copied() {
+        let image = if let Some(image) = self.pending.iter().find(|ri| ri.key == key).cloned() {
             image
         } else if let Some(index) = self.registry.live.iter().position(|ri| ri.key == key) {
             let index = self.registry.touch(index);
-            self.registry.live.get(index).copied().unwrap()
+            Arc::clone(self.registry.live.get(index).unwrap())
         } else {
             let image_source = ImageSource::from_peniko_image_data(&brush.image);
             let ImageSource::Pixmap(pixmap) = image_source else {
@@ -132,7 +139,7 @@ impl HybridImageUploadSession<'_> {
                     .expect("hybrid image upload session should own an encoder"),
                 &pixmap,
             );
-            let image = RegisteredImage {
+            let image = Arc::new(RegisteredImage {
                 key,
                 id,
                 may_have_transparency: pixmap.may_have_transparency(),
@@ -141,25 +148,28 @@ impl HybridImageUploadSession<'_> {
                     .format
                     .size_in_bytes(brush.image.width, brush.image.height)
                     .unwrap_or_else(|| brush.image.data.data().len()),
-            };
-            self.pending.push(image);
+            });
+            self.pending.push(Arc::clone(&image));
             image
         };
 
-        Ok(VelloImage {
-            image: ImageSource::opaque_id_with_transparency_hint(
-                image.id,
-                image.may_have_transparency,
-            ),
-            sampler: brush.sampler,
-        })
+        Ok((
+            VelloImage {
+                image: ImageSource::opaque_id_with_transparency_hint(
+                    image.id,
+                    image.may_have_transparency,
+                ),
+                sampler: brush.sampler,
+            },
+            image,
+        ))
     }
 
     pub(crate) fn finish(&mut self, resources: &mut vello_gpu::Resources, success: bool) {
         if success {
             for image in self.pending.drain(..) {
-                self.registry.live.push_back(image);
                 self.registry.bytes_used = self.registry.bytes_used.saturating_add(image.bytes);
+                self.registry.live.push_back(image);
             }
         } else {
             for image in self.pending.drain(..) {
@@ -179,8 +189,8 @@ impl HybridImageUploadSession<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RegisteredImage {
+#[derive(Debug)]
+pub(crate) struct RegisteredImage {
     key: ImageKey,
     id: ImageId,
     may_have_transparency: bool,
@@ -193,19 +203,17 @@ struct ImageKey {
     alpha_type: core::mem::Discriminant<peniko::ImageAlphaType>,
     width: u32,
     height: u32,
-    data_hash: u64,
+    blob_id: u64,
 }
 
 impl ImageKey {
     fn derive(image: &ImageData) -> Self {
-        let mut hasher = DefaultHasher::new();
-        image.data.data().hash(&mut hasher);
         Self {
             format: core::mem::discriminant(&image.format),
             alpha_type: core::mem::discriminant(&image.alpha_type),
             width: image.width,
             height: image.height,
-            data_hash: hasher.finish(),
+            blob_id: image.data.id(),
         }
     }
 }
@@ -231,10 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn image_key_dedupes_equivalent_image_contents() {
+    fn image_key_reuses_cloned_assets() {
         let a = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
         let b = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
-        assert_eq!(ImageKey::derive(&a), ImageKey::derive(&b));
+        assert_eq!(ImageKey::derive(&a), ImageKey::derive(&a.clone()));
+        assert_ne!(ImageKey::derive(&a), ImageKey::derive(&b));
     }
 
     #[test]
@@ -272,8 +281,8 @@ mod tests {
         };
 
         let mut live = VecDeque::new();
-        live.push_back(a_ri);
-        live.push_back(b_ri);
+        live.push_back(Arc::new(a_ri));
+        live.push_back(Arc::new(b_ri));
 
         let mut registry = HybridImageRegistry {
             live,

@@ -12,7 +12,7 @@
 
 use alloc::vec::Vec;
 
-use peniko::BrushRef;
+use crate::BrushRef;
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef, PaintSink,
@@ -450,8 +450,9 @@ impl PaintSink for NullSink {
 mod tests {
     use alloc::vec;
 
+    use crate::Brush;
     use kurbo::{Affine, BezPath, Rect, Stroke};
-    use peniko::{Brush, Color, Fill};
+    use peniko::{Color, Fill};
 
     use super::*;
     use crate::Composite;

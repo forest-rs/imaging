@@ -3,22 +3,28 @@
 
 use super::Error;
 use crate::vello::{self, Glyph as VelloGlyph};
+use crate::{ExternalTexture, VelloScene};
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, StrokeRef,
     record::{Scene, replay_transformed},
 };
 use kurbo::{Affine, Rect};
-use peniko::{Brush, BrushRef, Fill};
-use std::boxed::Box;
+use peniko::{Brush, Fill};
+use std::{boxed::Box, collections::HashMap, sync::Arc};
 
-/// Borrowed adapter that streams `imaging` commands into an existing [`crate::vello::Scene`].
+/// Borrowed adapter that streams `imaging` commands into an existing [`VelloScene`].
 ///
 /// Use this when you want a backend-native retained scene without owning a full
 /// [`crate::VelloRenderer`]. Call [`VelloSceneSink::finish`] after streaming to surface any
 /// deferred translation errors and to confirm the Vello layer stack is balanced.
 pub struct VelloSceneSink<'a> {
     scene: &'a mut vello::Scene,
+    images: &'a mut Vec<Arc<ExternalTexture>>,
+    renderer: &'a mut Option<Arc<()>>,
+    binding_renderer: Option<&'a Arc<()>>,
+    bindings: Option<&'a HashMap<imaging::ExternalImage, Arc<ExternalTexture>>>,
+    finished: bool,
     surface_clip: Rect,
     error: Option<Error>,
     layer_stack: Vec<LayerFrame>,
@@ -37,6 +43,16 @@ enum LayerFrame {
     Group { mask: Option<Box<PendingMask>> },
 }
 
+impl Drop for VelloSceneSink<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.scene.reset();
+            self.images.clear();
+            *self.renderer = None;
+        }
+    }
+}
+
 impl core::fmt::Debug for VelloSceneSink<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("VelloSceneSink")
@@ -48,28 +64,75 @@ impl core::fmt::Debug for VelloSceneSink<'_> {
 }
 
 impl<'a> VelloSceneSink<'a> {
-    /// Wrap an existing [`crate::vello::Scene`].
+    /// Wrap an existing [`VelloScene`].
     ///
     /// `surface_clip` is used as the fallback layer bounds for isolated groups that do not
     /// provide an explicit clip.
-    pub fn new(scene: &'a mut vello::Scene, surface_clip: Rect) -> Self {
+    pub fn new(scene: &'a mut VelloScene, surface_clip: Rect) -> Self {
         Self {
-            scene,
+            scene: &mut scene.native,
+            images: &mut scene.images,
+            renderer: &mut scene.renderer,
+            bindings: None,
+            binding_renderer: None,
+            finished: false,
             surface_clip,
             error: None,
             layer_stack: Vec::new(),
         }
     }
 
-    /// Return the first deferred translation error, if any, and ensure the layer stack is balanced.
-    pub fn finish(&mut self) -> Result<(), Error> {
-        if let Some(err) = self.error.take() {
-            return Err(err);
+    /// Record a scene using this renderer's external image bindings.
+    pub fn with_renderer(
+        scene: &'a mut VelloScene,
+        surface_clip: Rect,
+        renderer: &'a crate::VelloRenderer,
+    ) -> Self {
+        Self::with_bindings(
+            scene,
+            surface_clip,
+            &renderer.state.external_images,
+            &renderer.state.identity,
+        )
+    }
+
+    pub(crate) fn with_bindings(
+        scene: &'a mut VelloScene,
+        surface_clip: Rect,
+        bindings: &'a HashMap<imaging::ExternalImage, Arc<ExternalTexture>>,
+        identity: &'a Arc<()>,
+    ) -> Self {
+        let wrong_renderer = scene
+            .renderer
+            .as_ref()
+            .is_some_and(|held| !Arc::ptr_eq(held, identity));
+        let mut sink = Self::new(scene, surface_clip);
+        sink.bindings = Some(bindings);
+        sink.binding_renderer = Some(identity);
+        if wrong_renderer {
+            sink.error = Some(Error::WrongRenderer);
         }
-        if !self.layer_stack.is_empty() {
-            return Err(Error::Internal("unbalanced layer stack"));
+        sink
+    }
+
+    /// Complete recording and report translation or unbalanced-stack errors.
+    ///
+    /// Failed or unfinished recordings are discarded, releasing their image bindings.
+    pub fn finish(mut self) -> Result<(), Error> {
+        let result = if let Some(err) = self.error.take() {
+            Err(err)
+        } else if !self.layer_stack.is_empty() {
+            Err(Error::Internal("unbalanced layer stack"))
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.scene.reset();
+            self.images.clear();
+            *self.renderer = None;
         }
-        Ok(())
+        self.finished = true;
+        result
     }
 
     fn set_error_once(&mut self, err: Error) {
@@ -78,7 +141,33 @@ impl<'a> VelloSceneSink<'a> {
         }
     }
 
-    fn brush_to_brush(&mut self, brush: BrushRef<'_>, composite: Composite) -> Option<Brush> {
+    fn brush_to_brush(
+        &mut self,
+        brush: imaging::BrushRef<'_>,
+        composite: Composite,
+    ) -> Option<Brush> {
+        if let imaging::BrushRef::Image(imaging::ImageBrushRef {
+            image: imaging::ImageRef::External(handle),
+            mut sampler,
+        }) = brush
+        {
+            let Some(binding) = self.bindings.and_then(|bindings| bindings.get(handle)) else {
+                self.set_error_once(Error::UnboundImage(handle.clone()));
+                return None;
+            };
+            *self.renderer = self.binding_renderer.cloned();
+            if !self.images.iter().any(|held| Arc::ptr_eq(held, binding)) {
+                self.images.push(Arc::clone(binding));
+            }
+            sampler.alpha *= composite.alpha;
+            return Some(Brush::Image(peniko::ImageBrush {
+                image: binding.image.clone(),
+                sampler,
+            }));
+        }
+        let brush = brush
+            .as_raster()
+            .expect("external images were resolved above");
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
         match brush {
             Brush::Solid(_) | Brush::Gradient(_) | Brush::Image(_) => Some(brush),
@@ -125,7 +214,9 @@ impl<'a> VelloSceneSink<'a> {
             return;
         }
         // The glyph builder applies composite alpha, including to color glyphs.
-        let paint = glyph_run.brush.to_owned();
+        let Some(paint) = self.brush_to_brush(glyph_run.brush, Composite::default()) else {
+            return;
+        };
 
         let builder = self
             .scene
@@ -532,7 +623,7 @@ mod tests {
 
     #[test]
     fn vello_scene_sink_reports_unbalanced_layer_stack() {
-        let mut scene = vello::Scene::new();
+        let mut scene = VelloScene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.pop_group();
         assert!(matches!(sink.finish(), Err(Error::UnbalancedLayerStack)));
@@ -540,7 +631,7 @@ mod tests {
 
     #[test]
     fn vello_scene_sink_rejects_filters() {
-        let mut scene = vello::Scene::new();
+        let mut scene = VelloScene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
@@ -562,7 +653,7 @@ mod tests {
         }]
         .into_iter();
 
-        let mut scene = vello::Scene::new();
+        let mut scene = VelloScene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.glyph_run(
             GlyphRunRef::new(&font, &style, Color::BLACK)
@@ -577,7 +668,7 @@ mod tests {
         let mut mask = Scene::new();
         mask.fill(FillRef::new(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE));
 
-        let mut scene = vello::Scene::new();
+        let mut scene = VelloScene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Luminance, &mask)));
         sink.fill(FillRef::new(Rect::new(4.0, 4.0, 20.0, 20.0), Color::BLACK));
@@ -590,7 +681,7 @@ mod tests {
         let mut mask = Scene::new();
         mask.fill(FillRef::new(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE));
 
-        let mut scene = vello::Scene::new();
+        let mut scene = VelloScene::new();
         let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Alpha, &mask)));
         assert!(matches!(sink.finish(), Err(Error::UnsupportedMask)));

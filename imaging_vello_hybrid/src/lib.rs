@@ -4,7 +4,7 @@
 //! Vello hybrid backend for `imaging`.
 //!
 //! This crate provides a headless CPU/GPU renderer that consumes native
-//! [`vello_gpu::Scene`] values and renders them to GPU targets or RGBA8 image data using
+//! [`VelloHybridScene`] values and renders them to GPU targets or RGBA8 image data using
 //! `vello_gpu` + `wgpu`.
 //!
 //! Semantic [`imaging::record::Scene`] values can be lowered to native hybrid scenes through
@@ -14,8 +14,9 @@
 //! presentation targets, then pass those handles into [`VelloHybridRenderer`].
 //!
 //! Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
-//! and translated to backend-managed opaque image ids. Use [`VelloHybridSceneSink::with_renderer`]
-//! when recording directly into a native [`vello_gpu::Scene`] and you want the same image
+//! and translated to backend-managed opaque image ids. Encoded scenes retain these uploads
+//! until reset or dropped. Use [`VelloHybridSceneSink::with_renderer`]
+//! when recording directly into a native [`VelloHybridScene`] and you want the same image
 //! support.
 //!
 //! # Render A Recorded Scene
@@ -48,20 +49,20 @@
 //! }
 //! ```
 //!
-//! # Record Into `vello_gpu::Scene`
+//! # Record A Hybrid Scene
 //!
 //! If you want a backend-native retained scene without owning a full renderer, wrap an existing
-//! [`vello_gpu::Scene`] with [`VelloHybridSceneSink`].
+//! [`VelloHybridScene`] with [`VelloHybridSceneSink`].
 //!
 //! ```no_run
 //! use imaging::Painter;
-//! use imaging_vello_hybrid::VelloHybridSceneSink;
+//! use imaging_vello_hybrid::{VelloHybridScene, VelloHybridSceneSink};
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //!
 //! fn main() -> Result<(), imaging_vello_hybrid::Error> {
 //!     let paint = Brush::Solid(Color::from_rgb8(0x1d, 0x4e, 0x89));
-//!     let mut scene = vello_gpu::Scene::new(128, 128);
+//!     let mut scene = VelloHybridScene::new(128, 128);
 //!     scene.reset();
 //!
 //!     {
@@ -77,17 +78,17 @@
 //!
 //! Use [`VelloHybridSceneSink::with_renderer`] instead when the scene uses image brushes.
 //!
-//! # Record Image Brushes Into `vello_gpu::Scene`
+//! # Record Image Brushes
 //!
 //! Use [`VelloHybridSceneSink::with_renderer`] when recording image brushes directly into a
-//! native [`vello_gpu::Scene`]. The sink uploads images through the renderer and reuses them
+//! native [`VelloHybridScene`]. The sink uploads images through the renderer and reuses them
 //! across later recordings and renders.
 //!
 //! ```no_run
 //! use std::sync::Arc;
 //!
 //! use imaging::Painter;
-//! use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridSceneSink};
+//! use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridScene, VelloHybridSceneSink};
 //! use kurbo::Rect;
 //! use peniko::{Blob, Brush, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 //!
@@ -107,7 +108,7 @@
 //!     # let device: imaging_vello_hybrid::wgpu::Device = todo!();
 //!     # let queue: imaging_vello_hybrid::wgpu::Queue = todo!();
 //!     let mut renderer = VelloHybridRenderer::new(device, queue);
-//!     let mut scene = vello_gpu::Scene::new(128, 128);
+//!     let mut scene = VelloHybridScene::new(128, 128);
 //!     scene.reset();
 //!
 //!     {
@@ -123,19 +124,19 @@
 //! }
 //! ```
 //!
-//! # Render A Native `vello_gpu::Scene`
+//! # Render An Encoded Hybrid Scene
 //!
 //! If you already have a native hybrid scene, hand it directly to [`VelloHybridRenderer`].
 //!
 //! ```no_run
 //! use imaging::Painter;
-//! use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridSceneSink};
+//! use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridScene, VelloHybridSceneSink};
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //!
 //! fn main() -> Result<(), imaging_vello_hybrid::Error> {
 //!     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
-//!     let mut scene = vello_gpu::Scene::new(128, 128);
+//!     let mut scene = VelloHybridScene::new(128, 128);
 //!     scene.reset();
 //!
 //!     {
@@ -154,10 +155,37 @@
 //! }
 //! ```
 
+//! # External Images
+//!
+//! Bind a caller-owned texture to an [`imaging::ExternalImage`], then use it through the
+//! normal image brush or drawing API. Encoded scenes retain their bindings after unbinding.
+//! The texture must come from the renderer's device; see the `TextureImageRenderer`
+//! implementation below for format, usage, and alpha requirements.
+//!
+//! ```no_run
+//! use imaging::{ExternalImage, Painter, record};
+//! use imaging_wgpu::TextureImageRenderer;
+//! use peniko::ImageAlphaType;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let mut renderer: imaging_vello_hybrid::VelloHybridRenderer = todo!();
+//! # let texture: imaging_vello_hybrid::wgpu::Texture = todo!();
+//! let image = ExternalImage::new(2, 2, ImageAlphaType::AlphaPremultiplied);
+//! renderer.bind_image(&image, &texture)?;
+//! let mut scene = record::Scene::new();
+//! Painter::new(&mut scene).draw_image(&image, kurbo::Affine::IDENTITY);
+//! let encoded = renderer.encode_scene(&scene, 2, 2)?;
+//! renderer.unbind_image(&image);
+//! let output = renderer.render(&encoded, 2, 2)?;
+//! # Ok(())
+//! # }
+//! ```
+
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 mod image_registry;
+mod scene;
 mod scene_sink;
 mod wgpu_support;
 
@@ -171,6 +199,7 @@ use imaging::render::{
 pub use imaging_wgpu::wgpu;
 use imaging_wgpu::{TextureRenderer, TextureViewTarget};
 use imaging_wgpu::{TextureRendererError, TextureTargetError};
+use std::sync::Arc;
 use vello_gpu::{RenderError, RenderSize, RenderTargetConfig, TextureBindings};
 use wgpu::{CommandEncoderDescriptor, TextureFormat};
 
@@ -179,11 +208,16 @@ use crate::wgpu_support::{
     unpremultiply_rgba8_in_place, unpremultiply_rgba8_target,
 };
 
+pub use scene::VelloHybridScene;
 pub use scene_sink::VelloHybridSceneSink;
 
 /// Errors that can occur when rendering via Vello hybrid.
 #[derive(Debug)]
 pub enum Error {
+    /// The encoded scene belongs to a different renderer.
+    WrongRenderer,
+    /// An external image has no binding on this renderer.
+    UnboundImage(imaging::ExternalImage),
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
     /// An image brush was encountered on a sink path that has no renderer-backed image resolver.
@@ -212,12 +246,19 @@ impl core::error::Error for Error {}
 
 #[derive(Debug)]
 pub(crate) struct VelloHybridRendererState {
+    identity: Arc<()>,
     renderer: vello_gpu::Renderer,
     resources: vello_gpu::Resources,
     device: wgpu::Device,
     queue: wgpu::Queue,
     tolerance: f64,
     image_registry: HybridImageRegistry,
+    external_images: std::collections::HashMap<imaging::ExternalImage, Arc<ExternalTexture>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExternalTexture {
+    view: wgpu::TextureView,
 }
 
 /// Target-oriented renderer that executes `imaging` commands using `vello_gpu` + `wgpu`.
@@ -249,12 +290,14 @@ impl VelloHybridRendererState {
         );
 
         Self {
+            identity: Arc::new(()),
             renderer,
             resources,
             device,
             queue,
             tolerance: 0.1,
             image_registry: HybridImageRegistry::default(),
+            external_images: std::collections::HashMap::new(),
         }
     }
 
@@ -269,14 +312,19 @@ impl VelloHybridRendererState {
         self.queue.submit([encoder.finish()]);
     }
 
-    /// Lower a semantic [`imaging::record::Scene`] into a native [`vello_gpu::Scene`].
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`VelloHybridScene`].
     fn render_to_view(
         &mut self,
-        scene: &vello_gpu::Scene,
+        scene: &VelloHybridScene,
         texture_view: &wgpu::TextureView,
         width: u32,
         height: u32,
     ) -> Result<(), Error> {
+        if let Some(identity) = &scene.renderer
+            && !Arc::ptr_eq(identity, &self.identity)
+        {
+            return Err(Error::WrongRenderer);
+        }
         let (width, height) = Self::checked_size(width, height)?;
         let render_size = RenderSize { width, height };
         let mut encoder = self
@@ -285,9 +333,13 @@ impl VelloHybridRendererState {
                 label: Some("imaging_vello_hybrid render"),
             });
 
+        let mut bindings = TextureBindings::new();
+        for (index, image) in scene.external_images.iter().enumerate() {
+            bindings.insert(vello_common::TextureId(index as u64), image.view.clone());
+        }
         self.renderer
             .render(
-                scene,
+                &scene.native,
                 &mut self.resources,
                 &self.device,
                 &self.queue,
@@ -295,7 +347,7 @@ impl VelloHybridRendererState {
                 &render_size,
                 texture_view,
                 None,
-                &TextureBindings::new(),
+                &bindings,
                 vello_gpu::TargetInit::Clear(vello_gpu::ClearSettings::default()),
             )
             .map_err(Error::Render)?;
@@ -320,20 +372,23 @@ impl VelloHybridRenderer {
         self.state.tolerance = tolerance;
     }
 
-    /// Destroy all uploaded hybrid image resources cached by this renderer.
+    /// Release unused uploaded images from the cache.
+    ///
+    /// Images referenced by encoded scenes stay alive until those scenes are reset or dropped.
+    /// Call this again afterwards to release their cached allocations immediately.
     pub fn clear_cached_images(&mut self) {
         self.state.clear_cached_images();
     }
 
-    /// Lower a semantic [`imaging::record::Scene`] into a native [`vello_gpu::Scene`].
+    /// Lower a semantic [`imaging::record::Scene`] into a native [`VelloHybridScene`].
     pub fn encode_scene(
         &mut self,
         scene: &Scene,
         width: u16,
         height: u16,
-    ) -> Result<vello_gpu::Scene, Error> {
+    ) -> Result<VelloHybridScene, Error> {
         scene.validate().map_err(Error::InvalidScene)?;
-        let mut native = vello_gpu::Scene::new(width, height);
+        let mut native = VelloHybridScene::new(width, height);
         native.reset();
         let tolerance = self.state.tolerance;
         {
@@ -350,10 +405,10 @@ impl VelloHybridRenderer {
         source: &mut S,
         width: u32,
         height: u32,
-    ) -> Result<vello_gpu::Scene, Error> {
+    ) -> Result<VelloHybridScene, Error> {
         source.validate().map_err(Error::InvalidScene)?;
         let (width, height) = VelloHybridRendererState::checked_size(width, height)?;
-        let mut native = vello_gpu::Scene::new(width, height);
+        let mut native = VelloHybridScene::new(width, height);
         native.reset();
         let tolerance = self.state.tolerance;
         {
@@ -365,10 +420,10 @@ impl VelloHybridRenderer {
         Ok(native)
     }
 
-    /// Render a native [`vello_gpu::Scene`] into a caller-provided texture view.
+    /// Render a native [`VelloHybridScene`] into a caller-provided texture view.
     pub fn render_to_texture_view(
         &mut self,
-        scene: &vello_gpu::Scene,
+        scene: &VelloHybridScene,
         texture_view: &wgpu::TextureView,
         width: u32,
         height: u32,
@@ -443,10 +498,10 @@ impl TextureRenderer for VelloHybridRenderer {
 }
 
 impl VelloHybridRenderer {
-    /// Render a native [`vello_gpu::Scene`] into an RGBA8 image (unpremultiplied).
+    /// Render a native [`VelloHybridScene`] into an RGBA8 image (unpremultiplied).
     pub fn render_into(
         &mut self,
-        scene: &vello_gpu::Scene,
+        scene: &VelloHybridScene,
         width: u16,
         height: u16,
         image: &mut RgbaImage,
@@ -467,10 +522,10 @@ impl VelloHybridRenderer {
         )
     }
 
-    /// Render a native [`vello_gpu::Scene`] and return an RGBA8 image (unpremultiplied).
+    /// Render a native [`VelloHybridScene`] and return an RGBA8 image (unpremultiplied).
     pub fn render(
         &mut self,
-        scene: &vello_gpu::Scene,
+        scene: &VelloHybridScene,
         width: u16,
         height: u16,
     ) -> Result<RgbaImage, Error> {
@@ -555,6 +610,9 @@ fn map_readback_error(err: ReadbackError) -> Error {
 
 fn map_texture_renderer_error(error: Error) -> TextureRendererError {
     match error {
+        Error::UnboundImage(image) => {
+            TextureRendererError::Content(RenderContentError::UnboundImage(image))
+        }
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
         }
@@ -628,6 +686,53 @@ fn map_readback_image_error(error: ReadbackError) -> ImageRendererError {
     }
 }
 
+/// Hybrid external images use premultiplied RGBA8 or BGRA8 textures with `TEXTURE_BINDING` usage.
+impl imaging_wgpu::TextureImageRenderer for VelloHybridRenderer {
+    fn bind_image(
+        &mut self,
+        image: &imaging::ExternalImage,
+        texture: &wgpu::Texture,
+    ) -> Result<(), imaging_wgpu::TextureImageError> {
+        use imaging_wgpu::TextureImageError;
+        imaging_wgpu::validate_image_texture(image, texture)?;
+        if image.width() > u32::from(u16::MAX) || image.height() > u32::from(u16::MAX) {
+            return Err(TextureImageError::InvalidTexture(
+                "external image exceeds hybrid's dimension limit",
+            ));
+        }
+        if image.alpha_type() != peniko::ImageAlphaType::AlphaPremultiplied {
+            return Err(TextureImageError::UnsupportedAlphaType);
+        }
+        if !matches!(
+            texture.format(),
+            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+        ) {
+            return Err(TextureImageError::UnsupportedFormat);
+        }
+        if !texture
+            .usage()
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        {
+            return Err(TextureImageError::InvalidTexture(
+                "hybrid external images require TEXTURE_BINDING usage",
+            ));
+        }
+        if self.state.external_images.contains_key(image) {
+            return Err(TextureImageError::AlreadyBound);
+        }
+        self.state.external_images.insert(
+            image.clone(),
+            Arc::new(ExternalTexture {
+                view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            }),
+        );
+        Ok(())
+    }
+    fn unbind_image(&mut self, image: &imaging::ExternalImage) -> bool {
+        self.state.external_images.remove(image).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +780,286 @@ mod tests {
                 .await
                 .map_err(|_| ())
         })
+    }
+
+    fn image_test_renderer() -> Option<VelloHybridRenderer> {
+        if std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() == Ok("no") {
+            return None;
+        }
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            assert!(
+                std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() != Ok("yes"),
+                "GPU initialization failed"
+            );
+            return None;
+        };
+        Some(VelloHybridRenderer::new(device, queue))
+    }
+
+    fn retained_image_scene(
+        renderer: &mut VelloHybridRenderer,
+        color: [u8; 4],
+    ) -> VelloHybridScene {
+        let brush = Brush::Image(ImageBrush::new(ImageData {
+            data: Blob::new(Arc::new(color)),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 1,
+            height: 1,
+        }));
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).fill_rect(Rect::new(0.0, 0.0, 8.0, 8.0), &brush);
+        renderer.encode_scene(&scene, 8, 8).unwrap()
+    }
+
+    #[test]
+    fn external_images_retain_bindings_and_sample_live_contents() {
+        use imaging::{ExternalImage, ImageBrush};
+        use imaging_wgpu::{TextureImageError, TextureImageRenderer};
+        if std::env::var("IMAGING_CI_GPU_SUPPORT").is_ok_and(|value| value == "no") {
+            return;
+        }
+        let gpu = try_init_device_and_queue();
+        if std::env::var("IMAGING_CI_GPU_SUPPORT").is_ok_and(|value| value == "yes") {
+            assert!(gpu.is_ok(), "GPU tests require a device");
+        }
+        let Ok((device, queue)) = gpu else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device.clone(), queue.clone());
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("external image test"),
+            size: Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        let texture = device.create_texture(&descriptor);
+        let write = |pixel: [u8; 4]| {
+            queue.write_texture(
+                texture.as_image_copy(),
+                &pixel.repeat(4),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(8),
+                    rows_per_image: None,
+                },
+                texture.size(),
+            );
+        };
+        write([128, 0, 0, 128]);
+        let handle = ExternalImage::new(2, 2, ImageAlphaType::AlphaPremultiplied);
+        let brush = ImageBrush::new(handle.clone());
+        let mut recording = Scene::new();
+        Painter::new(&mut recording).draw_image(&brush, kurbo::Affine::IDENTITY);
+        assert!(matches!(
+            renderer.encode_scene(&recording, 2, 2),
+            Err(Error::UnboundImage(_))
+        ));
+        assert!(matches!(
+            renderer.bind_image(&ExternalImage::new(1, 2, handle.alpha_type()), &texture),
+            Err(TextureImageError::InvalidTexture(_))
+        ));
+        renderer.bind_image(&handle, &texture).unwrap();
+        assert_eq!(
+            renderer.bind_image(&handle, &texture),
+            Err(TextureImageError::AlreadyBound)
+        );
+        let allocation = Arc::downgrade(renderer.state.external_images.get(&handle).unwrap());
+        let mut encoded = renderer.encode_scene(&recording, 2, 2).unwrap();
+        let mut appended = renderer.encode_scene(&recording, 2, 2).unwrap();
+        assert_solid_rgba_image(&renderer.render(&encoded, 2, 2).unwrap(), [255, 0, 0, 128]);
+        queue.write_texture(
+            texture.as_image_copy(),
+            &[128, 0, 0, 128, 0, 0, 128, 128].repeat(2),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: None,
+            },
+            texture.size(),
+        );
+        let pattern = ImageBrush::new(handle.clone()).with_sampler(
+            peniko::ImageSampler::new()
+                .with_extend(peniko::Extend::Repeat)
+                .with_quality(peniko::ImageQuality::Low)
+                .with_alpha(0.5),
+        );
+        let mut clipped = Scene::new();
+        Painter::new(&mut clipped).with_fill_clip(Rect::new(1.0, 0.0, 3.0, 2.0), |p| {
+            p.fill(Rect::new(0.0, 0.0, 4.0, 2.0), &pattern)
+                .brush_transform(Some(kurbo::Affine::translate((1.0, 0.0))))
+                .composite(imaging::Composite::new(peniko::BlendMode::default(), 0.5))
+                .draw();
+        });
+        let clipped = renderer.encode_scene(&clipped, 4, 2).unwrap();
+        let mut pixels = renderer.render(&clipped, 4, 2).unwrap().data;
+        // Straight-alpha RGB is unspecified for completely transparent samples.
+        for pixel in pixels.chunks_exact_mut(4).filter(|pixel| pixel[3] == 0) {
+            pixel[..3].fill(0);
+        }
+        assert_eq!(
+            pixels,
+            [0, 0, 0, 0, 255, 0, 0, 32, 0, 0, 255, 32, 0, 0, 0, 0].repeat(2),
+            "external brushes must preserve clip, brush transform, sampling, and alpha"
+        );
+        drop(clipped);
+        drop(pattern);
+        assert!(renderer.unbind_image(&handle));
+        assert!(!renderer.unbind_image(&handle));
+        assert!(matches!(
+            renderer.encode_scene(&recording, 2, 2),
+            Err(Error::UnboundImage(_))
+        ));
+        // Rebinding affects new commands without invalidating earlier captured bindings.
+        let replacement = device.create_texture(&descriptor);
+        queue.write_texture(
+            replacement.as_image_copy(),
+            &[0_u8, 255, 0, 255].repeat(4),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: None,
+            },
+            replacement.size(),
+        );
+        renderer.bind_image(&handle, &replacement).unwrap();
+        let replacement_allocation =
+            Arc::downgrade(renderer.state.external_images.get(&handle).unwrap());
+        {
+            let mut sink = VelloHybridSceneSink::with_renderer(&mut appended, &mut renderer);
+            Painter::new(&mut sink).draw_image(&brush, kurbo::Affine::IDENTITY);
+            sink.finish().unwrap();
+        }
+        renderer.unbind_image(&handle);
+        drop(replacement);
+        assert_solid_rgba_image(&renderer.render(&appended, 2, 2).unwrap(), [0, 255, 0, 255]);
+        drop(appended);
+        assert!(
+            replacement_allocation.upgrade().is_none(),
+            "appended binding is released with its scene"
+        );
+        drop(recording);
+        drop(brush);
+        drop(handle);
+        write([0, 0, 128, 128]);
+        drop(texture);
+        assert_solid_rgba_image(&renderer.render(&encoded, 2, 2).unwrap(), [0, 0, 255, 128]);
+        let mut other = VelloHybridRenderer::new(device.clone(), queue.clone());
+        assert!(matches!(
+            other.render(&encoded, 2, 2),
+            Err(Error::WrongRenderer)
+        ));
+        assert!(
+            allocation.upgrade().is_some(),
+            "encoded scene retains the binding"
+        );
+        encoded.reset();
+        assert!(
+            allocation.upgrade().is_none(),
+            "reset releases the unbound resource"
+        );
+        assert_solid_rgba_image(&renderer.render(&encoded, 2, 2).unwrap(), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn retained_images_survive_cache_clear() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        let old = retained_image_scene(&mut renderer, [255, 0, 0, 255]);
+        assert_solid_rgba_image(&renderer.render(&old, 8, 8).unwrap(), [255, 0, 0, 255]);
+        renderer.clear_cached_images();
+        let _new = retained_image_scene(&mut renderer, [0, 0, 255, 255]);
+        assert_solid_rgba_image(&renderer.render(&old, 8, 8).unwrap(), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn retained_images_survive_cache_eviction() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        renderer.state.image_registry = HybridImageRegistry::new(0);
+        let old = retained_image_scene(&mut renderer, [255, 0, 0, 255]);
+        assert_solid_rgba_image(&renderer.render(&old, 8, 8).unwrap(), [255, 0, 0, 255]);
+        let _new = retained_image_scene(&mut renderer, [0, 0, 255, 255]);
+        assert_solid_rgba_image(&renderer.render(&old, 8, 8).unwrap(), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn reset_releases_retained_image_allocations() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        let mut scene = retained_image_scene(&mut renderer, [255, 0, 0, 255]);
+        let image = Arc::downgrade(&scene.images[0]);
+        renderer.clear_cached_images();
+        assert!(image.upgrade().is_some());
+        scene.reset();
+        renderer.clear_cached_images();
+        assert!(image.upgrade().is_none());
+        assert_solid_rgba_image(&renderer.render(&scene, 8, 8).unwrap(), [0; 4]);
+    }
+
+    #[test]
+    fn unused_images_are_still_evicted() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        renderer.state.image_registry = HybridImageRegistry::new(0);
+        let scene = retained_image_scene(&mut renderer, [255, 0, 0, 255]);
+        let image = Arc::downgrade(&scene.images[0]);
+        drop(scene);
+        let _new = retained_image_scene(&mut renderer, [0, 0, 255, 255]);
+        assert!(image.upgrade().is_none());
+    }
+
+    #[test]
+    fn retained_images_reject_a_different_renderer() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        let scene = retained_image_scene(&mut renderer, [255, 0, 0, 255]);
+        let mut other =
+            VelloHybridRenderer::new(renderer.state.device.clone(), renderer.state.queue.clone());
+        assert!(matches!(
+            other.render(&scene, 8, 8),
+            Err(Error::WrongRenderer)
+        ));
+        assert_solid_rgba_image(&renderer.render(&scene, 8, 8).unwrap(), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn unfinished_image_recording_is_discarded() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        let scene = solid_scene(Color::from_rgb8(255, 0, 0), 8.0, 8.0);
+        let mut native = renderer.encode_scene(&scene, 8, 8).unwrap();
+        {
+            let mut sink = VelloHybridSceneSink::with_renderer(&mut native, &mut renderer);
+            let brush = ImageBrush::new(ImageData {
+                data: Blob::new(Arc::new([0, 0, 255, 255])),
+                format: ImageFormat::Rgba8,
+                alpha_type: ImageAlphaType::Alpha,
+                width: 1,
+                height: 1,
+            });
+            Painter::new(&mut sink).fill_rect(Rect::new(0.0, 0.0, 8.0, 8.0), &brush);
+        }
+        assert!(native.images.is_empty());
+        assert_solid_rgba_image(&renderer.render(&native, 8, 8).unwrap(), [0; 4]);
+        let next = retained_image_scene(&mut renderer, [0, 0, 255, 255]);
+        assert_solid_rgba_image(&renderer.render(&next, 8, 8).unwrap(), [0, 0, 255, 255]);
     }
 
     #[test]
@@ -742,7 +1127,7 @@ mod tests {
             peniko::Style::Fill(peniko::Fill::NonZero),
             peniko::Style::Stroke(kurbo::Stroke::new(1.5)),
         ] {
-            let mut scene = vello_gpu::Scene::new(64, 64);
+            let mut scene = VelloHybridScene::new(64, 64);
             {
                 let mut sink = VelloHybridSceneSink::new(&mut scene);
                 Painter::new(&mut sink)

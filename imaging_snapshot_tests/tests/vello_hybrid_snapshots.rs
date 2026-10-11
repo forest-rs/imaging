@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use imaging::Painter;
 use imaging_snapshot_tests::cases::{DEFAULT_HEIGHT, DEFAULT_WIDTH, build_scene};
-use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridSceneSink};
+use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridScene, VelloHybridSceneSink};
 use kurbo::Rect;
 use peniko::{Blob, Brush, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 use pollster::block_on;
@@ -89,7 +89,7 @@ fn native_scene_sink_supports_image_brushes_with_renderer() {
         return;
     };
 
-    let mut scene = vello_gpu::Scene::new(32, 32);
+    let mut scene = VelloHybridScene::new(32, 32);
     scene.reset();
     {
         let brush = Brush::Image(ImageBrush::new(ImageData {

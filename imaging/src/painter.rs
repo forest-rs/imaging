@@ -5,8 +5,9 @@
 
 use core::borrow::Borrow;
 
+use crate::{BrushRef, ImageBrushRef};
 use kurbo::{Affine, BezPath, CubicBez, Line, QuadBez, Rect, RoundedRect, Stroke, Vec2};
-use peniko::{BrushRef, ImageBrushRef, Style};
+use peniko::Style;
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GeometryRef, GlyphRunRef,
@@ -246,8 +247,8 @@ where
         let rect = Rect::new(
             0.0,
             0.0,
-            image.image.width as f64,
-            image.image.height as f64,
+            image.image.width() as f64,
+            image.image.height() as f64,
         );
         self.fill(rect, image).transform(transform).draw();
     }
@@ -621,7 +622,7 @@ mod tests {
             &record::Draw::Fill {
                 transform,
                 fill_rule: Fill::NonZero,
-                brush: peniko::Brush::Image(peniko::ImageBrush::new(image)),
+                brush: crate::Brush::Image(crate::ImageBrush::new(image)),
                 brush_transform: None,
                 shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
                 composite: Composite::default(),
@@ -635,7 +636,7 @@ mod tests {
         source.draw(record::Draw::Fill {
             transform: Affine::IDENTITY,
             fill_rule: Fill::NonZero,
-            brush: peniko::Brush::Solid(peniko::Color::WHITE),
+            brush: crate::Brush::Solid(peniko::Color::WHITE),
             brush_transform: None,
             shape: record::Geometry::Rect(Rect::new(0.0, 0.0, 2.0, 3.0)),
             composite: Composite::default(),

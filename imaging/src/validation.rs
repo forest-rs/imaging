@@ -70,13 +70,13 @@
 //! assert_eq!(scene.commands().len(), 1);
 //! ```
 
+use crate::BrushRef;
 use crate::{
     AppliedMaskRef, BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef,
     PaintSink, StrokeRef,
     record::{self, Geometry, Glyph},
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
-use peniko::BrushRef;
 
 /// Decision returned by a [`ValidatingSink`] violation hook.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -447,17 +447,19 @@ where
         }
     }
 
-    fn validate_image_brush(
-        &mut self,
-        image_brush: peniko::ImageBrush<&peniko::ImageData>,
-    ) -> bool {
+    fn validate_image_brush(&mut self, image_brush: crate::ImageBrushRef<'_>) -> bool {
         if !(image_brush.sampler.alpha.is_finite() && image_brush.sampler.alpha >= 0.0) {
             return !self.violate(ValidationError::InvalidBrush {
                 what: "Brush::Image::alpha",
             });
         }
 
-        let image = image_brush.image;
+        let crate::ImageRef::Raster(image) = image_brush.image else {
+            return (image_brush.image.width() != 0 && image_brush.image.height() != 0)
+                || !self.violate(ValidationError::InvalidBrush {
+                    what: "Brush::Image::dimensions",
+                });
+        };
         if image
             .format
             .size_in_bytes(image.width, image.height)
