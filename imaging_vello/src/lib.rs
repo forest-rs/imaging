@@ -12,12 +12,7 @@
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
 //! presentation targets, then pass those handles into [`VelloRenderer`].
 //!
-//! Enable a Vello compatibility feature:
-//!
-//! - `vello-0-11` (default) with `wgpu` 30
-//! - `vello-0-9` for integrations that still use `wgpu` 29
-//! - `vello-0-8` for integrations that still use `wgpu` 28
-//! - `vello-0-7` for integrations that still use `wgpu` 27
+//! This crate uses Vello 0.11 with `wgpu` 30.
 //!
 //! # Render A Recorded Scene
 //!
@@ -115,64 +110,16 @@
 mod scene_sink;
 mod wgpu_support;
 
-#[cfg(not(any(
-    feature = "vello-0-7",
-    feature = "vello-0-8",
-    feature = "vello-0-9",
-    feature = "vello-0-11"
-)))]
-compile_error!("Enable one of `vello-0-7`, `vello-0-8`, `vello-0-9`, or `vello-0-11`.");
-
 use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
 use imaging::render::{
     GpuReadbackError, ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError,
     ImageTargetError, RenderContentError, RenderSource, RenderUnsupportedError,
 };
-#[cfg(all(
-    not(any(feature = "vello-0-8", feature = "vello-0-9", feature = "vello-0-11")),
-    feature = "vello-0-7"
-))]
-use imaging_wgpu::v27::{TextureRenderer, TextureViewTarget};
-#[cfg(all(
-    not(any(feature = "vello-0-9", feature = "vello-0-11")),
-    feature = "vello-0-8"
-))]
-use imaging_wgpu::v28::{TextureRenderer, TextureViewTarget};
-#[cfg(all(not(feature = "vello-0-11"), feature = "vello-0-9"))]
-use imaging_wgpu::v29::{TextureRenderer, TextureViewTarget};
-#[cfg(feature = "vello-0-11")]
-use imaging_wgpu::v30::{TextureRenderer, TextureViewTarget};
-use imaging_wgpu::{TextureRendererError, TextureTargetError};
+use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError, TextureViewTarget};
 use kurbo::Rect;
 
-#[cfg(all(
-    feature = "vello-0-7",
-    any(feature = "vello-0-8", feature = "vello-0-9", feature = "vello-0-11")
-))]
-use vello_07 as _;
-#[cfg(all(
-    not(any(feature = "vello-0-8", feature = "vello-0-9", feature = "vello-0-11")),
-    feature = "vello-0-7"
-))]
-pub use vello_07 as vello;
-#[cfg(all(
-    feature = "vello-0-8",
-    any(feature = "vello-0-9", feature = "vello-0-11")
-))]
-use vello_08 as _;
-#[cfg(all(
-    not(any(feature = "vello-0-9", feature = "vello-0-11")),
-    feature = "vello-0-8"
-))]
-pub use vello_08 as vello;
-#[cfg(all(not(feature = "vello-0-11"), feature = "vello-0-9"))]
-pub use vello_09 as vello;
-
-#[cfg(all(feature = "vello-0-9", feature = "vello-0-11"))]
-use vello_09 as _;
-#[cfg(feature = "vello-0-11")]
-pub use vello_011 as vello;
+pub use vello;
 
 pub use crate::vello::wgpu;
 use crate::vello::{AaConfig, RenderParams};
@@ -195,8 +142,6 @@ pub enum Error {
     UnsupportedMask,
     /// Glyph draws with non-default blend modes are not supported by this backend yet.
     UnsupportedGlyphBlend,
-    /// Glyph brush transforms are not supported by older Vello compatibility lanes.
-    UnsupportedGlyphBrushTransform,
     /// Blurred rounded rect draws with non-default blend modes are not supported by this backend yet.
     UnsupportedBlurredRoundedRectBlend,
     /// The clip/group stack was not well-nested for this backend.
@@ -523,9 +468,6 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         }
         Error::UnsupportedMask => TextureRendererError::Unsupported(RenderUnsupportedError::Mask),
         Error::UnsupportedGlyphBlend => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::Glyph)
-        }
-        Error::UnsupportedGlyphBrushTransform => {
             TextureRendererError::Unsupported(RenderUnsupportedError::Glyph)
         }
         Error::UnsupportedBlurredRoundedRectBlend => {

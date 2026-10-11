@@ -124,14 +124,6 @@ impl<'a> VelloSceneSink<'a> {
             self.set_error_once(Error::UnsupportedGlyphBlend);
             return;
         }
-        #[cfg(all(
-            not(any(feature = "vello-0-9", feature = "vello-0-11")),
-            any(feature = "vello-0-7", feature = "vello-0-8")
-        ))]
-        if glyph_run.brush_transform.is_some() {
-            self.set_error_once(Error::UnsupportedGlyphBrushTransform);
-            return;
-        }
         // The glyph builder applies composite alpha, including to color glyphs.
         let paint = glyph_run.brush.to_owned();
 
@@ -143,7 +135,6 @@ impl<'a> VelloSceneSink<'a> {
             .hint(glyph_run.hint)
             .normalized_coords(glyph_run.normalized_coords)
             .brush(&paint);
-        #[cfg(any(feature = "vello-0-9", feature = "vello-0-11"))]
         let builder = builder.brush_transform(glyph_run.brush_transform);
         let builder = builder.brush_alpha(glyph_run.composite.alpha);
         let builder = builder.glyph_transform(glyph_run.glyph_transform);
@@ -556,7 +547,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "vello-0-9", feature = "vello-0-11"))]
     fn vello_scene_sink_accepts_glyph_brush_transforms() {
         const TEST_FONT_BYTES: &[u8] = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -580,34 +570,6 @@ mod tests {
             &mut glyphs,
         );
         sink.finish().expect("glyph brush transform should encode");
-    }
-
-    #[test]
-    #[cfg(all(
-        not(any(feature = "vello-0-9", feature = "vello-0-11")),
-        any(feature = "vello-0-7", feature = "vello-0-8")
-    ))]
-    fn vello_scene_sink_rejects_glyph_brush_transforms_before_vello_0_9() {
-        let font = FontData::new(Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
-        let style = Style::Fill(Fill::NonZero);
-        let mut glyphs = [imaging::record::Glyph {
-            id: 1,
-            x: 0.0,
-            y: 0.0,
-        }]
-        .into_iter();
-
-        let mut scene = vello::Scene::new();
-        let mut sink = VelloSceneSink::new(&mut scene, Rect::new(0.0, 0.0, 32.0, 32.0));
-        sink.glyph_run(
-            GlyphRunRef::new(&font, &style, Color::BLACK)
-                .brush_transform(Some(Affine::translate((-200.0, 0.0)))),
-            &mut glyphs,
-        );
-        assert!(matches!(
-            sink.finish(),
-            Err(Error::UnsupportedGlyphBrushTransform)
-        ));
     }
 
     #[test]

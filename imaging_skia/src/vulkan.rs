@@ -32,12 +32,12 @@ impl VulkanBackend {
         };
 
         let context = create_gr_context(
-            &entry,
             device.shared_instance().raw_instance().handle(),
             device.raw_physical_device(),
             device.raw_device().handle(),
             queue.as_raw(),
             device.queue_family_index(),
+            device.shared_instance().instance_api_version(),
             |gpo| unsafe {
                 let get_device_proc_addr = device
                     .shared_instance()
@@ -124,24 +124,25 @@ pub(crate) fn supports_texture_format(texture_format: wgpu::TextureFormat) -> Re
 }
 
 fn create_gr_context(
-    _entry: &ash::Entry,
     instance: ash::vk::Instance,
     physical_device: ash::vk::PhysicalDevice,
     device: ash::vk::Device,
     queue: ash::vk::Queue,
     queue_family_index: u32,
+    instance_api_version: u32,
     get_proc: impl Fn(sk::gpu::vk::GetProcOf) -> sk::gpu::vk::GetProcResult,
 ) -> Result<sk::gpu::DirectContext, Error> {
-    let mut backend_context = unsafe {
-        sk::gpu::vk::BackendContext::new(
+    let backend_context = unsafe {
+        sk::gpu::vk::BackendContext::new_builder(
             instance.as_raw() as _,
             physical_device.as_raw() as _,
             device.as_raw() as _,
             (queue.as_raw() as _, queue_family_index as usize),
             &get_proc,
+            Some(instance_api_version.into()),
         )
+        .build()
     };
-    backend_context.set_max_api_version(sk::gpu::vk::Version::new(1, 1, 0));
     sk::gpu::direct_contexts::make_vulkan(&backend_context, &sk::gpu::ContextOptions::default())
         .ok_or(Error::CreateGpuContext(
             "unable to create Skia Vulkan context",

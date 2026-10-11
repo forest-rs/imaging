@@ -150,9 +150,6 @@ pub(crate) fn read_texture_into_target(
         .map_err(|_| ReadbackError::CallbackDropped)?
         .map_err(|_| ReadbackError::BufferMap)?;
 
-    #[cfg(not(feature = "vello-0-11"))]
-    let mapped = slice.get_mapped_range();
-    #[cfg(feature = "vello-0-11")]
     let mapped = slice
         .get_mapped_range()
         .map_err(|_| ReadbackError::BufferMap)?;

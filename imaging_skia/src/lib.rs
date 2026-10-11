@@ -165,8 +165,6 @@ mod sinks;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios"))))]
 mod vulkan;
 
-#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios")))]
-use foreign_types_shared as _;
 use imaging::{
     Filter, GeometryRef, GlyphRunRef, RgbaImage,
     record::{Scene, ValidateError, replay},
@@ -194,7 +192,7 @@ use crate::gpu_readback::{
     ReadbackError, ScratchTexture, read_texture_into, read_texture_into_target,
 };
 #[cfg(feature = "gpu")]
-use imaging_wgpu::v28::TextureRenderer;
+use imaging_wgpu::TextureRenderer;
 #[cfg(feature = "gpu")]
 use imaging_wgpu::{TextureRendererError, TextureTargetError};
 use sinks::MaskCache;
@@ -1601,8 +1599,10 @@ impl FontCache {
 
         let extracted_font = extracted_font_data(self, key, font)?;
         let font_bytes = extracted_font.data.as_ref();
-        let font_index = extracted_font.index as usize;
-        let typeface = self.font_mgr.new_from_data(font_bytes, font_index)?;
+        let font_index = extracted_font.index;
+        let typeface = self
+            .font_mgr
+            .new_from_data(sk::Data::new_copy(font_bytes), font_index)?;
         self.base_typefaces.insert(key.clone(), typeface.clone());
         Some(typeface)
     }
@@ -2434,23 +2434,31 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     fn try_init_gpu_renderer() -> Option<SkiaRenderer> {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        let desc = wgpu::DeviceDescriptor::default();
-        let (device, queue) = block_on(adapter.request_device(&desc)).ok()?;
-        SkiaRenderer::new(adapter, device, queue).ok()
+        try_init_gpu_renderer_with_device().map(|(renderer, _)| renderer)
     }
 
     #[cfg(feature = "gpu")]
     fn try_init_gpu_renderer_with_device() -> Option<(SkiaRenderer, wgpu::Device)> {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        let desc = wgpu::DeviceDescriptor::default();
-        let (device, queue) = block_on(adapter.request_device(&desc)).ok()?;
-        let renderer = SkiaRenderer::new(adapter, device.clone(), queue).ok()?;
-        Some((renderer, device))
+        let result = (|| -> Result<_, Box<dyn core::error::Error>> {
+            let instance = wgpu::Instance::default();
+            let adapter =
+                block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+            let (device, queue) =
+                block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+            let renderer = SkiaRenderer::new(adapter, device.clone(), queue)?;
+            Ok((renderer, device))
+        })();
+        match result {
+            Ok(renderer) => Some(renderer),
+            Err(error) => {
+                assert!(
+                    std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() != Ok("yes"),
+                    "Skia GPU initialization failed: {error}"
+                );
+                eprintln!("skipping Skia GPU test: {error}");
+                None
+            }
+        }
     }
 
     #[cfg(feature = "gpu")]

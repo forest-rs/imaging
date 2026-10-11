@@ -168,8 +168,8 @@ use imaging::render::{
     GpuReadbackError, ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError,
     ImageTargetError, RenderContentError, RenderSource, RenderUnsupportedError,
 };
-pub use imaging_wgpu::v30::wgpu;
-use imaging_wgpu::v30::{TextureRenderer, TextureViewTarget};
+pub use imaging_wgpu::wgpu;
+use imaging_wgpu::{TextureRenderer, TextureViewTarget};
 use imaging_wgpu::{TextureRendererError, TextureTargetError};
 use vello_gpu::{RenderError, RenderSize, RenderTargetConfig, TextureBindings};
 use wgpu::{CommandEncoderDescriptor, TextureFormat};
