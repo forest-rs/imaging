@@ -1121,6 +1121,13 @@ impl SkiaRenderer {
             ReadbackError::DevicePoll => Error::Internal("wgpu device poll failed"),
             ReadbackError::CallbackDropped => Error::Internal("wgpu readback callback dropped"),
             ReadbackError::BufferMap => Error::Internal("wgpu readback buffer map failed"),
+            ReadbackError::InvalidTargetStride => {
+                Error::Internal("image target row stride is too small")
+            }
+            ReadbackError::InvalidTargetBuffer => {
+                Error::Internal("image target buffer is too small")
+            }
+            ReadbackError::PixelConversion => Error::Internal("GPU image pixel conversion failed"),
         })
     }
 
@@ -1234,6 +1241,15 @@ fn map_readback_image_error(error: ReadbackError) -> ImageRendererError {
             ImageRendererError::Readback(GpuReadbackError::CallbackDropped)
         }
         ReadbackError::BufferMap => ImageRendererError::Readback(GpuReadbackError::BufferMap),
+        ReadbackError::InvalidTargetStride => ImageRendererError::Target(
+            ImageTargetError::InvalidTarget("image target row stride is too small"),
+        ),
+        ReadbackError::InvalidTargetBuffer => {
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        }
+        ReadbackError::PixelConversion => {
+            ImageRendererError::backend(Error::Internal("GPU image pixel conversion failed"))
+        }
     }
 }
 
@@ -2548,6 +2564,68 @@ mod tests {
             renderer.supported_image_formats(),
             supported_image_formats()
         );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_readback_returns_unpremultiplied_pixels_and_rejects_short_targets() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+        let scene = solid_scene(2, 2, Color::from_rgba8(255, 0, 0, 128));
+        let mut source = &scene;
+        let image = ImageRenderer::render_source(&mut renderer, &mut source, 2, 2).unwrap();
+        assert_solid_rgba_image(&image, [255, 0, 0, 128]);
+        let mut bgra = [0_u8; 16];
+        let mut source = &scene;
+        ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut bgra,
+                width: 2,
+                height: 2,
+                bytes_per_row: 8,
+                format: ImageBufferFormat::Bgra8Unorm,
+            },
+        )
+        .unwrap();
+        assert_eq!(bgra, [0, 0, 255, 128].repeat(4).as_slice());
+        let mut float = [0_u8; 32];
+        let mut source = &scene;
+        ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut float,
+                width: 2,
+                height: 2,
+                bytes_per_row: 16,
+                format: ImageBufferFormat::Rgba16Float,
+            },
+        )
+        .unwrap();
+        for pixel in float.chunks_exact(8) {
+            assert_eq!(u16::from_le_bytes([pixel[0], pixel[1]]), 0x3c00);
+            assert_eq!(&pixel[2..6], &[0; 4]);
+            assert_eq!(u16::from_le_bytes([pixel[6], pixel[7]]), 0x3804);
+        }
+        let mut bytes = [0_u8; 16];
+        for (stride, len) in [(7, 16), (8, 15)] {
+            let mut source = &scene;
+            let result = ImageRenderer::render_source_into(
+                &mut renderer,
+                &mut source,
+                ImageBufferTarget {
+                    data: &mut bytes[..len],
+                    width: 2,
+                    height: 2,
+                    bytes_per_row: stride,
+                    format: ImageBufferFormat::Rgba8Unorm,
+                },
+            );
+            assert!(matches!(result, Err(ImageRendererError::Target(_))));
+        }
     }
 
     #[cfg(feature = "gpu")]
