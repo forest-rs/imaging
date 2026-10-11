@@ -15,9 +15,9 @@ imaging = { features = ["std"], workspace = true }
 imaging_wgpu = { default-features = false, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
-vello_07 = { default-features = true, optional = true, package = "vello", version = "0.7.0" }
-vello_08 = { default-features = true, optional = true, package = "vello", version = "0.8.0" }
-vello_09 = { default-features = true, optional = true, package = "vello", version = "0.9.0" }
+vello_07 = { default-features = false, features = ["wgpu"], optional = true, package = "vello", version = "0.7.0" }
+vello_08 = { default-features = false, features = ["wgpu"], optional = true, package = "vello", version = "0.8.0" }
+vello_09 = { default-features = false, features = ["wgpu"], optional = true, package = "vello", version = "0.9.0" }
 
 [features]
 default = ["vello-0-9"]
@@ -27,6 +27,9 @@ vello-0-9 = ["dep:vello_09", "imaging_wgpu/wgpu-29"]
 
 [dev-dependencies]
 pollster = "0.4.0"
+wgpu_27 = { package = "wgpu", version = "27" }
+wgpu_28 = { package = "wgpu", version = "28" }
+wgpu_29 = { package = "wgpu", version = "29" }
 
 [lints]
 workspace = true
