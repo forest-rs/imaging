@@ -3,27 +3,17 @@
 
 //! `wgpu` texture rendering traits for `imaging` backends.
 //!
-//! The default feature set enables `wgpu-30`. Consumers that need an older `wgpu` version
-//! should disable default features and enable the matching version feature.
-//!
-//! Workspace-wide `--all-features` builds enable multiple lanes, so this crate resolves that case
-//! deterministically by exporting `wgpu-30` as [`wgpu`]. Backends that must stay on an older
-//! `wgpu` version should use the explicit [`v27`], [`v28`], or [`v29`] module.
+//! These traits use `wgpu` 30.
 //!
 //! This crate is `std`-only because it depends on `wgpu`.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use imaging::render::{ImageRenderer, RenderSource};
 use std::boxed::Box;
 
-#[cfg(not(any(
-    feature = "wgpu-27",
-    feature = "wgpu-28",
-    feature = "wgpu-29",
-    feature = "wgpu-30"
-)))]
-compile_error!("Enable one of `wgpu-27`, `wgpu-28`, `wgpu-29`, or `wgpu-30`.");
+pub use wgpu;
 
 /// Shared texture-render-target failures surfaced by texture renderers.
 #[derive(Debug)]
@@ -106,101 +96,64 @@ impl core::error::Error for TextureRendererError {
     }
 }
 
-macro_rules! define_wgpu_lane {
-    ($module:ident, $wgpu:ident) => {
-        /// Version-specific `wgpu` texture rendering traits and target wrappers.
-        pub mod $module {
-            use imaging::render::{ImageRenderer, RenderSource};
-            use std::vec::Vec;
-
-            pub use $wgpu as wgpu;
-
-            /// Shared `wgpu` texture-view render target used by view-based [`TextureRenderer`]
-            /// backends.
-            #[derive(Clone, Debug)]
-            pub struct TextureViewTarget {
-                /// Render-target texture view.
-                pub view: wgpu::TextureView,
-                /// Effective render width in pixels.
-                pub width: u32,
-                /// Effective render height in pixels.
-                pub height: u32,
-            }
-
-            impl TextureViewTarget {
-                /// Create a shared texture-view render target wrapper.
-                #[must_use]
-                pub fn new(view: &wgpu::TextureView, width: u32, height: u32) -> Self {
-                    Self {
-                        view: view.clone(),
-                        width,
-                        height,
-                    }
-                }
-            }
-
-            /// Renderer capability for drawing a [`RenderSource`] into a backend-selected `wgpu`
-            /// texture target.
-            ///
-            /// These methods intentionally use names distinct from
-            /// [`imaging::render::ImageRenderer`] so renderers that implement both traits can be
-            /// called without fully qualified syntax.
-            pub trait TextureRenderer: ImageRenderer {
-                /// Concrete caller-owned target type consumed by this renderer.
-                type TextureTarget;
-
-                /// Owned texture type returned by [`Self::render_source_texture`].
-                type Texture;
-
-                /// Return the `wgpu` texture formats this renderer can draw into directly.
-                ///
-                /// Callers can use this to preflight swapchain or offscreen target formats before
-                /// calling [`Self::render_source_into_texture`].
-                fn supported_texture_formats(&self) -> Vec<wgpu::TextureFormat>;
-
-                /// Render a source into a caller-provided texture target.
-                ///
-                /// Renderers should treat the target as a fresh output and may clear or overwrite
-                /// any existing contents before drawing.
-                fn render_source_into_texture(
-                    &mut self,
-                    source: &mut dyn RenderSource,
-                    target: Self::TextureTarget,
-                ) -> Result<(), crate::TextureRendererError>;
-
-                /// Render a source and return a backend-owned texture.
-                fn render_source_texture(
-                    &mut self,
-                    source: &mut dyn RenderSource,
-                    width: u32,
-                    height: u32,
-                ) -> Result<Self::Texture, crate::TextureRendererError>;
-            }
-        }
-    };
+/// Shared `wgpu` texture-view render target used by view-based [`TextureRenderer`]
+/// backends.
+#[derive(Clone, Debug)]
+pub struct TextureViewTarget {
+    /// Render-target texture view.
+    pub view: wgpu::TextureView,
+    /// Effective render width in pixels.
+    pub width: u32,
+    /// Effective render height in pixels.
+    pub height: u32,
 }
 
-#[cfg(feature = "wgpu-27")]
-define_wgpu_lane!(v27, wgpu_27);
-#[cfg(feature = "wgpu-28")]
-define_wgpu_lane!(v28, wgpu_28);
-#[cfg(feature = "wgpu-29")]
-define_wgpu_lane!(v29, wgpu_29);
-#[cfg(feature = "wgpu-30")]
-define_wgpu_lane!(v30, wgpu_30);
+impl TextureViewTarget {
+    /// Create a shared texture-view render target wrapper.
+    #[must_use]
+    pub fn new(view: &wgpu::TextureView, width: u32, height: u32) -> Self {
+        Self {
+            view: view.clone(),
+            width,
+            height,
+        }
+    }
+}
 
-#[cfg(all(
-    not(any(feature = "wgpu-28", feature = "wgpu-29", feature = "wgpu-30")),
-    feature = "wgpu-27"
-))]
-pub use v27::{TextureRenderer, TextureViewTarget, wgpu};
-#[cfg(all(
-    not(any(feature = "wgpu-29", feature = "wgpu-30")),
-    feature = "wgpu-28"
-))]
-pub use v28::{TextureRenderer, TextureViewTarget, wgpu};
-#[cfg(all(not(feature = "wgpu-30"), feature = "wgpu-29"))]
-pub use v29::{TextureRenderer, TextureViewTarget, wgpu};
+/// Renderer capability for drawing a [`RenderSource`] into a backend-selected `wgpu`
+/// texture target.
+///
+/// These methods intentionally use names distinct from
+/// [`imaging::render::ImageRenderer`] so renderers that implement both traits can be
+/// called without fully qualified syntax.
+pub trait TextureRenderer: ImageRenderer {
+    /// Concrete caller-owned target type consumed by this renderer.
+    type TextureTarget;
 
-#[cfg(feature = "wgpu-30")]
-pub use v30::{TextureRenderer, TextureViewTarget, wgpu};
+    /// Owned texture type returned by [`Self::render_source_texture`].
+    type Texture;
+
+    /// Return the `wgpu` texture formats this renderer can draw into directly.
+    ///
+    /// Callers can use this to preflight swapchain or offscreen target formats before
+    /// calling [`Self::render_source_into_texture`].
+    fn supported_texture_formats(&self) -> Vec<wgpu::TextureFormat>;
+
+    /// Render a source into a caller-provided texture target.
+    ///
+    /// Renderers should treat the target as a fresh output and may clear or overwrite
+    /// any existing contents before drawing.
+    fn render_source_into_texture(
+        &mut self,
+        source: &mut dyn RenderSource,
+        target: Self::TextureTarget,
+    ) -> Result<(), TextureRendererError>;
+
+    /// Render a source and return a backend-owned texture.
+    fn render_source_texture(
+        &mut self,
+        source: &mut dyn RenderSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Self::Texture, TextureRendererError>;
+}
