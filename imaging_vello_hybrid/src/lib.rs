@@ -19,6 +19,9 @@
 //! when recording directly into a native [`VelloHybridScene`] and you want the same image
 //! support.
 //!
+//! Alpha masks render the mask scene into an isolated `DestIn` layer, preserving its paint,
+//! blending, and image bindings. Luminance masks remain unsupported by this backend.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with
@@ -226,7 +229,7 @@ pub enum Error {
     UnsupportedGlyphBlend,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
-    /// Masks are not supported by this backend yet.
+    /// Luminance masks are not supported by this backend yet.
     UnsupportedMask,
     /// Blurred rounded rect draws are not supported by this backend yet.
     UnsupportedBlurredRoundedRect,
@@ -914,6 +917,13 @@ mod tests {
         );
         drop(clipped);
         drop(pattern);
+        let mut masked = Scene::new();
+        Painter::new(&mut masked).with_masked_group(
+            imaging::MaskMode::Alpha,
+            |mask| mask.draw_image(&handle, kurbo::Affine::IDENTITY),
+            |content| content.fill_rect(Rect::new(0.0, 0.0, 2.0, 2.0), Color::WHITE),
+        );
+        let masked = renderer.encode_scene(&masked, 2, 2).unwrap();
         assert!(renderer.unbind_image(&handle));
         assert!(!renderer.unbind_image(&handle));
         assert!(matches!(
@@ -954,6 +964,11 @@ mod tests {
         write([0, 0, 128, 128]);
         drop(texture);
         assert_solid_rgba_image(&renderer.render(&encoded, 2, 2).unwrap(), [0, 0, 255, 128]);
+        assert_solid_rgba_image(
+            &renderer.render(&masked, 2, 2).unwrap(),
+            [255, 255, 255, 128],
+        );
+        drop(masked);
         let mut other = VelloHybridRenderer::new(device.clone(), queue.clone());
         assert!(matches!(
             other.render(&encoded, 2, 2),

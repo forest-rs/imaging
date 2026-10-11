@@ -39,6 +39,9 @@ until reset or dropped. Use [`VelloHybridSceneSink::with_renderer`]
 when recording directly into a native [`VelloHybridScene`] and you want the same image
 support.
 
+Alpha masks render the mask scene into an isolated `DestIn` layer, preserving its paint,
+blending, and image bindings. Luminance masks remain unsupported by this backend.
+
 # Render A Recorded Scene
 
 Record commands into [`imaging::record::Scene`], then render them with
