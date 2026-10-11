@@ -114,6 +114,12 @@
 //! imaging = { version = "0.0.1", default-features = false, features = ["libm"] }
 //! ```
 //!
+//! Images use [`ImageBrush`] and [`ImageBrushRef`] throughout fills, strokes, glyph runs, and
+//! [`Painter::draw_image`]. [`Image::Raster`] holds shared [`peniko::ImageData`] pixels;
+//! [`Image::External`] holds a typed resource handle bound by a renderer. Core recordings own
+//! handles without depending on GPU types. Encoded scenes keep the backend resources they sample
+//! alive, and unsupported or missing bindings produce explicit errors.
+//!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 
 #![no_std]
@@ -124,13 +130,17 @@ use alloc::vec::Vec;
 use kurbo::{Affine, Rect};
 use peniko::BlendMode;
 
+mod brush;
 pub mod diagnostics;
+mod image;
 mod paint;
 mod painter;
 pub mod record;
 pub mod render;
 pub mod validation;
 
+pub use brush::{Brush, BrushRef, ImageBrush, ImageBrushRef};
+pub use image::{ExternalImage, Image, ImageRef};
 pub use paint::{
     AppliedMaskRef, ClipRef, ContextKindRef, ContextRef, ContextValueRef, DrawRef, FillRef,
     GeometryRef, GlyphRunRef, GroupRef, MaskRef, PaintSink, SourceLocationRef, StrokeRef,
@@ -194,8 +204,7 @@ macro_rules! with_context {
 /// Owned unpremultiplied RGBA8 image data returned by renderers.
 ///
 /// This is an output type for readback and headless rendering results. It is not the shared image
-/// asset type used for image brushes or other `imaging` inputs; those continue to use
-/// [`peniko::ImageData`].
+/// asset type used for image brushes or other `imaging` inputs; those use [`Image`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RgbaImage {
     /// Width in pixels.

@@ -2,18 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::Error;
-use crate::{VelloHybridRenderer, image_registry::HybridImageUploadSession};
+use crate::{
+    VelloHybridRenderer, VelloHybridScene,
+    image_registry::{HybridImageUploadSession, RegisteredImage},
+};
 use glifo::Glyph as VelloGlyph;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
     StrokeRef,
 };
 use kurbo::{Affine, Shape as _};
-use peniko::{Brush, BrushRef, ImageBrush, Style};
+use peniko::{Brush, ImageBrush, Style};
+use std::sync::Arc;
 
-/// Borrowed adapter that streams `imaging` commands into an existing [`vello_gpu::Scene`].
+/// Borrowed adapter that streams `imaging` commands into an existing [`VelloHybridScene`].
 pub struct VelloHybridSceneSink<'a> {
     scene: &'a mut vello_gpu::Scene,
+    external_images: &'a mut Vec<Arc<crate::ExternalTexture>>,
+    external_bindings:
+        Option<&'a std::collections::HashMap<imaging::ExternalImage, Arc<crate::ExternalTexture>>>,
+    image_leases: &'a mut Vec<Arc<RegisteredImage>>,
+    scene_renderer: &'a mut Option<Arc<()>>,
+    finished: bool,
     resources: SceneSinkResources<'a>,
     image_upload: Option<HybridImageUploadSession<'a>>,
     tolerance: f64,
@@ -85,6 +95,22 @@ impl<'a> glifo::GlyphRunBackend<'a> for UncachedGlyphBackend<'a> {
     }
 }
 
+impl Drop for VelloHybridSceneSink<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.scene.reset();
+            self.image_leases.clear();
+            self.external_images.clear();
+            *self.scene_renderer = None;
+            if let Some(mut upload) = self.image_upload.take()
+                && let SceneSinkResources::Borrowed(resources) = &mut self.resources
+            {
+                upload.finish(resources, false);
+            }
+        }
+    }
+}
+
 impl core::fmt::Debug for VelloHybridSceneSink<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("VelloHybridSceneSink")
@@ -97,10 +123,15 @@ impl core::fmt::Debug for VelloHybridSceneSink<'_> {
 }
 
 impl<'a> VelloHybridSceneSink<'a> {
-    /// Wrap an existing [`vello_gpu::Scene`].
-    pub fn new(scene: &'a mut vello_gpu::Scene) -> Self {
+    /// Wrap an existing [`VelloHybridScene`].
+    pub fn new(scene: &'a mut VelloHybridScene) -> Self {
         Self {
-            scene,
+            scene: &mut scene.native,
+            external_images: &mut scene.external_images,
+            external_bindings: None,
+            image_leases: &mut scene.images,
+            scene_renderer: &mut scene.renderer,
+            finished: false,
             resources: SceneSinkResources::Owned(Box::default()),
             image_upload: None,
             tolerance: 0.1,
@@ -110,15 +141,23 @@ impl<'a> VelloHybridSceneSink<'a> {
         }
     }
 
-    /// Wrap an existing [`vello_gpu::Scene`] and use `renderer` to upload image brushes on
+    /// Wrap an existing [`VelloHybridScene`] and use `renderer` to upload image brushes on
     /// demand.
     ///
     /// This is the native-scene path for image brushes. Uploaded images are cached on the
     /// renderer and reused across subsequent recordings and renders.
     pub fn with_renderer(
-        scene: &'a mut vello_gpu::Scene,
+        scene: &'a mut VelloHybridScene,
         renderer: &'a mut VelloHybridRenderer,
     ) -> Self {
+        if let Some(identity) = &scene.renderer
+            && !Arc::ptr_eq(identity, &renderer.state.identity)
+        {
+            let mut sink = Self::new(scene);
+            sink.error = Some(Error::WrongRenderer);
+            return sink;
+        }
+        scene.renderer = Some(Arc::clone(&renderer.state.identity));
         let state = &mut renderer.state;
         let encoder = state
             .device
@@ -133,7 +172,12 @@ impl<'a> VelloHybridSceneSink<'a> {
             encoder,
         );
         Self {
-            scene,
+            scene: &mut scene.native,
+            external_images: &mut scene.external_images,
+            external_bindings: Some(&state.external_images),
+            image_leases: &mut scene.images,
+            scene_renderer: &mut scene.renderer,
+            finished: false,
             resources: SceneSinkResources::Borrowed(&mut state.resources),
             image_upload: Some(image_upload),
             tolerance: 0.1,
@@ -148,8 +192,11 @@ impl<'a> VelloHybridSceneSink<'a> {
         self.tolerance = tolerance;
     }
 
-    /// Return the first deferred translation error, if any, and ensure clip/group stacks are balanced.
-    pub fn finish(&mut self) -> Result<(), Error> {
+    /// Complete recording and report translation or unbalanced-stack errors.
+    ///
+    /// A failed recording clears the scene and releases its image references. Dropping the
+    /// sink without calling this method also discards the recording.
+    pub fn finish(mut self) -> Result<(), Error> {
         let result = if let Some(err) = self.error.take() {
             Err(err)
         } else if self.clip_depth != 0 {
@@ -160,6 +207,13 @@ impl<'a> VelloHybridSceneSink<'a> {
             Ok(())
         };
 
+        if result.is_err() {
+            self.scene.reset();
+            self.image_leases.clear();
+            self.external_images.clear();
+            *self.scene_renderer = None;
+        }
+        self.finished = true;
         if let Some(mut image_upload) = self.image_upload.take()
             && let SceneSinkResources::Borrowed(resources) = &mut self.resources
         {
@@ -177,9 +231,48 @@ impl<'a> VelloHybridSceneSink<'a> {
 
     fn brush_to_paint(
         &mut self,
-        brush: BrushRef<'_>,
+        brush: imaging::BrushRef<'_>,
         composite: Composite,
     ) -> Option<vello_common::paint::PaintType> {
+        if let imaging::BrushRef::Image(imaging::ImageBrushRef {
+            image: imaging::ImageRef::External(image),
+            mut sampler,
+        }) = brush
+        {
+            let Some(binding) = self
+                .external_bindings
+                .and_then(|bindings| bindings.get(image))
+            else {
+                self.set_error_once(Error::UnboundImage(image.clone()));
+                return None;
+            };
+            let index = self
+                .external_images
+                .iter()
+                .position(|held| Arc::ptr_eq(held, binding))
+                .unwrap_or_else(|| {
+                    self.external_images.push(Arc::clone(binding));
+                    self.external_images.len() - 1
+                });
+            sampler.alpha *= composite.alpha;
+            let source = vello_common::paint::ImageSource::external_texture(
+                vello_common::TextureId(index as u64),
+                vello_common::geometry::RectU16::new(
+                    0,
+                    0,
+                    u16::try_from(image.width()).expect("binding dimensions were checked"),
+                    u16::try_from(image.height()).expect("binding dimensions were checked"),
+                ),
+                true,
+            );
+            return Some(Brush::Image(vello_common::paint::Image {
+                image: source,
+                sampler,
+            }));
+        }
+        let brush = brush
+            .as_raster()
+            .expect("external images were resolved above");
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
         match brush {
             Brush::Solid(c) => Some(Brush::Solid(c)),
@@ -202,7 +295,16 @@ impl<'a> VelloHybridSceneSink<'a> {
             },
             image,
         ) {
-            Ok(image) => Some(image),
+            Ok((image, lease)) => {
+                if !self
+                    .image_leases
+                    .iter()
+                    .any(|held| Arc::ptr_eq(held, &lease))
+                {
+                    self.image_leases.push(lease);
+                }
+                Some(image)
+            }
             Err(err) => {
                 self.set_error_once(err);
                 None
@@ -540,7 +642,7 @@ mod tests {
 
     #[test]
     fn hybrid_scene_sink_reports_clip_underflow() {
-        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut scene = VelloHybridScene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.pop_clip();
@@ -552,7 +654,7 @@ mod tests {
 
     #[test]
     fn hybrid_scene_sink_rejects_filters() {
-        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut scene = VelloHybridScene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.push_group(GroupRef::new().with_filters(&[Filter::blur(2.0)]));
@@ -561,7 +663,7 @@ mod tests {
 
     #[test]
     fn hybrid_scene_sink_rejects_image_brushes_without_resolver() {
-        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut scene = VelloHybridScene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         let image = Brush::Image(ImageBrush::new(ImageData {
@@ -583,7 +685,7 @@ mod tests {
             ))),
             0,
         );
-        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut scene = VelloHybridScene::new(32, 32);
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         imaging::Painter::new(&mut sink)
             .glyphs(&font, peniko::Color::BLACK)
@@ -604,7 +706,7 @@ mod tests {
     #[test]
     fn hybrid_scene_sink_rejects_destructive_glyph_blends() {
         let font = peniko::FontData::new(Blob::new(Arc::new([0_u8; 4])), 0);
-        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut scene = VelloHybridScene::new(32, 32);
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         imaging::Painter::new(&mut sink)
             .glyphs(&font, peniko::Color::BLACK)
@@ -629,7 +731,7 @@ mod tests {
             peniko::Color::BLACK,
         ));
 
-        let mut scene = vello_gpu::Scene::new(32, 32);
+        let mut scene = VelloHybridScene::new(32, 32);
         scene.reset();
         let mut sink = VelloHybridSceneSink::new(&mut scene);
         sink.push_group(GroupRef::new().with_mask(MaskRef::new(MaskMode::Luminance, &mask)));

@@ -24,7 +24,7 @@ Full documentation at https://github.com/orium/cargo-rdme -->
 Vello hybrid backend for `imaging`.
 
 This crate provides a headless CPU/GPU renderer that consumes native
-[`vello_gpu::Scene`] values and renders them to GPU targets or RGBA8 image data using
+[`VelloHybridScene`] values and renders them to GPU targets or RGBA8 image data using
 `vello_gpu` + `wgpu`.
 
 Semantic [`imaging::record::Scene`] values can be lowered to native hybrid scenes through
@@ -34,8 +34,9 @@ In UI integrations, the host application should usually own the `wgpu` device, q
 presentation targets, then pass those handles into [`VelloHybridRenderer`].
 
 Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
-and translated to backend-managed opaque image ids. Use [`VelloHybridSceneSink::with_renderer`]
-when recording directly into a native [`vello_gpu::Scene`] and you want the same image
+and translated to backend-managed opaque image ids. Encoded scenes retain these uploads
+until reset or dropped. Use [`VelloHybridSceneSink::with_renderer`]
+when recording directly into a native [`VelloHybridScene`] and you want the same image
 support.
 
 # Render A Recorded Scene
@@ -66,20 +67,20 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
 }
 ```
 
-# Record Into `vello_gpu::Scene`
+# Record A Hybrid Scene
 
 If you want a backend-native retained scene without owning a full renderer, wrap an existing
-[`vello_gpu::Scene`] with [`VelloHybridSceneSink`].
+[`VelloHybridScene`] with [`VelloHybridSceneSink`].
 
 ```rust
 use imaging::Painter;
-use imaging_vello_hybrid::VelloHybridSceneSink;
+use imaging_vello_hybrid::{VelloHybridScene, VelloHybridSceneSink};
 use kurbo::Rect;
 use peniko::{Brush, Color};
 
 fn main() -> Result<(), imaging_vello_hybrid::Error> {
     let paint = Brush::Solid(Color::from_rgb8(0x1d, 0x4e, 0x89));
-    let mut scene = vello_gpu::Scene::new(128, 128);
+    let mut scene = VelloHybridScene::new(128, 128);
     scene.reset();
 
     {
@@ -95,17 +96,17 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
 
 Use [`VelloHybridSceneSink::with_renderer`] instead when the scene uses image brushes.
 
-# Record Image Brushes Into `vello_gpu::Scene`
+# Record Image Brushes
 
 Use [`VelloHybridSceneSink::with_renderer`] when recording image brushes directly into a
-native [`vello_gpu::Scene`]. The sink uploads images through the renderer and reuses them
+native [`VelloHybridScene`]. The sink uploads images through the renderer and reuses them
 across later recordings and renders.
 
 ```rust
 use std::sync::Arc;
 
 use imaging::Painter;
-use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridSceneSink};
+use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridScene, VelloHybridSceneSink};
 use kurbo::Rect;
 use peniko::{Blob, Brush, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 
@@ -123,7 +124,7 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
     let brush = Brush::Image(ImageBrush::new(image));
 
     let mut renderer = VelloHybridRenderer::new(device, queue);
-    let mut scene = vello_gpu::Scene::new(128, 128);
+    let mut scene = VelloHybridScene::new(128, 128);
     scene.reset();
 
     {
@@ -139,19 +140,19 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
 }
 ```
 
-# Render A Native `vello_gpu::Scene`
+# Render An Encoded Hybrid Scene
 
 If you already have a native hybrid scene, hand it directly to [`VelloHybridRenderer`].
 
 ```rust
 use imaging::Painter;
-use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridSceneSink};
+use imaging_vello_hybrid::{VelloHybridRenderer, VelloHybridScene, VelloHybridSceneSink};
 use kurbo::Rect;
 use peniko::{Brush, Color};
 
 fn main() -> Result<(), imaging_vello_hybrid::Error> {
     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
-    let mut scene = vello_gpu::Scene::new(128, 128);
+    let mut scene = VelloHybridScene::new(128, 128);
     scene.reset();
 
     {
@@ -166,6 +167,26 @@ fn main() -> Result<(), imaging_vello_hybrid::Error> {
     assert_eq!(image.width, 128);
     Ok(())
 }
+```
+# External Images
+
+Bind a caller-owned texture to an [`imaging::ExternalImage`], then use it through the
+normal image brush or drawing API. Encoded scenes retain their bindings after unbinding.
+The texture must come from the renderer's device; see the `TextureImageRenderer`
+implementation below for format, usage, and alpha requirements.
+
+```rust
+use imaging::{ExternalImage, Painter, record};
+use imaging_wgpu::TextureImageRenderer;
+use peniko::ImageAlphaType;
+
+let image = ExternalImage::new(2, 2, ImageAlphaType::AlphaPremultiplied);
+renderer.bind_image(&image, &texture)?;
+let mut scene = record::Scene::new();
+Painter::new(&mut scene).draw_image(&image, kurbo::Affine::IDENTITY);
+let encoded = renderer.encode_scene(&scene, 2, 2)?;
+renderer.unbind_image(&image);
+let output = renderer.render(&encoded, 2, 2)?;
 ```
 
 <!-- cargo-rdme end -->

@@ -8,8 +8,9 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 
+use crate::Brush;
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
-use peniko::{Brush, Fill, FontData, Style};
+use peniko::{Fill, FontData, Style};
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, ContextKindRef, ContextRef, ContextValueRef, FillRef,
@@ -432,6 +433,36 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Whether this recording or a referenced mask samples an external image.
+    ///
+    /// External pixels can change without changing scene equality. Renderers must not reuse
+    /// cached rasterizations of such scenes solely because their commands compare equal.
+    #[must_use]
+    pub fn has_external_images(&self) -> bool {
+        self.commands.iter().any(|command| match *command {
+            Command::Draw(id) => {
+                let brush = match self.draw_op(id) {
+                    Draw::Fill { brush, .. } | Draw::Stroke { brush, .. } => brush,
+                    Draw::GlyphRun(run) => &run.brush,
+                    Draw::BlurredRoundedRect(_) => return false,
+                };
+                matches!(
+                    brush,
+                    Brush::Image(crate::ImageBrush {
+                        image: crate::Image::External(_),
+                        ..
+                    })
+                )
+            }
+            Command::PushGroup(id) => self
+                .group(id)
+                .mask
+                .as_ref()
+                .is_some_and(|mask| self.mask(mask.mask).scene.has_external_images()),
+            _ => false,
+        })
+    }
+
     /// Create an empty scene.
     #[inline]
     pub fn new() -> Self {

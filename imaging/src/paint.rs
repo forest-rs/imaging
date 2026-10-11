@@ -7,9 +7,10 @@
 //! first constructing owned recording payloads. [`crate::record::Scene`] remains the owned
 //! semantic recording format.
 
+use crate::BrushRef;
 use alloc::string::{String, ToString};
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
-use peniko::{BrushRef, Fill, Style};
+use peniko::{Fill, Style};
 
 use crate::{
     BlurredRoundedRect, Composite, Filter, MaskMode, NormalizedCoord,
@@ -1187,8 +1188,9 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+    use crate::Brush;
     use crate::{Composite, record::Geometry};
-    use peniko::{Brush, FontData};
+    use peniko::FontData;
 
     #[test]
     fn context_ref_format_covers_builtin_and_named_values() {
@@ -1269,12 +1271,9 @@ mod tests {
 
     #[test]
     fn fill_ref_prepend_transform_prefixes_draw_transform_only() {
-        let draw = FillRef::new(
-            Rect::new(0.0, 0.0, 3.0, 4.0),
-            Brush::Solid(peniko::Color::WHITE),
-        )
-        .transform(Affine::translate((1.0, 2.0)))
-        .brush_transform(Some(Affine::translate((3.0, 4.0))));
+        let draw = FillRef::new(Rect::new(0.0, 0.0, 3.0, 4.0), peniko::Color::WHITE)
+            .transform(Affine::translate((1.0, 2.0)))
+            .brush_transform(Some(Affine::translate((3.0, 4.0))));
 
         assert_eq!(
             draw.prepend_transform(Affine::translate((5.0, 6.0))),
@@ -1291,10 +1290,7 @@ mod tests {
 
     #[test]
     fn fill_ref_prepend_transform_preserves_missing_brush_transform() {
-        let draw = FillRef::new(
-            Rect::new(0.0, 0.0, 3.0, 4.0),
-            Brush::Solid(peniko::Color::WHITE),
-        );
+        let draw = FillRef::new(Rect::new(0.0, 0.0, 3.0, 4.0), peniko::Color::WHITE);
 
         assert_eq!(
             draw.prepend_transform(Affine::translate((5.0, 6.0)))
@@ -1307,7 +1303,7 @@ mod tests {
     fn glyph_run_ref_prepend_transform_only_prefixes_run_transform() {
         let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
         let style = Style::Fill(Fill::NonZero);
-        let draw = GlyphRunRef::new(&font, &style, Brush::Solid(peniko::Color::BLACK));
+        let draw = GlyphRunRef::new(&font, &style, peniko::Color::BLACK);
         let draw = GlyphRunRef {
             transform: Affine::translate((1.0, 2.0)),
             glyph_transform: Some(Affine::translate((3.0, 4.0))),

@@ -222,8 +222,8 @@ pub enum Error {
     InvalidGpuTextureTarget(&'static str),
     /// The target image buffer format cannot be represented through Skia.
     UnsupportedImageTargetFormat,
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
+    /// This renderer cannot sample externally bound images.
+    UnsupportedExternalImage,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
     /// A glyph run used a per-glyph transform unsupported by this backend.
@@ -1188,8 +1188,8 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         Error::InvalidScene(error) => {
             ImageRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        Error::UnsupportedExternalImage => {
+            ImageRendererError::Unsupported(RenderUnsupportedError::ExternalImage)
         }
         Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
         Error::UnsupportedGlyphTransform => {
@@ -1243,8 +1243,8 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        Error::UnsupportedExternalImage => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::ExternalImage)
         }
         Error::UnsupportedFilter => {
             TextureRendererError::Unsupported(RenderUnsupportedError::Filter)
@@ -1800,11 +1800,12 @@ fn color_to_sk_color4f(color: peniko::Color) -> sk::Color4f {
 }
 
 fn brush_to_paint(
-    brush: BrushRef<'_>,
+    brush: imaging::BrushRef<'_>,
     opacity: f32,
     paint_xf: Affine,
     image_cache: Option<&Rc<RefCell<ImageCache>>>,
 ) -> Option<sk::Paint> {
+    let brush = brush.as_raster()?;
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
     let alpha_scale = opacity.clamp(0.0, 1.0);

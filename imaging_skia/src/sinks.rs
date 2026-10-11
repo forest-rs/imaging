@@ -253,6 +253,13 @@ fn clip_path(canvas: &sk::Canvas, state: &mut StreamState, clip: ClipRef<'_>) ->
 }
 
 fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef<'_>) -> u8 {
+    if group
+        .mask
+        .as_ref()
+        .is_some_and(|mask| mask.mask.scene.has_external_images())
+    {
+        state.set_error_once(Error::UnsupportedExternalImage);
+    }
     let filter = if group.filters.is_empty() {
         None
     } else {
@@ -314,6 +321,10 @@ fn draw_glyph_run(
 
     set_matrix(canvas, glyph_run.transform);
 
+    if glyph_run.brush.as_raster().is_none() {
+        state.set_error_once(Error::UnsupportedExternalImage);
+        return;
+    }
     let Some(mut sk_paint) = brush_to_paint(
         glyph_run.brush,
         glyph_run.composite.alpha,
@@ -699,6 +710,10 @@ fn paint_sink_fill(
     }
 
     set_matrix(canvas, draw.transform);
+    if draw.brush.as_raster().is_none() {
+        state.set_error_once(Error::UnsupportedExternalImage);
+        return;
+    }
     let Some(mut sk_paint) = brush_to_paint(
         draw.brush,
         draw.composite.alpha,
@@ -755,6 +770,10 @@ fn paint_sink_stroke(
     }
 
     set_matrix(canvas, draw.transform);
+    if draw.brush.as_raster().is_none() {
+        state.set_error_once(Error::UnsupportedExternalImage);
+        return;
+    }
     let Some(mut sk_paint) = brush_to_paint(
         draw.brush,
         draw.composite.alpha,

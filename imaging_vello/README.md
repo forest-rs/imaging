@@ -23,7 +23,7 @@ Full documentation at https://github.com/orium/cargo-rdme -->
 
 Vello backend for `imaging`.
 
-This crate provides a headless CPU/GPU renderer that consumes native [`vello::Scene`] values
+This crate provides a headless CPU/GPU renderer that consumes encoded [`VelloScene`] values
 and renders them to GPU targets or RGBA8 image data using `vello` + `wgpu`.
 
 Semantic [`imaging::record::Scene`] values can be lowered to native Vello scenes through
@@ -61,20 +61,20 @@ fn main() -> Result<(), imaging_vello::Error> {
 }
 ```
 
-# Record Into `vello::Scene`
+# Record An Encoded Scene
 
 If you want a backend-native retained scene without going through a renderer, wrap a
-mutable [`vello::Scene`] with [`VelloSceneSink`].
+mutable [`VelloScene`] with [`VelloSceneSink`].
 
 ```rust
 use imaging::Painter;
-use imaging_vello::{VelloSceneSink, vello};
+use imaging_vello::{VelloSceneSink, VelloScene};
 use kurbo::Rect;
 use peniko::{Brush, Color};
 
 fn main() -> Result<(), imaging_vello::Error> {
     let paint = Brush::Solid(Color::from_rgb8(0x1d, 0x4e, 0x89));
-    let mut scene = vello::Scene::new();
+    let mut scene = VelloScene::new();
 
     {
         let bounds = Rect::new(0.0, 0.0, 128.0, 128.0);
@@ -88,19 +88,19 @@ fn main() -> Result<(), imaging_vello::Error> {
 }
 ```
 
-# Render A Native `vello::Scene`
+# Render An Encoded Scene
 
 If you already have a native Vello scene, hand it directly to [`VelloRenderer`].
 
 ```rust
 use imaging::Painter;
-use imaging_vello::{VelloRenderer, VelloSceneSink, vello};
+use imaging_vello::{VelloRenderer, VelloSceneSink, VelloScene};
 use kurbo::Rect;
 use peniko::{Brush, Color};
 
 fn main() -> Result<(), imaging_vello::Error> {
     let paint = Brush::Solid(Color::from_rgb8(0xd9, 0x77, 0x06));
-    let mut scene = vello::Scene::new();
+    let mut scene = VelloScene::new();
 
     {
         let bounds = Rect::new(0.0, 0.0, 128.0, 128.0);
@@ -119,6 +119,26 @@ fn main() -> Result<(), imaging_vello::Error> {
 
 Note: Vello uses a single layer stack for clipping and blending. Scenes that interleave clips
 and groups in ways Vello cannot represent may return [`Error::UnbalancedLayerStack`].
+# External Images
+
+Bind a caller-owned texture to an [`imaging::ExternalImage`], then use it through the
+normal image brush or drawing API. Encoded scenes retain their bindings after unbinding.
+The texture must come from the renderer's device; see the `TextureImageRenderer`
+implementation below for format, usage, and alpha requirements.
+
+```rust
+use imaging::{ExternalImage, Painter, record};
+use imaging_wgpu::TextureImageRenderer;
+use peniko::ImageAlphaType;
+
+let image = ExternalImage::new(2, 2, ImageAlphaType::AlphaPremultiplied);
+renderer.bind_image(&image, &texture)?;
+let mut scene = record::Scene::new();
+Painter::new(&mut scene).draw_image(&image, kurbo::Affine::IDENTITY);
+let encoded = renderer.encode_scene(&scene, 2, 2)?;
+renderer.unbind_image(&image);
+let output = renderer.render(&encoded, 2, 2)?;
+```
 
 <!-- cargo-rdme end -->
 

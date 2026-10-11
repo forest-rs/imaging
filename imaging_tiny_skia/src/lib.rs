@@ -62,6 +62,8 @@ pub enum Error {
     UnsupportedTargetFormat,
     /// The caller-provided buffer shape is not large enough for the target dimensions.
     InvalidTargetBuffer,
+    /// This renderer cannot sample externally bound images.
+    UnsupportedExternalImage,
     /// An internal invariant was violated.
     Internal(&'static str),
 }
@@ -216,7 +218,7 @@ impl GlyphCacheKey {
     }
 }
 
-type ImageCacheMap = FxHashMap<u64, (CacheColor, Arc<Pixmap>)>;
+type ImageCacheMap = FxHashMap<ImageCacheKey, (CacheColor, Arc<Pixmap>)>;
 type ScaledImageCacheMap = FxHashMap<ScaledImageCacheKey, (CacheColor, Arc<Pixmap>)>;
 type BlurredRRectCacheMap = FxHashMap<BlurredRRectCacheKey, (CacheColor, Arc<Pixmap>)>;
 type GlyphCacheMap = FxHashMap<(GlyphCacheKey, u32), GlyphCacheEntry>;
@@ -413,8 +415,28 @@ fn should_retain_glyph_entry(
 }
 
 #[derive(Hash, PartialEq, Eq)]
+struct ImageCacheKey {
+    blob: u64,
+    width: u32,
+    height: u32,
+    format: Discriminant<peniko::ImageFormat>,
+    alpha_type: Discriminant<peniko::ImageAlphaType>,
+}
+impl ImageCacheKey {
+    fn new(image: &ImageData) -> Self {
+        Self {
+            blob: image.data.id(),
+            width: image.width,
+            height: image.height,
+            format: std::mem::discriminant(&image.format),
+            alpha_type: std::mem::discriminant(&image.alpha_type),
+        }
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
 struct ScaledImageCacheKey {
-    image_id: u64,
+    image: ImageCacheKey,
     width: u32,
     height: u32,
     quality: Discriminant<ImageQuality>,
@@ -1831,6 +1853,7 @@ pub struct TinySkiaRender<'renderer, 'target> {
     cache_color: CacheColor,
     cache_color_out: &'renderer mut CacheColor,
     transform: Affine,
+    error: Option<Error>,
     mask_cache: VecDeque<CachedMask>,
     layers: Vec<Layer<'target>>,
     group_frames: Vec<GroupFrame>,
@@ -1866,6 +1889,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             cache_color: cache_color_value,
             cache_color_out: cache_color,
             transform: Affine::IDENTITY,
+            error: None,
             mask_cache: VecDeque::new(),
             layers: vec![root],
             group_frames: Vec::new(),
@@ -2257,12 +2281,12 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         first_layer.filters.clear();
     }
 
-    fn brush_to_owned<'b>(&self, brush: impl Into<BrushRef<'b>>) -> Option<peniko::Brush> {
-        match brush.into() {
-            BrushRef::Solid(color) => Some(peniko::Brush::Solid(color)),
-            BrushRef::Gradient(gradient) => Some(peniko::Brush::Gradient(gradient.clone())),
-            BrushRef::Image(image) => Some(peniko::Brush::Image(image.to_owned())),
-        }
+    fn brush_to_owned(&mut self, brush: imaging::BrushRef<'_>) -> Option<peniko::Brush> {
+        let Some(brush) = brush.as_raster() else {
+            self.error = Some(Error::UnsupportedExternalImage);
+            return None;
+        };
+        Some(brush.to_owned())
     }
 
     fn current_layer_mut(&mut self) -> &mut Layer<'target> {
@@ -2659,6 +2683,13 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
+        if group
+            .mask
+            .as_ref()
+            .is_some_and(|mask| mask.mask.scene.has_external_images())
+        {
+            self.error = Some(Error::UnsupportedExternalImage);
+        }
         if !Self::group_requires_isolation(&group) {
             let pushed_clip = if let Some(clip) = group.clip {
                 self.push_clip(clip);
@@ -2853,6 +2884,10 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         draw: GlyphRunRef<'_>,
         glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
     ) {
+        if draw.brush.as_raster().is_none() {
+            self.error = Some(Error::UnsupportedExternalImage);
+            return;
+        }
         let cache_color = self.cache_color;
         if draw.composite == Composite::default() {
             let transform = self.transform;
@@ -2923,6 +2958,9 @@ impl TinySkiaRenderer {
         source.validate().map_err(Error::InvalidScene)?;
         let mut render = self.begin(width, height)?;
         source.paint_into(&mut render);
+        if let Some(error) = render.error.take() {
+            return Err(error);
+        }
         image.resize(width, height);
         render
             .finish_into_rgba8(image.data.as_mut_slice(), usize_from_u32(width) * 4)
@@ -3000,6 +3038,9 @@ impl ImageRenderer for TinySkiaRenderer {
             .begin(target.width, target.height)
             .map_err(map_image_renderer_error)?;
         source.paint_into(&mut render);
+        if let Some(error) = render.error.take() {
+            return Err(map_image_renderer_error(error));
+        }
         render
             .finish_into_rgba8(target.data, target.bytes_per_row)
             .ok_or(ImageRendererError::Target(ImageTargetError::InvalidTarget(
@@ -3018,6 +3059,9 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         }
         Error::InvalidTargetBuffer => {
             ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        }
+        Error::UnsupportedExternalImage => {
+            ImageRendererError::Unsupported(imaging::render::RenderUnsupportedError::ExternalImage)
         }
         other => ImageRendererError::backend(other),
     }
@@ -3043,6 +3087,9 @@ impl TinySkiaRenderer {
         source.validate().map_err(Error::InvalidScene)?;
         let mut render = self.begin_target(target)?;
         source.paint_into(&mut render);
+        if let Some(error) = render.error.take() {
+            return Err(error);
+        }
         render.finish_direct_rgba8_opaque().ok_or(Error::Internal(
             "tiny-skia bound target renderer did not produce a frame",
         ))
@@ -3564,7 +3611,7 @@ fn draw_brushed_glyphs_into_layer<'a>(
         Err(_) => return,
     };
     let mask_run = GlyphRunRef {
-        brush: BrushRef::Solid(Color::WHITE),
+        brush: imaging::BrushRef::Solid(Color::WHITE),
         ..run
     };
     draw_solid_color_glyphs_into_layer(
@@ -3601,7 +3648,9 @@ fn draw_brushed_glyphs_into_layer<'a>(
             * run.brush_transform.unwrap_or(Affine::IDENTITY);
     content_layer.fill_with_brush_transform_and_mode(
         &canvas_rect,
-        run.brush,
+        run.brush
+            .as_raster()
+            .expect("glyph brush was checked before rendering"),
         Some(brush_transform),
         1.0,
         TinyBlendMode::SourceOver,
@@ -3638,7 +3687,7 @@ fn draw_glyphs_into_layer<'a>(
         return;
     }
     match run.brush {
-        BrushRef::Solid(color) => draw_solid_color_glyphs_into_layer(
+        imaging::BrushRef::Solid(color) => draw_solid_color_glyphs_into_layer(
             caches,
             layer,
             cache_color,
@@ -3815,16 +3864,29 @@ fn path_to_tiny_skia_path(path: &BezPath) -> Option<Path> {
     builder.finish()
 }
 
-fn realize_image_pixmap(image_data: &ImageData) -> Option<Pixmap> {
-    let mut pixmap = Pixmap::new(image_data.width, image_data.height)?;
+fn realize_image_pixmap(image: &ImageData) -> Option<Pixmap> {
+    if image.format.size_in_bytes(image.width, image.height)? != image.data.len() {
+        return None;
+    }
+    let mut pixmap = Pixmap::new(image.width, image.height)?;
     for (pixel, bytes) in pixmap
         .pixels_mut()
         .iter_mut()
-        .zip(image_data.data.data().chunks_exact(4))
+        .zip(image.data.data().chunks_exact(4))
     {
-        *pixel = tiny_skia::Color::from_rgba8(bytes[0], bytes[1], bytes[2], bytes[3])
-            .premultiply()
-            .to_color_u8();
+        let [r, g, b, a] = match image.format {
+            peniko::ImageFormat::Rgba8 => [bytes[0], bytes[1], bytes[2], bytes[3]],
+            peniko::ImageFormat::Bgra8 => [bytes[2], bytes[1], bytes[0], bytes[3]],
+            _ => return None,
+        };
+        *pixel = match image.alpha_type {
+            peniko::ImageAlphaType::Alpha => tiny_skia::Color::from_rgba8(r, g, b, a)
+                .premultiply()
+                .to_color_u8(),
+            peniko::ImageAlphaType::AlphaPremultiplied => {
+                PremultipliedColorU8::from_rgba(r, g, b, a)?
+            }
+        };
     }
     Some(pixmap)
 }
@@ -3838,7 +3900,7 @@ where
     T: Borrow<ImageData>,
 {
     let image_data = image.image.borrow();
-    let image_id = image_data.data.id();
+    let image_id = ImageCacheKey::new(image_data);
     if let Some((entry_color, pixmap)) = caches.image_cache.get_mut(&image_id) {
         *entry_color = cache_color;
         return Some(pixmap.clone());
@@ -3881,9 +3943,9 @@ fn cache_scaled_image_pixmap<T>(
 where
     T: Borrow<ImageData>,
 {
-    let image_id = image.image.borrow().data.id();
+    let image_id = ImageCacheKey::new(image.image.borrow());
     let key = ScaledImageCacheKey {
-        image_id,
+        image: image_id,
         width,
         height,
         quality: std::mem::discriminant(&image.sampler.quality),
