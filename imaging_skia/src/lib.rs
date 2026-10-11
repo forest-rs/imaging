@@ -11,6 +11,9 @@
 //! This crate provides a CPU raster renderer that consumes `imaging::record::Scene` or native
 //! Skia draw targets and produces an RGBA8 image buffer using Skia.
 //!
+//! Masks use native Skia layers on raster canvases, GPU canvases, and recorded pictures.
+//! The rendered mask's alpha or luminance modulates the filtered content before compositing.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then hand the scene to [`SkiaCpuRenderer`].
@@ -195,7 +198,6 @@ use crate::gpu_readback::{
 use imaging_wgpu::TextureRenderer;
 #[cfg(feature = "gpu")]
 use imaging_wgpu::{TextureRendererError, TextureTargetError};
-use sinks::MaskCache;
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 #[cfg(feature = "gpu")]
 pub use wgpu;
@@ -397,7 +399,6 @@ impl Default for ImageCache {
 pub struct SkiaCaches {
     font_cache: SkiaFontCache,
     image_cache: Rc<RefCell<ImageCache>>,
-    mask_cache: Rc<RefCell<MaskCache>>,
 }
 
 impl SkiaCaches {
@@ -407,7 +408,6 @@ impl SkiaCaches {
         Self {
             font_cache: SkiaFontCache::new(),
             image_cache: Rc::new(RefCell::new(ImageCache::default())),
-            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
         }
     }
 
@@ -425,21 +425,14 @@ impl SkiaCaches {
     fn image_cache(&self) -> Rc<RefCell<ImageCache>> {
         Rc::clone(&self.image_cache)
     }
-    fn mask_cache(&self) -> Rc<RefCell<MaskCache>> {
-        Rc::clone(&self.mask_cache)
-    }
 
     fn clear(&self) {
         self.font_cache.clear();
         self.image_cache.borrow_mut().clear();
-        self.mask_cache.borrow_mut().clear();
     }
 
     fn set_image_cache_total_bytes_limit(&self, limit: usize) {
         self.image_cache.borrow_mut().set_max_bytes(limit);
-    }
-    fn set_mask_cache_total_bytes_limit(&self, limit: usize) {
-        self.mask_cache.borrow_mut().set_max_bytes(limit);
     }
 }
 
@@ -460,8 +453,6 @@ pub struct SkiaCacheConfig {
     pub resource_cache_single_allocation_byte_limit: Option<usize>,
     /// Maximum number of bytes retained by the shared realized-image cache.
     pub image_cache_total_bytes_limit: usize,
-    /// Maximum number of bytes retained by the shared realized mask cache.
-    pub mask_cache_total_bytes_limit: usize,
 }
 
 impl Default for SkiaCacheConfig {
@@ -472,7 +463,6 @@ impl Default for SkiaCacheConfig {
             resource_cache_total_bytes_limit: 10 * 1024 * 1024,
             resource_cache_single_allocation_byte_limit: None,
             image_cache_total_bytes_limit: 64 * 1024 * 1024,
-            mask_cache_total_bytes_limit: 64 * 1024 * 1024,
         }
     }
 }
@@ -519,13 +509,6 @@ impl SkiaCacheConfig {
     #[must_use]
     pub fn with_image_cache_total_bytes_limit(mut self, limit: usize) -> Self {
         self.image_cache_total_bytes_limit = limit;
-        self
-    }
-
-    /// Override the shared realized-mask cache byte limit.
-    #[must_use]
-    pub fn with_mask_cache_total_bytes_limit(mut self, limit: usize) -> Self {
-        self.mask_cache_total_bytes_limit = limit;
         self
     }
 
@@ -620,9 +603,6 @@ impl SkiaCpuRenderer {
         config
             .caches
             .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
-        config
-            .caches
-            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let surface = Self::create_surface(1, 1);
         Self {
             surface,
@@ -635,19 +615,7 @@ impl SkiaCpuRenderer {
 
     /// Set the tolerance used when converting shapes to paths.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        if self.tolerance != tolerance {
-            self.caches.mask_cache().borrow_mut().clear();
-        }
         self.tolerance = tolerance;
-    }
-
-    /// Drop any realized mask artifacts cached by the renderer.
-    ///
-    /// The cache is shared through [`SkiaCaches`], so unchanged masked subscenes can be reused
-    /// across compatible renderers. Call this if you need to release memory aggressively or after
-    /// changing assumptions that affect mask realization outside the recorded scene itself.
-    pub fn clear_cached_masks(&mut self) {
-        self.caches.mask_cache().borrow_mut().clear();
     }
 
     /// Drop any realized image resources cached by the renderer.
@@ -668,7 +636,6 @@ impl SkiaCpuRenderer {
         self.surface = Self::create_surface(width, height);
         self.width = width;
         self.height = height;
-        self.clear_cached_masks();
     }
 
     fn reset(&mut self) {
@@ -692,7 +659,6 @@ impl SkiaCpuRenderer {
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
             Some(self.caches.image_cache()),
-            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -765,7 +731,6 @@ impl ImageRenderer for SkiaCpuRenderer {
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
             Some(self.caches.image_cache()),
-            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -863,9 +828,6 @@ impl SkiaGpuRendererState {
         config
             .caches
             .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
-        config
-            .caches
-            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
         Ok(Self {
             backend,
@@ -901,7 +863,6 @@ impl SkiaGpuRendererState {
         let mut sink = SkCanvasSink::new_with_caches(
             surface.canvas(),
             Some(self.caches.image_cache()),
-            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -954,15 +915,7 @@ impl SkiaRenderer {
 
     /// Set the tolerance used when converting shapes to paths during scene encoding.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        if self.state.tolerance != tolerance {
-            self.state.caches.mask_cache().borrow_mut().clear();
-        }
         self.state.tolerance = tolerance;
-    }
-
-    /// Drop any realized mask artifacts cached by the renderer.
-    pub fn clear_cached_masks(&mut self) {
-        self.state.caches.mask_cache().borrow_mut().clear();
     }
 
     /// Drop any realized image resources cached by the renderer.
@@ -2185,31 +2138,104 @@ mod tests {
         assert_eq!(&image.data[..4], &[0x22, 0x66, 0xaa, 0xff]);
     }
 
-    #[test]
-    fn render_scene_reuses_cached_masks_for_identical_scenes() {
-        let scene = masked_scene(MaskMode::Alpha);
+    fn image_pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        let width = usize::try_from(image.width).expect("image width fits usize");
+        let idx = (usize::try_from(y).expect("y fits usize") * width
+            + usize::try_from(x).expect("x fits usize"))
+            * 4;
+        image.data[idx..idx + 4].try_into().expect("RGBA pixel")
+    }
+
+    fn assert_masked_scene_renders(mode: MaskMode) {
+        let scene = masked_scene(mode);
         let mut renderer = SkiaCpuRenderer::new();
 
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
+        let image = renderer.render_scene(&scene, 64, 64).unwrap();
 
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
+        assert_eq!(image_pixel(&image, 4, 4), [0, 0, 0, 0]);
+        assert!(image_pixel(&image, 16, 16)[3] > 0);
     }
 
     #[test]
-    fn clear_cached_masks_drops_realized_masks() {
-        let scene = masked_scene(MaskMode::Luminance);
+    fn render_scene_renders_alpha_masks() {
+        assert_masked_scene_renders(MaskMode::Alpha);
+    }
+
+    #[test]
+    fn render_scene_renders_luminance_masks() {
+        assert_masked_scene_renders(MaskMode::Luminance);
+    }
+
+    fn filtered_mask_scene(mode: MaskMode) -> Scene {
+        let mask = Painter::<Scene>::record_mask(mode, |p| {
+            p.fill_rect(
+                Rect::new(0.0, 0.0, 8.0, 8.0),
+                Color::from_rgba8(0, 0, 255, 128),
+            );
+        });
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(
+            GroupRef::new()
+                .with_filters(&[Filter::offset(4.0, 0.0)])
+                .with_mask(mask.as_ref())
+                .with_clip(imaging::ClipRef::fill(Rect::new(5.0, 0.0, 7.0, 8.0)))
+                .with_composite(imaging::Composite::new(peniko::BlendMode::default(), 0.5)),
+            |p| p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE),
+        );
+        scene
+    }
+
+    fn assert_filtered_mask(image: &RgbaImage, mode: MaskMode) {
+        for y in 0..8 {
+            for x in 0..16 {
+                let pixel = image_pixel(image, x, y);
+                let expected = if (5..7).contains(&x) {
+                    match mode {
+                        MaskMode::Alpha => 64,
+                        MaskMode::Luminance => 5,
+                    }
+                } else {
+                    0
+                };
+                assert!(
+                    pixel[3].abs_diff(expected) <= 1,
+                    "filtered {mode:?} mask at ({x}, {y}): {pixel:?}, expected alpha {expected}"
+                );
+                if expected != 0 {
+                    assert_eq!(&pixel[..3], &[255; 3], "mask colors must not tint content");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_pictures_preserve_filtered_masks_and_clips() {
         let mut renderer = SkiaCpuRenderer::new();
+        for mode in [MaskMode::Alpha, MaskMode::Luminance] {
+            let scene = filtered_mask_scene(mode);
+            let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 16.0, 8.0));
+            replay(&scene, &mut sink);
+            let picture = sink.finish_picture().unwrap();
+            assert_filtered_mask(&renderer.render_picture(&picture, 16, 8).unwrap(), mode);
+            assert_filtered_mask(&renderer.render_scene(&scene, 16, 8).unwrap(), mode);
+        }
+    }
 
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
-
-        renderer.clear_cached_masks();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
-
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn gpu_sources_and_pictures_preserve_filtered_masks_and_clips() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+        for mode in [MaskMode::Alpha, MaskMode::Luminance] {
+            let scene = filtered_mask_scene(mode);
+            let image = ImageRenderer::render_source(&mut renderer, &mut &scene, 16, 8).unwrap();
+            assert_filtered_mask(&image, mode);
+            let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 16.0, 8.0));
+            replay(&scene, &mut sink);
+            let picture = sink.finish_picture().unwrap();
+            assert_filtered_mask(&renderer.render_picture(&picture, 16, 8).unwrap(), mode);
+        }
     }
 
     #[test]
@@ -2237,26 +2263,14 @@ mod tests {
     }
 
     #[test]
-    fn changing_tolerance_clears_cached_masks() {
-        let scene = masked_scene(MaskMode::Alpha);
+    fn changing_tolerance_keeps_masked_rendering_working() {
+        let scene = masked_scene(MaskMode::Luminance);
         let mut renderer = SkiaCpuRenderer::new();
 
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
 
         renderer.set_tolerance(0.25);
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
-    }
-
-    #[test]
-    fn config_can_disable_realized_mask_retention() {
-        let scene = masked_scene(MaskMode::Alpha);
-        let config = SkiaConfig::new()
-            .with_cache_config(SkiaCacheConfig::new().with_mask_cache_total_bytes_limit(0));
-        let mut renderer = SkiaCpuRenderer::new_with_config(config);
-
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
     }
 
     #[test]
