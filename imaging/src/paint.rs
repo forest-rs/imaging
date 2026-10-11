@@ -231,13 +231,16 @@ impl<'a> ClipRef<'a> {
 }
 
 /// Borrowed isolated group payload.
+///
+/// The group renders its content in isolation, applies filters in slice order, then applies
+/// the mask and isolated clip. Group opacity and blending apply once to that result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupRef<'a> {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<ClipRef<'a>>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMaskRef<'a>>,
-    /// Optional filter chain applied to the group result before compositing.
+    /// Filter chain applied in slice order before the mask, isolated clip, and compositing.
     pub filters: &'a [Filter],
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,

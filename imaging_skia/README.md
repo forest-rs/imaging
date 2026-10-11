@@ -26,6 +26,9 @@ Skia backend for `imaging`.
 This crate provides a CPU raster renderer that consumes `imaging::record::Scene` or native
 Skia draw targets and produces an RGBA8 image buffer using Skia.
 
+Masks use native Skia layers on raster canvases, GPU canvases, and recorded pictures.
+The rendered mask's alpha or luminance modulates the filtered content before compositing.
+
 # Render A Recorded Scene
 
 Record commands into [`imaging::record::Scene`], then hand the scene to [`SkiaCpuRenderer`].

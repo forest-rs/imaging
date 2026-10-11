@@ -259,16 +259,16 @@ impl AppliedMask {
 
 /// Parameters for an isolated group.
 ///
-/// The group is rendered into an isolated buffer, then composited into its parent using
-/// [`Group::composite`]. If `clip` is present, it is applied to the group's result at
-/// composite time (isolated clip).
+/// The group renders its content in isolation, applies filters in vector order, then applies
+/// the mask and isolated clip. Group opacity and blending apply once to that result when it
+/// is composited into its parent using [`Group::composite`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Group {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<Clip>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMask>,
-    /// Optional filter chain applied to the group result before compositing.
+    /// Filter chain applied in vector order before the mask, isolated clip, and compositing.
     pub filters: Vec<crate::Filter>,
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,

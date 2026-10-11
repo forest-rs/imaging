@@ -19,6 +19,102 @@ use std::sync::Arc;
 const SURFACE: Rect = Rect::new(0.0, 0.0, 16.0, 8.0);
 
 fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
+    let mut isolated = Scene::new();
+    let mut p = Painter::new(&mut isolated);
+    p.fill_rect(SURFACE, Color::from_rgb8(0, 0, 255));
+    p.with_group(GroupRef::new(), |p| {
+        p.fill(SURFACE, Color::from_rgb8(255, 0, 0))
+            .composite(Composite::new(peniko::Mix::Multiply.into(), 1.0))
+            .draw();
+    });
+    let image = renderer.render_source(&mut &isolated, 16, 8).unwrap();
+    assert!(
+        image
+            .data
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 0, 0, 255]),
+        "default groups must isolate child blending from the parent backdrop: {:?}",
+        &image.data[..4]
+    );
+
+    let mut empty = Scene::new();
+    let mut p = Painter::new(&mut empty);
+    p.with_group(GroupRef::new(), |p| {
+        p.with_group(
+            GroupRef::new().with_clip(imaging::ClipRef::fill(Rect::ZERO)),
+            |p| {
+                p.fill_rect(SURFACE, Color::BLACK);
+                p.with_group(GroupRef::new(), |p| p.fill_rect(SURFACE, Color::BLACK));
+            },
+        );
+        p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE);
+    });
+    let image = renderer.render_source(&mut &empty, 16, 8).unwrap();
+    assert_eq!(
+        image.data[(4 * 16 + 2) * 4 + 3],
+        255,
+        "empty nested groups must preserve the parent layer"
+    );
+    assert_eq!(
+        image.data[(4 * 16 + 12) * 4 + 3],
+        0,
+        "empty group clips must discard their content"
+    );
+
+    // A cropped glyph mask must preserve the image brush's run and brush transforms.
+    use skrifa::MetadataProvider as _;
+    let bytes = include_bytes!("../../test_assets/fonts/NotoSans-Regular.ttf");
+    let glyph = skrifa::FontRef::new(bytes)
+        .unwrap()
+        .charmap()
+        .map('M')
+        .unwrap();
+    let font = peniko::FontData::new(Blob::new(Arc::new(bytes)), 0);
+    let image = imaging::ImageBrush::new(ImageData {
+        data: Blob::new(Arc::new([255_u8, 0, 0, 255, 0, 0, 255, 255])),
+        width: 2,
+        height: 1,
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+    })
+    .with_sampler(peniko::ImageSampler::default().with_quality(peniko::ImageQuality::Low));
+    let mut text = Scene::new();
+    Painter::new(&mut text).with_group(
+        GroupRef::new().with_clip(imaging::ClipRef::fill(Rect::new(2.0, 1.0, 14.0, 8.0))),
+        |p| {
+            p.glyphs(&font, &image)
+                .font_size(8.0)
+                .transform(Affine::translate((3.0, 7.0)))
+                .brush_transform(Some(Affine::scale(4.0)))
+                .draw(
+                    &peniko::Style::Fill(peniko::Fill::NonZero),
+                    [imaging::record::Glyph {
+                        id: glyph.to_u32(),
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                );
+        },
+    );
+    let image = renderer.render_source(&mut &text, 16, 8).unwrap();
+    let mut painted = 0;
+    for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+        if pixel[3] < 32 {
+            continue;
+        }
+        painted += 1;
+        let x = index % 16;
+        let expected = if x < 7 { [255, 0, 0] } else { [0, 0, 255] };
+        assert!(
+            pixel[..3]
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.abs_diff(b) <= 2),
+            "glyph brush at x={x}: {pixel:?}, expected {expected:?}"
+        );
+    }
+    assert!(painted > 0, "glyphs inside an offset group must render");
+
     let mut mask = Scene::new();
     let mut painter = Painter::new(&mut mask);
     painter.fill_rect(
@@ -99,6 +195,30 @@ fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
         "outside nested mask is transparent"
     );
 
+    let mask = Painter::<Scene>::record_mask(MaskMode::Alpha, |p| {
+        p.fill_rect(Rect::new(4.0, 4.0, 12.0, 6.0), Color::WHITE);
+    });
+    let mut nested = Scene::new();
+    Painter::new(&mut nested).with_group(
+        GroupRef::new().with_clip(imaging::ClipRef::fill(Rect::new(2.0, 2.0, 14.0, 8.0))),
+        |p| {
+            p.with_group(GroupRef::new().with_mask(mask.as_ref()), |p| {
+                p.fill_rect(SURFACE, Color::WHITE);
+            });
+        },
+    );
+    let image = renderer.render_source(&mut &nested, 16, 8).unwrap();
+    assert_eq!(
+        image.data[(5 * 16 + 6) * 4 + 3],
+        255,
+        "localized masks stay aligned inside an offset parent layer"
+    );
+    assert_eq!(
+        image.data[(5 * 16 + 13) * 4 + 3],
+        0,
+        "localized mask bounds stay in scene coordinates"
+    );
+
     let empty = Scene::new();
     let mut scene = Scene::new();
     Painter::new(&mut scene).with_group(
@@ -115,19 +235,22 @@ fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
 #[test]
 #[cfg(feature = "tiny_skia")]
 fn tiny_skia_alpha_masks() {
-    check_alpha_mask_contract(&mut imaging_tiny_skia::TinySkiaRenderer::new());
+    let mut renderer = imaging_tiny_skia::TinySkiaRenderer::new();
+    check_alpha_mask_contract(&mut renderer);
 }
 
 #[test]
 #[cfg(feature = "vello_cpu")]
 fn vello_cpu_alpha_masks() {
-    check_alpha_mask_contract(&mut imaging_vello_cpu::VelloCpuRenderer::new(16, 8));
+    let mut renderer = imaging_vello_cpu::VelloCpuRenderer::new(16, 8);
+    check_alpha_mask_contract(&mut renderer);
 }
 
 #[test]
 #[cfg(feature = "skia")]
 fn skia_alpha_masks() {
-    check_alpha_mask_contract(&mut imaging_skia::SkiaCpuRenderer::new());
+    let mut renderer = imaging_skia::SkiaCpuRenderer::new();
+    check_alpha_mask_contract(&mut renderer);
 }
 
 #[cfg(any(feature = "vello", feature = "vello_hybrid"))]
@@ -172,7 +295,6 @@ fn hybrid_alpha_masks() {
     let Some((device, queue)) = device() else {
         return;
     };
-    check_alpha_mask_contract(&mut imaging_vello_hybrid::VelloHybridRenderer::new(
-        device, queue,
-    ));
+    let mut renderer = imaging_vello_hybrid::VelloHybridRenderer::new(device, queue);
+    check_alpha_mask_contract(&mut renderer);
 }

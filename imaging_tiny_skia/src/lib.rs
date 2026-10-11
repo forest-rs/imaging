@@ -590,6 +590,7 @@ struct Layer<'a> {
     group_mask: Option<PendingGroupMask>,
     filters: Vec<Filter>,
     clip_applied_in_content: bool,
+    deferred_group_clip: Option<ClipPath>,
 }
 
 struct PendingGroupMask {
@@ -640,6 +641,7 @@ impl Layer<'static> {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         })
     }
 
@@ -669,6 +671,7 @@ impl Layer<'static> {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         };
         layer.rebuild_clip_mask();
         Ok(layer)
@@ -710,6 +713,7 @@ impl<'a> Layer<'a> {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         })
     }
 
@@ -1092,7 +1096,7 @@ impl<'a> Layer<'a> {
     }
 
     fn mark_drawn_rect_inflated(&mut self, rect: Rect, transform: Affine, pad: f64) {
-        let mut root_rect = transform.transform_rect_bbox(rect).inset(-pad);
+        let mut root_rect = transform.transform_rect_bbox(rect).inflate(pad, pad);
         if let Some(clip) = self.clip_in_root() {
             root_rect = root_rect.intersect(clip);
         }
@@ -1113,7 +1117,11 @@ impl<'a> Layer<'a> {
         }
 
         let stroke_pad = stroke.width + stroke.miter_limit.max(1.0) + 4.0;
-        self.mark_drawn_rect_inflated(shape.bounding_box().inset(-stroke_pad), self.transform, 4.0);
+        self.mark_drawn_rect_inflated(
+            shape.bounding_box().inflate(stroke_pad, stroke_pad),
+            self.transform,
+            4.0,
+        );
     }
 
     fn try_draw_pixmap_translate_only(
@@ -1240,12 +1248,7 @@ impl<'a> Layer<'a> {
         (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
     }
 
-    fn try_fill_rect_with_paint_fast(
-        &mut self,
-        rect: Rect,
-        paint: &Paint<'_>,
-        brush_transform: Option<Affine>,
-    ) -> bool {
+    fn try_fill_rect_with_paint_fast(&mut self, rect: Rect, paint: &Paint<'_>) -> bool {
         if !is_axis_aligned(self.device_transform()) {
             return false;
         }
@@ -1256,9 +1259,10 @@ impl<'a> Layer<'a> {
         };
 
         let mut paint = paint.clone();
-        paint.shader.transform(affine_to_skia(
-            self.device_transform() * brush_transform.unwrap_or(Affine::IDENTITY),
-        ));
+        // The shader already contains the brush transform; only move it into device space.
+        paint
+            .shader
+            .transform(affine_to_skia(self.device_transform()));
         self.materialize_simple_clip_mask();
         let clip_mask = self.clip.is_some().then_some(&self.mask);
         self.pixmap
@@ -1276,7 +1280,14 @@ impl<'a> Layer<'a> {
         transform: Affine,
         quality: FilterQuality,
     ) {
-        if self.try_draw_pixmap_translate_only(img_pixmap, x as f64, y as f64, transform, quality) {
+        let device_transform = Affine::translate((-self.origin.x, -self.origin.y)) * transform;
+        if self.try_draw_pixmap_translate_only(
+            img_pixmap,
+            x as f64,
+            y as f64,
+            device_transform,
+            quality,
+        ) {
             return;
         }
 
@@ -1284,7 +1295,7 @@ impl<'a> Layer<'a> {
             (x, y),
             (img_pixmap.width() as f64, img_pixmap.height() as f64),
         );
-        if !self.intersects_clip(img_rect, transform) {
+        if !self.intersects_clip(img_rect, device_transform) {
             return;
         }
         self.mark_drawn_rect_inflated(img_rect, transform, 2.0);
@@ -1293,7 +1304,7 @@ impl<'a> Layer<'a> {
             blend_mode: tiny_skia::BlendMode::SourceOver,
             quality,
         };
-        let transform = affine_to_skia(transform * Affine::translate((x as f64, y as f64)));
+        let transform = affine_to_skia(device_transform * Affine::translate((x as f64, y as f64)));
         self.materialize_simple_clip_mask();
         let clip_mask = self.clip.is_some().then_some(&self.mask);
         self.pixmap
@@ -1640,7 +1651,7 @@ impl<'a> Layer<'a> {
         };
         self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
         if let Some(rect) = shape.as_rect() {
-            if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
+            if !self.try_fill_rect_with_paint_fast(rect, &paint) {
                 let rect = try_ret!(to_skia_rect(rect));
                 self.materialize_simple_clip_mask();
                 let clip_mask = self.clip.is_some().then_some(&self.mask);
@@ -1819,7 +1830,7 @@ impl Layer<'_> {
         let paint = try_ret!(brush_to_paint(brush, brush_transform, opacity, blend_mode));
         self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
         if let Some(rect) = shape.as_rect() {
-            if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
+            if !self.try_fill_rect_with_paint_fast(rect, &paint) {
                 let rect = try_ret!(to_skia_rect(rect));
                 self.materialize_simple_clip_mask();
                 let clip_mask = self.clip.is_some().then_some(&self.mask);
@@ -1861,7 +1872,7 @@ pub struct TinySkiaRender<'renderer, 'target> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GroupFrame {
-    Direct { pushed_clip: bool },
+    Empty,
     Isolated,
 }
 
@@ -1957,8 +1968,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             .collect()
     }
 
-    fn group_requires_isolation(group: &GroupRef<'_>) -> bool {
-        group.composite != Composite::default() || !group.filters.is_empty() || group.mask.is_some()
+    fn discarding_group(&self) -> bool {
+        self.group_frames.last() == Some(&GroupFrame::Empty)
     }
 
     fn default_group_clip(&self) -> Option<ClipPath> {
@@ -1993,6 +2004,21 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     ) -> Option<Layer<'static>> {
         let parent_origin = self.current_layer().origin;
         let clip = translate_clip_path(&clip, parent_origin.x, parent_origin.y);
+        if !filters.is_empty() {
+            // Filters can move source pixels into the isolated clip. Keep their input unclipped;
+            // the group's clip and the parent's clip constrain the result at composition time.
+            let mut child = Layer::new_root(
+                self.layers[0].pixmap.width(),
+                self.layers[0].pixmap.height(),
+            )
+            .ok()?;
+            child.blend_mode = composite.blend;
+            child.alpha = composite.alpha;
+            child.group_mask = group_mask;
+            child.filters = filters.to_vec();
+            child.deferred_group_clip = Some(clip);
+            return Some(child);
+        }
         let inherited_clips = self.current_layer().effective_clips_in_root();
         let mut group_bounds = clip.rect;
         for inherited in &inherited_clips {
@@ -2026,6 +2052,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     }
 
     fn finish_popped_group(&mut self, mut child: Layer<'_>) {
+        apply_group_filters(&mut child);
         let mask_bounds = child
             .group_mask
             .as_ref()
@@ -2036,7 +2063,17 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         }
 
         self.apply_deferred_group_mask(&mut child, mask_bounds);
-        apply_group_filters(&mut child);
+        if let Some(clip) = child.deferred_group_clip.take() {
+            if clip.rect.is_zero_area() {
+                return;
+            }
+            child.base_clip = Some(clip);
+            child.rebuild_clip_mask();
+            child.materialize_simple_clip_mask();
+            if let LayerPixmap::Owned(pixmap) = &mut child.pixmap {
+                pixmap.apply_mask(&child.mask);
+            }
+        }
         let parent = self.current_layer_mut();
         apply_layer(&child, parent);
     }
@@ -2096,8 +2133,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         let parent = self.current_layer_mut();
         draw_layer_pixmap(
             &localized_child,
-            bounds.x(),
-            bounds.y(),
+            bounds.x() - round_to_i32(parent.origin.x),
+            bounds.y() - round_to_i32(parent.origin.y),
             parent,
             blend_mode,
             child.alpha,
@@ -2279,6 +2316,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         first_layer.mask_valid = false;
         first_layer.group_mask = None;
         first_layer.filters.clear();
+        first_layer.deferred_group_clip = None;
     }
 
     fn brush_to_owned(&mut self, brush: imaging::BrushRef<'_>) -> Option<peniko::Brush> {
@@ -2667,6 +2705,9 @@ fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Op
 
 impl PaintSink for TinySkiaRender<'_, '_> {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
+        if self.discarding_group() {
+            return;
+        }
         let clip_path = self.clip_path_for_clip(clip);
         if let Some(clip_path) = clip_path {
             let layer = self.current_layer_mut();
@@ -2676,6 +2717,9 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn pop_clip(&mut self) {
+        if self.discarding_group() {
+            return;
+        }
         let layer = self.current_layer_mut();
         if layer.clip_stack.pop().is_some() {
             layer.rebuild_clip_mask();
@@ -2690,14 +2734,8 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         {
             self.error = Some(Error::UnsupportedExternalImage);
         }
-        if !Self::group_requires_isolation(&group) {
-            let pushed_clip = if let Some(clip) = group.clip {
-                self.push_clip(clip);
-                true
-            } else {
-                false
-            };
-            self.group_frames.push(GroupFrame::Direct { pushed_clip });
+        if self.discarding_group() {
+            self.group_frames.push(GroupFrame::Empty);
             return;
         }
 
@@ -2711,6 +2749,8 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         {
             self.layers.push(child);
             self.group_frames.push(GroupFrame::Isolated);
+        } else {
+            self.group_frames.push(GroupFrame::Empty);
         }
     }
 
@@ -2719,11 +2759,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             return;
         };
         match frame {
-            GroupFrame::Direct { pushed_clip } => {
-                if pushed_clip {
-                    self.pop_clip();
-                }
-            }
+            GroupFrame::Empty => {}
             GroupFrame::Isolated => {
                 if self.layers.len() <= 1 {
                     return;
@@ -2735,6 +2771,9 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
+        if self.discarding_group() {
+            return;
+        }
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
@@ -2809,6 +2848,9 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
+        if self.discarding_group() {
+            return;
+        }
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
@@ -2884,6 +2926,9 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         draw: GlyphRunRef<'_>,
         glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
     ) {
+        if self.discarding_group() {
+            return;
+        }
         if draw.brush.as_raster().is_none() {
             self.error = Some(Error::UnsupportedExternalImage);
             return;
@@ -2917,6 +2962,9 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        if self.discarding_group() {
+            return;
+        }
         if let BlendStrategy::SinglePass(blend_mode) =
             determine_blend_strategy(&draw.composite.blend)
         {
@@ -3610,6 +3658,7 @@ fn draw_brushed_glyphs_into_layer<'a>(
         Ok(layer) => layer,
         Err(_) => return,
     };
+    mask_layer.origin = layer.origin;
     let mask_run = GlyphRunRef {
         brush: imaging::BrushRef::Solid(Color::WHITE),
         ..run
@@ -3623,13 +3672,21 @@ fn draw_brushed_glyphs_into_layer<'a>(
         glyphs,
         Color::WHITE,
     );
-    let Some(mask_bounds) = mask_layer.draw_bounds else {
+    let Some(mask_bounds) = mask_layer.draw_bounds.map(|bounds| {
+        bounds.intersect(Rect::from_origin_size(
+            layer.origin,
+            Size::new(f64::from(width), f64::from(height)),
+        ))
+    }) else {
         return;
     };
     let Some(mask_bounds) = rect_to_int_rect(mask_bounds) else {
         return;
     };
-    let Some(local_mask) = clone_pixmap_region(mask_layer.pixmap.as_ref(), mask_bounds) else {
+    let Some(local_bounds) = root_rect_to_local_int_rect(&mask_layer, mask_bounds) else {
+        return;
+    };
+    let Some(local_mask) = clone_pixmap_region(mask_layer.pixmap.as_ref(), local_bounds) else {
         return;
     };
     let mut content_layer = match Layer::new_root(mask_bounds.width(), mask_bounds.height()) {
@@ -3644,7 +3701,8 @@ fn draw_brushed_glyphs_into_layer<'a>(
         ),
     );
     let brush_transform =
-        Affine::translate((f64::from(mask_bounds.x()), f64::from(mask_bounds.y())))
+        Affine::translate((-f64::from(mask_bounds.x()), -f64::from(mask_bounds.y())))
+            * run.transform
             * run.brush_transform.unwrap_or(Affine::IDENTITY);
     content_layer.fill_with_brush_transform_and_mode(
         &canvas_rect,
@@ -5357,6 +5415,7 @@ mod tests {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         }
     }
 
@@ -5688,7 +5747,9 @@ mod tests {
         apply_layer(&child, &mut parent);
 
         assert_ne!(pixel_rgba(&parent, 3, 3), (0, 0, 255, 255));
-        assert_eq!(pixel_rgba(&parent, 1, 1), (0, 0, 255, 255));
+        // (1, 1) straddles the diamond's antialiased boundary; (0, 0) is fully outside.
+        assert_ne!(pixel_rgba(&parent, 1, 1), (0, 0, 255, 255));
+        assert_eq!(pixel_rgba(&parent, 0, 0), (0, 0, 255, 255));
         assert_eq!(pixel_rgba(&parent, 6, 6), (0, 0, 255, 255));
     }
 
@@ -5886,28 +5947,6 @@ mod tests {
 
         assert!(rgba_distance(rendered, expected_longer) <= 10);
         assert!(rgba_distance(rendered, expected_shorter) >= 40);
-    }
-
-    #[test]
-    fn default_group_with_clip_does_not_isolate() {
-        let mut renderer = TinySkiaRenderer::new_with_size(16, 16).expect("renderer");
-        let mut render = renderer.begin(16, 16).expect("render");
-        let clip = ClipRef::fill(imaging::GeometryRef::Rect(Rect::new(2.0, 2.0, 14.0, 14.0)));
-
-        render.push_group(GroupRef::new().with_clip(clip));
-
-        assert_eq!(render.layers.len(), 1);
-        assert_eq!(
-            render.group_frames,
-            vec![GroupFrame::Direct { pushed_clip: true }]
-        );
-        assert_eq!(render.current_layer().clip_stack.len(), 1);
-
-        render.pop_group();
-
-        assert!(render.group_frames.is_empty());
-        assert_eq!(render.layers.len(), 1);
-        assert!(render.current_layer().clip_stack.is_empty());
     }
 
     #[test]
