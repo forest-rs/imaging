@@ -232,11 +232,106 @@ fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
     );
 }
 
+#[cfg(any(
+    feature = "tiny_skia",
+    feature = "vello_cpu",
+    feature = "skia",
+    feature = "vello_hybrid"
+))]
+fn check_filter_contract(renderer: &mut dyn ImageRenderer) {
+    let mask = Painter::<Scene>::record_mask(MaskMode::Alpha, |p| {
+        p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE);
+    });
+    let mut scene = Scene::new();
+    Painter::new(&mut scene).with_group(
+        GroupRef::new()
+            .with_mask(mask.as_ref())
+            .with_filters(&[imaging::Filter::offset(4.0, 0.0)]),
+        |p| p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE),
+    );
+    let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
+    assert!(
+        image.data.chunks_exact(4).all(|pixel| pixel[3] == 0),
+        "filters must run before masks: the offset moves all content outside the mask"
+    );
+
+    let mut scene = Scene::new();
+    Painter::new(&mut scene).with_group(
+        GroupRef::new()
+            .with_filters(&[
+                imaging::Filter::offset(2.0, 0.0),
+                imaging::Filter::offset(2.0, 0.0),
+            ])
+            .with_composite(Composite::new(Compose::SrcOver.into(), 0.5)),
+        |p| p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE),
+    );
+    let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
+    for y in 0..8 {
+        for x in 0..16 {
+            let expected = if (4..8).contains(&x) { 128 } else { 0 };
+            let alpha = image.data[(y * 16 + x) * 4 + 3];
+            assert!(
+                alpha.abs_diff(expected) <= 1,
+                "filter chain at ({x}, {y}): {alpha}, expected {expected}; group alpha applies once after both offsets"
+            );
+        }
+    }
+    // The isolated clip constrains the filtered result, not the filter's input.
+    let mut scene = Scene::new();
+    Painter::new(&mut scene).with_group(
+        GroupRef::new()
+            .with_clip(imaging::ClipRef::fill(Rect::new(4.0, 0.0, 8.0, 8.0)))
+            .with_filters(&[imaging::Filter::offset(4.0, 0.0)]),
+        |p| p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE),
+    );
+    let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
+    assert_eq!(
+        image.data[(4 * 16 + 6) * 4 + 3],
+        255,
+        "source outside the isolated clip can contribute to its filtered result"
+    );
+    assert_eq!(
+        image.data[(4 * 16 + 2) * 4 + 3],
+        0,
+        "the isolated clip constrains the result"
+    );
+
+    // Flood replaces the source even when there are no draws to provide content bounds.
+    let mut scene = Scene::new();
+    Painter::new(&mut scene).with_group(
+        GroupRef::new().with_filters(&[imaging::Filter::flood(Color::from_rgba8(255, 0, 0, 128))]),
+        |_| {},
+    );
+    let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
+    for pixel in image.data.chunks_exact(4) {
+        assert_eq!(
+            pixel,
+            [255, 0, 0, 128],
+            "flood must not depend on source draw bounds"
+        );
+    }
+
+    // These filters do not commute: the second flood must replace the first.
+    let mut scene = Scene::new();
+    Painter::new(&mut scene).with_group(
+        GroupRef::new().with_filters(&[
+            imaging::Filter::flood(Color::from_rgb8(255, 0, 0)),
+            imaging::Filter::flood(Color::from_rgba8(0, 0, 255, 128)),
+        ]),
+        |_| {},
+    );
+    let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
+    for pixel in image.data.chunks_exact(4) {
+        assert_eq!(pixel, [0, 0, 255, 128], "filters must run in slice order");
+    }
+}
+
 #[test]
 #[cfg(feature = "tiny_skia")]
 fn tiny_skia_alpha_masks() {
     let mut renderer = imaging_tiny_skia::TinySkiaRenderer::new();
     check_alpha_mask_contract(&mut renderer);
+    check_filter_contract(&mut renderer);
 }
 
 #[test]
@@ -244,6 +339,7 @@ fn tiny_skia_alpha_masks() {
 fn vello_cpu_alpha_masks() {
     let mut renderer = imaging_vello_cpu::VelloCpuRenderer::new(16, 8);
     check_alpha_mask_contract(&mut renderer);
+    check_filter_contract(&mut renderer);
 }
 
 #[test]
@@ -251,6 +347,7 @@ fn vello_cpu_alpha_masks() {
 fn skia_alpha_masks() {
     let mut renderer = imaging_skia::SkiaCpuRenderer::new();
     check_alpha_mask_contract(&mut renderer);
+    check_filter_contract(&mut renderer);
 }
 
 #[cfg(any(feature = "vello", feature = "vello_hybrid"))]
@@ -297,4 +394,5 @@ fn hybrid_alpha_masks() {
     };
     let mut renderer = imaging_vello_hybrid::VelloHybridRenderer::new(device, queue);
     check_alpha_mask_contract(&mut renderer);
+    check_filter_contract(&mut renderer);
 }

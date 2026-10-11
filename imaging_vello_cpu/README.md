@@ -26,6 +26,9 @@ Vello CPU backend for `imaging`.
 This crate provides a CPU renderer that consumes `imaging::record::Scene` (or accepts commands
 directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 
+Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
+X/Y standard deviations; anisotropic filters return [`Error::UnsupportedFilter`].
+
 # Render A Recorded Scene
 
 Record commands into [`imaging::record::Scene`], then render them with [`VelloCpuRenderer`].
