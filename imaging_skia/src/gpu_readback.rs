@@ -9,6 +9,9 @@ pub(crate) enum ReadbackError {
     DevicePoll,
     CallbackDropped,
     BufferMap,
+    InvalidTargetStride,
+    InvalidTargetBuffer,
+    PixelConversion,
 }
 
 #[derive(Debug)]
@@ -86,8 +89,22 @@ pub(crate) fn read_texture_into_target(
     data: &mut [u8],
     bytes_per_row_out: usize,
 ) -> Result<(), ReadbackError> {
-    let width_bytes = width * 4;
-    let width_bytes_usize = width_bytes as usize;
+    let color_type = crate::color_type_for_wgpu_texture_format(texture.format())
+        .map_err(|_| ReadbackError::PixelConversion)?;
+    let width_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(color_type.bytes_per_pixel()))
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(ReadbackError::InvalidTargetStride)?;
+    if bytes_per_row_out < width_bytes as usize {
+        return Err(ReadbackError::InvalidTargetStride);
+    }
+    if bytes_per_row_out
+        .checked_mul(height as usize)
+        .is_none_or(|len| data.len() < len)
+    {
+        return Err(ReadbackError::InvalidTargetBuffer);
+    }
     let bytes_per_row = width_bytes.div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("imaging_skia readback"),
@@ -137,15 +154,40 @@ pub(crate) fn read_texture_into_target(
     let mapped = slice
         .get_mapped_range()
         .map_err(|_| ReadbackError::BufferMap)?;
-    for (row, out_row) in mapped
-        .chunks_exact(bytes_per_row as usize)
-        .zip(data.chunks_exact_mut(bytes_per_row_out))
-    {
-        out_row[..width_bytes_usize].copy_from_slice(&row[..width_bytes_usize]);
-    }
+    let dimensions = (
+        i32::try_from(width).map_err(|_| ReadbackError::PixelConversion)?,
+        i32::try_from(height).map_err(|_| ReadbackError::PixelConversion)?,
+    );
+    let color_space = crate::color_space_for_wgpu_texture_format(texture.format());
+    let source_info = skia_safe::ImageInfo::new(
+        dimensions,
+        color_type,
+        skia_safe::AlphaType::Premul,
+        color_space.clone(),
+    );
+    let output_info = skia_safe::ImageInfo::new(
+        dimensions,
+        color_type,
+        skia_safe::AlphaType::Unpremul,
+        color_space,
+    );
+    let pixels = skia_safe::Data::new_copy(&mapped);
+    let source = skia_safe::images::raster_from_data(&source_info, pixels, bytes_per_row as usize)
+        .ok_or(ReadbackError::PixelConversion)?;
+    let converted = source.read_pixels(
+        &output_info,
+        data,
+        bytes_per_row_out,
+        (0, 0),
+        skia_safe::image::CachingHint::Disallow,
+    );
     drop(mapped);
     readback.unmap();
-    Ok(())
+    if converted {
+        Ok(())
+    } else {
+        Err(ReadbackError::PixelConversion)
+    }
 }
 
 pub(crate) fn create_texture(
