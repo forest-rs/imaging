@@ -132,6 +132,7 @@ use peniko::BlendMode;
 
 mod brush;
 pub mod diagnostics;
+mod filter;
 mod image;
 mod paint;
 mod painter;
@@ -140,6 +141,7 @@ pub mod render;
 pub mod validation;
 
 pub use brush::{Brush, BrushRef, ImageBrush, ImageBrushRef};
+pub use filter::Filter;
 pub use image::{ExternalImage, Image, ImageRef};
 pub use paint::{
     AppliedMaskRef, ClipRef, ContextKindRef, ContextRef, ContextValueRef, DrawRef, FillRef,
@@ -254,82 +256,6 @@ pub enum MaskMode {
     ///
     /// This follows SVG/CSS masking behavior where premultiplied RGB contributes to the mask value.
     Luminance,
-}
-
-/// Description of a filter effect applied to an isolated group.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Filter {
-    /// Fill the group output with a solid color (aka `feFlood`).
-    ///
-    /// This ignores the group's source content. It is still affected by the group's isolated clip.
-    Flood {
-        /// Flood color.
-        color: peniko::Color,
-    },
-    /// Gaussian blur with separate X/Y standard deviation values in user space.
-    ///
-    /// Backends should scale these values using the current transform when the filter is applied.
-    Blur {
-        /// Standard deviation along the X axis (in user space units).
-        std_deviation_x: f32,
-        /// Standard deviation along the Y axis (in user space units).
-        std_deviation_y: f32,
-    },
-    /// Drop shadow under the source content.
-    DropShadow {
-        /// Shadow offset along the X axis (in user space units).
-        dx: f32,
-        /// Shadow offset along the Y axis (in user space units).
-        dy: f32,
-        /// Blur standard deviation along the X axis (in user space units).
-        std_deviation_x: f32,
-        /// Blur standard deviation along the Y axis (in user space units).
-        std_deviation_y: f32,
-        /// Shadow color.
-        color: peniko::Color,
-    },
-    /// Translate the group output by a vector (aka `feOffset`).
-    ///
-    /// Offsets are specified in user space; backends should transform this vector using the current
-    /// linear transform when the filter is applied.
-    Offset {
-        /// Offset along the X axis (in user space units).
-        dx: f32,
-        /// Offset along the Y axis (in user space units).
-        dy: f32,
-    },
-}
-
-impl Filter {
-    /// Create a flood filter.
-    #[inline]
-    pub const fn flood(color: peniko::Color) -> Self {
-        Self::Flood { color }
-    }
-
-    /// Create a uniform Gaussian blur filter.
-    #[inline]
-    pub const fn blur(sigma: f32) -> Self {
-        Self::Blur {
-            std_deviation_x: sigma,
-            std_deviation_y: sigma,
-        }
-    }
-
-    /// Create a Gaussian blur filter with separate X/Y sigma values.
-    #[inline]
-    pub const fn blur_xy(std_deviation_x: f32, std_deviation_y: f32) -> Self {
-        Self::Blur {
-            std_deviation_x,
-            std_deviation_y,
-        }
-    }
-
-    /// Create an offset/translation filter.
-    #[inline]
-    pub const fn offset(dx: f32, dy: f32) -> Self {
-        Self::Offset { dx, dy }
-    }
 }
 
 /// A solid-color rounded rectangle blurred with a gaussian filter.

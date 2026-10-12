@@ -242,6 +242,11 @@ pub struct GroupRef<'a> {
     pub mask: Option<AppliedMaskRef<'a>>,
     /// Filter chain applied in slice order before the mask, isolated clip, and compositing.
     pub filters: &'a [Filter],
+    /// Maps filter user-space coordinates to the destination coordinate system.
+    ///
+    /// This transforms filter offsets and blur kernels, independently of content, clips, and masks.
+    /// Defaults to identity. Transformed replay prefixes this transform along with the content.
+    pub filter_transform: Affine,
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,
 }
@@ -254,6 +259,7 @@ impl<'a> GroupRef<'a> {
             clip: None,
             mask: None,
             filters: &[],
+            filter_transform: Affine::IDENTITY,
             composite: Composite::default(),
         }
     }
@@ -290,6 +296,13 @@ impl<'a> GroupRef<'a> {
         self
     }
 
+    /// Set the transform from filter user space to destination coordinates.
+    #[must_use]
+    pub fn with_filter_transform(mut self, transform: Affine) -> Self {
+        self.filter_transform = transform;
+        self
+    }
+
     /// Set the compositing parameters used when merging the group into its parent.
     #[must_use]
     pub fn with_composite(mut self, composite: Composite) -> Self {
@@ -305,6 +318,7 @@ impl<'a> GroupRef<'a> {
             clip: self.clip.map(ClipRef::to_owned),
             mask: self.mask.map(|mask| mask.into_owned_with(define_mask)),
             filters: self.filters.to_vec(),
+            filter_transform: self.filter_transform,
             composite: self.composite,
         }
     }
@@ -314,6 +328,7 @@ impl<'a> GroupRef<'a> {
         Self {
             clip: self.clip.map(|clip| clip.prepend_transform(prefix)),
             mask: self.mask.map(|mask| mask.prepend_transform(prefix)),
+            filter_transform: prefix * self.filter_transform,
             ..self
         }
     }
@@ -980,6 +995,7 @@ impl Group {
                 .as_ref()
                 .map(|mask| mask.as_ref(scene.mask(mask.mask))),
             filters: &self.filters,
+            filter_transform: self.filter_transform,
             composite: self.composite,
         }
     }
@@ -1253,6 +1269,7 @@ mod tests {
                 }),
                 mask: None,
                 filters: &[],
+                filter_transform: Affine::translate((5.0, 6.0)),
                 composite: Composite::default(),
             }
         );
@@ -1343,7 +1360,8 @@ mod tests {
                 stroke: Stroke::new(2.0),
             }),
             mask: None,
-            filters: vec![],
+            filters: vec![Filter::offset(2.0, 3.0)],
+            filter_transform: Affine::scale(2.0),
             composite: Composite::default(),
         });
         let fill_id = source.draw(Draw::Fill {
@@ -1414,7 +1432,8 @@ mod tests {
                     stroke: Stroke::new(2.0),
                 }),
                 mask: None,
-                filters: vec![],
+                filters: vec![Filter::offset(2.0, 3.0)],
+                filter_transform: transform * Affine::scale(2.0),
                 composite: Composite::default(),
             }
         );

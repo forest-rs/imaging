@@ -27,7 +27,8 @@ This crate provides a CPU renderer that consumes `imaging::record::Scene` (or ac
 directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 
 Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
-X/Y standard deviations; anisotropic filters return [`Error::UnsupportedFilter`].
+X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
+or sheared blur kernel return [`Error::UnsupportedFilter`].
 
 # Render A Recorded Scene
 

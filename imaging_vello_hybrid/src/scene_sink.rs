@@ -483,6 +483,10 @@ impl<'a> VelloHybridSceneSink<'a> {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "native filter parameters use f32"
+)]
 fn filter_to_vello(filter: imaging::Filter) -> Result<VelloFilter, Error> {
     let primitive = match filter {
         imaging::Filter::Flood { color } => FilterPrimitive::Flood { color },
@@ -490,11 +494,13 @@ fn filter_to_vello(filter: imaging::Filter) -> Result<VelloFilter, Error> {
             std_deviation_x,
             std_deviation_y,
         } => {
-            if std_deviation_x != std_deviation_y {
+            let (sigma_x, sigma_y) = (std_deviation_x as f32, std_deviation_y as f32);
+            // Native blur planning computes its variance in f32.
+            if sigma_x != sigma_y || !(sigma_x * sigma_x).is_finite() {
                 return Err(Error::UnsupportedFilter);
             }
             FilterPrimitive::GaussianBlur {
-                std_deviation: std_deviation_x,
+                std_deviation: sigma_x,
                 edge_mode: EdgeMode::None,
             }
         }
@@ -505,18 +511,30 @@ fn filter_to_vello(filter: imaging::Filter) -> Result<VelloFilter, Error> {
             std_deviation_y,
             color,
         } => {
-            if std_deviation_x != std_deviation_y {
+            let (sigma_x, sigma_y) = (std_deviation_x as f32, std_deviation_y as f32);
+            // Native blur planning computes its variance in f32.
+            if sigma_x != sigma_y || !(sigma_x * sigma_x).is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            let (dx, dy) = (dx as f32, dy as f32);
+            if !dx.is_finite() || !dy.is_finite() {
                 return Err(Error::UnsupportedFilter);
             }
             FilterPrimitive::DropShadow {
                 dx,
                 dy,
-                std_deviation: std_deviation_x,
+                std_deviation: sigma_x,
                 color,
                 edge_mode: EdgeMode::None,
             }
         }
-        imaging::Filter::Offset { dx, dy } => FilterPrimitive::Offset { dx, dy },
+        imaging::Filter::Offset { dx, dy } => {
+            let (dx, dy) = (dx as f32, dy as f32);
+            if !dx.is_finite() || !dy.is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::Offset { dx, dy }
+        }
     };
     Ok(VelloFilter::from_primitive(primitive))
 }
@@ -560,7 +578,12 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             .filters
             .iter()
             .copied()
-            .map(filter_to_vello)
+            .map(|filter| {
+                filter
+                    .in_device_space(group.filter_transform)
+                    .ok_or(Error::UnsupportedFilter)
+                    .and_then(filter_to_vello)
+            })
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(filters) => filters,
@@ -786,11 +809,22 @@ mod tests {
 
     #[test]
     fn hybrid_scene_sink_rejects_anisotropic_filters() {
-        let mut scene = VelloHybridScene::new(32, 32);
-        scene.reset();
-        let mut sink = VelloHybridSceneSink::new(&mut scene);
-        sink.push_group(GroupRef::new().with_filters(&[Filter::blur_xy(2.0, 1.0)]));
-        assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+        for (filter, transform) in [
+            (Filter::blur_xy(2.0, 1.0), Affine::IDENTITY),
+            (Filter::blur(1.0), Affine::scale_non_uniform(2.0, 1.0)),
+            (Filter::blur(1.0), Affine::skew(0.5, 0.0)),
+            (Filter::offset(f64::from(f32::MAX), 0.0), Affine::scale(2.0)),
+        ] {
+            let mut scene = VelloHybridScene::new(32, 32);
+            let mut sink = VelloHybridSceneSink::new(&mut scene);
+            sink.push_group(
+                GroupRef::new()
+                    .with_filters(&[filter])
+                    .with_filter_transform(transform),
+            );
+            sink.pop_group();
+            assert!(matches!(sink.finish(), Err(Error::UnsupportedFilter)));
+        }
     }
 
     #[test]

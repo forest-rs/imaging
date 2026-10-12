@@ -239,6 +239,44 @@ fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
     feature = "vello_hybrid"
 ))]
 fn check_filter_contract(renderer: &mut dyn ImageRenderer) {
+    check_filter_coordinates(renderer);
+    // Finite core geometry can exceed a backend's numeric or kernel limits.
+    for filter in [
+        imaging::Filter::blur(f64::from(f32::MAX) * 2.0),
+        imaging::Filter::offset(f64::from(f32::MAX) * 2.0, 0.0),
+    ] {
+        let mut unsupported = Scene::new();
+        Painter::new(&mut unsupported).with_group(GroupRef::new().with_filters(&[filter]), |p| {
+            p.fill_rect(SURFACE, Color::WHITE);
+        });
+        unsupported.validate().unwrap();
+        assert!(
+            matches!(
+                renderer.render_source(&mut &unsupported, 16, 8),
+                Err(imaging::ImageRendererError::Unsupported(
+                    imaging::render::RenderUnsupportedError::Filter
+                ))
+            ),
+            "backend limits must be reported separately from invalid source parameters"
+        );
+    }
+    let mut invalid = Scene::new();
+    Painter::new(&mut invalid).with_group(
+        GroupRef::new()
+            .with_filters(&[imaging::Filter::blur(f64::MAX)])
+            .with_filter_transform(Affine::scale(2.0)),
+        |p| p.fill_rect(SURFACE, Color::WHITE),
+    );
+    assert!(
+        matches!(
+            renderer.render_source(&mut &invalid, 16, 8),
+            Err(imaging::ImageRendererError::Content(
+                imaging::render::RenderContentError::InvalidScene(_)
+            ))
+        ),
+        "invalid transformed parameters must fail source validation"
+    );
+
     let mask = Painter::<Scene>::record_mask(MaskMode::Alpha, |p| {
         p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE);
     });
@@ -323,6 +361,145 @@ fn check_filter_contract(renderer: &mut dyn ImageRenderer) {
     let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
     for pixel in image.data.chunks_exact(4) {
         assert_eq!(pixel, [0, 0, 255, 128], "filters must run in slice order");
+    }
+}
+
+#[cfg(any(
+    feature = "tiny_skia",
+    feature = "vello_cpu",
+    feature = "skia",
+    feature = "vello_hybrid"
+))]
+fn check_filter_coordinates(renderer: &mut dyn ImageRenderer) {
+    // Prefixing a recorded scene must transform the effect along with its source and mask.
+    for masked in [false, true] {
+        let mask = Painter::<Scene>::record_mask(MaskMode::Alpha, |p| {
+            p.fill_rect(Rect::new(2.0, 0.0, 4.0, 4.0), Color::WHITE);
+        });
+        let mut source = Scene::new();
+        let filters = [imaging::Filter::offset(1.0, 0.0)];
+        let mut group = GroupRef::new()
+            .with_filters(&filters)
+            .with_filter_transform(Affine::translate((50.0, 50.0)) * Affine::scale(2.0));
+        if masked {
+            group = group.with_mask(mask.as_ref());
+        }
+        Painter::new(&mut source).with_group(group, |p| {
+            p.fill_rect(Rect::new(0.0, 0.0, 2.0, 4.0), Color::WHITE);
+        });
+        let mut scene = Scene::new();
+        imaging::record::replay_transformed(&source, &mut scene, Affine::scale(2.0));
+        let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
+        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+            let expected = if (4..8).contains(&(index % 16)) {
+                255
+            } else {
+                0
+            };
+            assert_eq!(
+                pixel[3], expected,
+                "transformed filter at pixel {index}, masked={masked}"
+            );
+        }
+    }
+
+    // A singular filter transform collapses the offset, without hiding the source.
+    let mut scene = Scene::new();
+    Painter::new(&mut scene).with_group(
+        GroupRef::new()
+            .with_filters(&[imaging::Filter::offset(4.0, 0.0)])
+            .with_filter_transform(Affine::scale(0.0)),
+        |p| p.fill_rect(Rect::new(0.0, 0.0, 2.0, 8.0), Color::WHITE),
+    );
+    let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
+    assert_eq!(
+        image.data[(4 * 16 + 1) * 4 + 3],
+        255,
+        "collapsed filter coordinates preserve the source"
+    );
+    assert_eq!(
+        image.data[(4 * 16 + 5) * 4 + 3],
+        0,
+        "a collapsed offset must not move the source"
+    );
+
+    // Scaling an effect's coordinates must agree with specifying its device-space parameters.
+    for shadow in [false, true] {
+        let effect = |sigma, dx| {
+            if shadow {
+                imaging::Filter::DropShadow {
+                    dx,
+                    dy: 0.0,
+                    std_deviation_x: sigma,
+                    std_deviation_y: sigma,
+                    color: Color::from_rgba8(255, 0, 0, 128),
+                }
+            } else {
+                imaging::Filter::blur(sigma)
+            }
+        };
+        let mut images = Vec::new();
+        for (sigma, dx, transform, replay) in [
+            (1.0, 1.0, Affine::scale(2.0), false),
+            (2.0, 2.0, Affine::IDENTITY, false),
+            (1.0, 1.0, Affine::IDENTITY, true),
+        ] {
+            let mut scene = Scene::new();
+            let rect = if replay {
+                Rect::new(3.0, 1.0, 5.0, 3.0)
+            } else {
+                Rect::new(6.0, 2.0, 10.0, 6.0)
+            };
+            Painter::new(&mut scene).with_group(
+                GroupRef::new()
+                    .with_filters(&[effect(sigma, dx)])
+                    .with_filter_transform(transform),
+                |p| p.fill_rect(rect, Color::WHITE),
+            );
+            if replay {
+                let mut transformed = Scene::new();
+                imaging::record::replay_transformed(&scene, &mut transformed, Affine::scale(2.0));
+                scene = transformed;
+            }
+            images.push(renderer.render_source(&mut &scene, 16, 8).unwrap());
+        }
+        for image in &images[1..] {
+            for (a, b) in images[0].data.iter().zip(&image.data) {
+                assert!(
+                    a.abs_diff(*b) <= 1,
+                    "scaled filter differs: {a} vs {b}, shadow={shadow}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "skia")]
+fn skia_rotated_anisotropic_blur() {
+    let mut renderer = imaging_skia::SkiaCpuRenderer::new();
+    for masked in [false, true] {
+        let mask = Painter::<Scene>::record_mask(MaskMode::Alpha, |p| {
+            p.fill_rect(Rect::new(0.0, 0.0, 32.0, 32.0), Color::WHITE);
+        });
+        let filters = [imaging::Filter::blur_xy(4.0, 0.5)];
+        let mut group = GroupRef::new()
+            .with_filters(&filters)
+            .with_filter_transform(Affine::rotate(core::f64::consts::FRAC_PI_4));
+        if masked {
+            group = group.with_mask(mask.as_ref());
+        }
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(group, |p| {
+            p.fill_rect(Rect::new(15.0, 15.0, 17.0, 17.0), Color::WHITE);
+        });
+        let image = renderer.render_source(&mut &scene, 32, 32).unwrap();
+        let along = image.data[(19 * 32 + 19) * 4 + 3];
+        let across = image.data[(12 * 32 + 19) * 4 + 3];
+        assert!(
+            along > across + 5,
+            "anisotropic blur must rotate its kernel: {along} vs {across}, masked={masked}"
+        );
     }
 }
 

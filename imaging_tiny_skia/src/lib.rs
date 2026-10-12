@@ -11,6 +11,9 @@
 //!
 //! The implementation was integrated from Floem's tiny-skia renderer and adapted to match the
 //! public renderer shape used by the other `imaging_*` backends.
+//!
+//! Group filters are evaluated in destination coordinates. Transforms that require a rotated
+//! anisotropic or sheared blur kernel return [`Error::UnsupportedFilter`].
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
@@ -64,6 +67,8 @@ pub enum Error {
     InvalidTargetBuffer,
     /// This renderer cannot sample externally bound images.
     UnsupportedExternalImage,
+    /// The transformed filter kernel cannot be represented by this renderer.
+    UnsupportedFilter,
     /// An internal invariant was violated.
     Internal(&'static str),
 }
@@ -2739,10 +2744,52 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             return;
         }
 
+        let supports_blur = |sx, sy| {
+            // The box blur's window widths must fit in i32.
+            let max_sigma = f64::from(i32::MAX - 2) / 2.0;
+            [sx, sy].into_iter().all(|sigma| {
+                (0.0..=max_sigma).contains(&sigma)
+                    && (sigma == 0.0 || gaussian_box_radii(f64_to_f32(sigma)).is_some())
+            })
+        };
+        let supports_offset = |dx: f64, dy: f64| {
+            [dx.round(), dy.round()]
+                .into_iter()
+                .all(|value| (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&value))
+        };
+        let filters = group
+            .filters
+            .iter()
+            .copied()
+            .map(|filter| {
+                let filter = filter.in_device_space(group.filter_transform)?;
+                let supported = match filter {
+                    Filter::Blur {
+                        std_deviation_x,
+                        std_deviation_y,
+                    } => supports_blur(std_deviation_x, std_deviation_y),
+                    Filter::DropShadow {
+                        dx,
+                        dy,
+                        std_deviation_x,
+                        std_deviation_y,
+                        ..
+                    } => supports_blur(std_deviation_x, std_deviation_y) && supports_offset(dx, dy),
+                    Filter::Offset { dx, dy } => supports_offset(dx, dy),
+                    Filter::Flood { .. } => true,
+                };
+                supported.then_some(filter)
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(filters) = filters else {
+            self.error = Some(Error::UnsupportedFilter);
+            self.group_frames.push(GroupFrame::Empty);
+            return;
+        };
         if let Some(clip) = self.group_clip_path(group.clip)
             && let Some(child) = self.build_group_child_layer(
                 group.composite,
-                group.filters,
+                &filters,
                 self.pending_group_mask(group.mask),
                 clip,
             )
@@ -2984,8 +3031,8 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         let shape = draw.rect.to_rounded_rect(draw.radius);
         child.fill(&shape, draw.color);
         child.filters.push(Filter::Blur {
-            std_deviation_x: f64_to_f32(draw.std_dev),
-            std_deviation_y: f64_to_f32(draw.std_dev),
+            std_deviation_x: draw.std_dev,
+            std_deviation_y: draw.std_dev,
         });
         apply_group_filters(&mut child);
 
@@ -3110,6 +3157,9 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         }
         Error::UnsupportedExternalImage => {
             ImageRendererError::Unsupported(imaging::render::RenderUnsupportedError::ExternalImage)
+        }
+        Error::UnsupportedFilter => {
+            ImageRendererError::Unsupported(imaging::render::RenderUnsupportedError::Filter)
         }
         other => ImageRendererError::backend(other),
     }
@@ -4139,11 +4189,8 @@ fn render_cached_blurred_rounded_rect(
         return false;
     };
     let translated_rect = translate_rect(draw.rect, dx, dy);
-    let Some(bounds) = rect_to_int_rect(blur_bounds(
-        translated_rect,
-        f64_to_f32(draw.std_dev),
-        f64_to_f32(draw.std_dev),
-    )) else {
+    let Some(bounds) = rect_to_int_rect(blur_bounds(translated_rect, draw.std_dev, draw.std_dev))
+    else {
         return false;
     };
     let local_rect = translate_rect(
@@ -4906,13 +4953,16 @@ fn gaussian_box_radii(sigma: f32) -> Option<[i32; 3]> {
     let n = 3.0_f64;
     let sigma = f64::from(sigma);
     let ideal_width = ((12.0 * sigma * sigma / n) + 1.0).sqrt();
+    if ideal_width > f64::from(i32::MAX - 2) {
+        return None;
+    }
     let mut lower_width = floor_to_i32(ideal_width);
     if lower_width % 2 == 0 {
         lower_width -= 1;
     }
     let upper_width = lower_width + 2;
     let m_ideal = (12.0 * sigma * sigma
-        - n * f64::from(lower_width * lower_width)
+        - n * f64::from(lower_width).powi(2)
         - 4.0 * n * f64::from(lower_width)
         - 3.0 * n)
         / (-4.0 * f64::from(lower_width) - 4.0);
@@ -5128,9 +5178,9 @@ fn translate_rect(rect: Rect, dx: f64, dy: f64) -> Rect {
     Rect::new(rect.x0 + dx, rect.y0 + dy, rect.x1 + dx, rect.y1 + dy)
 }
 
-fn blur_bounds(rect: Rect, sigma_x: f32, sigma_y: f32) -> Rect {
-    let pad_x = (f64::from(sigma_x) * 3.0).ceil();
-    let pad_y = (f64::from(sigma_y) * 3.0).ceil();
+fn blur_bounds(rect: Rect, sigma_x: f64, sigma_y: f64) -> Rect {
+    let pad_x = (sigma_x * 3.0).ceil();
+    let pad_y = (sigma_y * 3.0).ceil();
     Rect::new(
         rect.x0 - pad_x,
         rect.y0 - pad_y,
@@ -5156,7 +5206,10 @@ fn blur_pixmap_local(
     let Some(bounds) = bounds else {
         return blur_pixmap(pixmap, sigma_x, sigma_y);
     };
-    let region = pixmap_region_bounds(pixmap, blur_bounds(bounds, sigma_x, sigma_y))?;
+    let region = pixmap_region_bounds(
+        pixmap,
+        blur_bounds(bounds, f64::from(sigma_x), f64::from(sigma_y)),
+    )?;
     let mut local = LocalPixmapRegion::extract(pixmap.as_ref(), region)?;
     local.pixmap = blur_pixmap(&local.pixmap, sigma_x, sigma_y)?;
     local.place_into_full_size(pixmap.width(), pixmap.height())
@@ -5175,7 +5228,7 @@ fn drop_shadow_pixmap_local(
         return drop_shadow_pixmap(pixmap, dx, dy, sigma_x, sigma_y, color);
     };
 
-    let padded = blur_bounds(bounds, sigma_x, sigma_y);
+    let padded = blur_bounds(bounds, f64::from(sigma_x), f64::from(sigma_y));
     let shadow_bounds = translate_rect(padded, f64::from(dx), f64::from(dy));
     let region = pixmap_region_bounds(pixmap, bounds.union(shadow_bounds))?;
     let mut local = LocalPixmapRegion::extract(pixmap.as_ref(), region)?;
@@ -5194,8 +5247,8 @@ fn filter_output_bounds(bounds: Option<Rect>, filter: &Filter, pixmap: &Pixmap) 
             std_deviation_y,
         } => bounds.map(|rect| blur_bounds(rect, std_deviation_x, std_deviation_y)),
         Filter::Offset { dx, dy } => {
-            let dx = f64::from(round_to_i32(f64::from(dx)));
-            let dy = f64::from(round_to_i32(f64::from(dy)));
+            let dx = f64::from(round_to_i32(dx));
+            let dy = f64::from(round_to_i32(dy));
             bounds.map(|rect| translate_rect(rect, dx, dy))
         }
         Filter::DropShadow {
@@ -5205,8 +5258,8 @@ fn filter_output_bounds(bounds: Option<Rect>, filter: &Filter, pixmap: &Pixmap) 
             std_deviation_y,
             ..
         } => {
-            let dx = f64::from(round_to_i32(f64::from(dx)));
-            let dy = f64::from(round_to_i32(f64::from(dy)));
+            let dx = f64::from(round_to_i32(dx));
+            let dy = f64::from(round_to_i32(dy));
             bounds.map(|rect| {
                 let shadow =
                     translate_rect(blur_bounds(rect, std_deviation_x, std_deviation_y), dx, dy);
@@ -5226,7 +5279,12 @@ fn filter_pixmap(pixmap: &Pixmap, bounds: Option<Rect>, filter: &Filter) -> Opti
         Filter::Blur {
             std_deviation_x,
             std_deviation_y,
-        } => blur_pixmap_local(pixmap, bounds, std_deviation_x, std_deviation_y),
+        } => blur_pixmap_local(
+            pixmap,
+            bounds,
+            f64_to_f32(std_deviation_x),
+            f64_to_f32(std_deviation_y),
+        ),
         Filter::DropShadow {
             dx,
             dy,
@@ -5236,17 +5294,13 @@ fn filter_pixmap(pixmap: &Pixmap, bounds: Option<Rect>, filter: &Filter) -> Opti
         } => drop_shadow_pixmap_local(
             pixmap,
             bounds,
-            round_to_i32(f64::from(dx)),
-            round_to_i32(f64::from(dy)),
-            std_deviation_x,
-            std_deviation_y,
+            round_to_i32(dx),
+            round_to_i32(dy),
+            f64_to_f32(std_deviation_x),
+            f64_to_f32(std_deviation_y),
             color,
         ),
-        Filter::Offset { dx, dy } => offset_pixmap(
-            pixmap,
-            round_to_i32(f64::from(dx)),
-            round_to_i32(f64::from(dy)),
-        ),
+        Filter::Offset { dx, dy } => offset_pixmap(pixmap, round_to_i32(dx), round_to_i32(dy)),
     }
 }
 
@@ -5394,6 +5448,30 @@ mod tests {
     use imaging::{GroupRef, MaskMode, Painter, record::Scene};
     use peniko::color::{ColorSpaceTag, HueDirection, palette::css};
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+
+    #[test]
+    fn unrepresentable_filter_transform_returns_unsupported_and_recovers() {
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(
+            GroupRef::new()
+                .with_filters(&[Filter::blur(1.0)])
+                .with_filter_transform(Affine::skew(0.5, 0.0)),
+            |p| p.fill_rect(Rect::new(0.0, 0.0, 8.0, 8.0), Color::WHITE),
+        );
+        let mut renderer = TinySkiaRenderer::new();
+        assert!(matches!(
+            renderer.render_scene(&scene, 8, 8),
+            Err(Error::UnsupportedFilter)
+        ));
+        assert!(renderer.render_scene(&Scene::new(), 8, 8).is_ok());
+    }
+
+    #[test]
+    fn large_box_blur_kernel_does_not_overflow_integer_arithmetic() {
+        let pixmap = Pixmap::new(8, 8).unwrap();
+        assert!(blur_pixmap(&pixmap, 100_000.0, 100_000.0).is_some());
+        assert!(gaussian_box_radii(f32::MAX).is_none());
+    }
 
     /// Creates a `Layer` directly without a window, for offscreen rendering.
     fn make_layer(width: u32, height: u32) -> Layer<'static> {
