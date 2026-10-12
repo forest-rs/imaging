@@ -10,6 +10,10 @@
 //! X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
 //! or sheared blur kernel return [`Error::UnsupportedFilter`].
 //!
+//! Synthetic emboldening uses glifo's native outline expansion. In glifo 0.4,
+//! unhinted fills expand in font units rather than font-size pixels, and absorbed
+//! transform scales do not scale the expansion amount.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with [`VelloCpuRenderer`].
@@ -371,6 +375,8 @@ impl VelloCpuRenderer {
             })
             .collect::<Vec<_>>();
 
+        // TODO: glifo must scale embolden amounts with cached outline size and
+        // absorbed transforms upstream. Keep native behavior until that is fixed.
         let result = match glyph_run.style {
             Style::Fill(fill_rule) => {
                 self.ctx.set_fill_rule(*fill_rule);
@@ -378,6 +384,10 @@ impl VelloCpuRenderer {
                     .ctx
                     .glyph_run(&mut self.resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
+                    .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(
+                        glyph_run.font_embolden.x,
+                        glyph_run.font_embolden.y,
+                    )))
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
@@ -393,6 +403,10 @@ impl VelloCpuRenderer {
                     .ctx
                     .glyph_run(&mut self.resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
+                    .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(
+                        glyph_run.font_embolden.x,
+                        glyph_run.font_embolden.y,
+                    )))
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {

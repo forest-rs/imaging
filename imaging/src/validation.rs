@@ -486,6 +486,9 @@ where
             .iter()
             .all(|glyph| glyph.x.is_finite() && glyph.y.is_finite());
         let font_size_ok = glyph_run.font_size.is_finite() && glyph_run.font_size >= 0.0;
+        let embolden_ok = glyph_run.font_embolden.is_finite()
+            && glyph_run.font_embolden.x >= 0.0
+            && glyph_run.font_embolden.y >= 0.0;
         let ok = self.validate_affine("GlyphRun::transform", &glyph_run.transform)
             && glyph_run.glyph_transform.as_ref().is_none_or(|transform| {
                 self.validate_affine("GlyphRun::glyph_transform", transform)
@@ -494,6 +497,7 @@ where
                 self.validate_affine("GlyphRun::brush_transform", transform)
             })
             && font_size_ok
+            && embolden_ok
             && glyphs_ok
             && self.validate_brush(glyph_run.brush)
             && match glyph_run.style {
@@ -506,6 +510,10 @@ where
         } else if !font_size_ok {
             !self.violate(ValidationError::InvalidGlyphRun {
                 what: "GlyphRun::font_size",
+            })
+        } else if !embolden_ok {
+            !self.violate(ValidationError::InvalidGlyphRun {
+                what: "GlyphRun::font_embolden",
             })
         } else if !glyphs_ok {
             !self.violate(ValidationError::InvalidGlyphRun {
@@ -889,6 +897,29 @@ mod tests {
                 what: "GlyphRun::font_size",
             })
         );
+    }
+
+    #[test]
+    fn glyph_runs_validate_embolden() {
+        let font = FontData::new(Blob::new(Arc::new([0_u8; 4])), 0);
+        let style = peniko::Style::Fill(Fill::NonZero);
+        for amount in [
+            Vec2::new(-1.0, 0.0),
+            Vec2::new(0.0, -1.0),
+            Vec2::new(f64::NAN, 0.0),
+            Vec2::new(0.0, f64::INFINITY),
+        ] {
+            let mut sink = ValidatingSink::new(Scene::new());
+            let mut run = GlyphRunRef::new(&font, &style, Color::BLACK);
+            run.font_embolden = amount;
+            sink.glyph_run(run, &mut core::iter::empty());
+            assert_eq!(
+                sink.first_error(),
+                Some(&ValidationError::InvalidGlyphRun {
+                    what: "GlyphRun::font_embolden",
+                })
+            );
+        }
     }
 
     #[test]

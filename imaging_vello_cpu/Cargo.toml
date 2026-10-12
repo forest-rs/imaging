@@ -11,6 +11,8 @@ keywords = ["graphics", "imaging", "rendering", "vello"]
 categories = ["graphics", "rendering"]
 
 [dependencies]
+# TODO: Vello CPU should re-export FontEmbolden upstream, removing this direct dependency.
+glifo = { default-features = false, version = "0.4.0" }
 imaging.workspace = true
 kurbo.workspace = true
 peniko.workspace = true

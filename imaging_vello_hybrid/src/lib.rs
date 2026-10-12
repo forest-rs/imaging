@@ -27,6 +27,10 @@
 //! or sheared blur kernel return [`Error::UnsupportedFilter`].
 //! Blurred rounded rectangles use the renderer's native analytic draw.
 //!
+//! Synthetic emboldening uses glifo's native outline expansion. In glifo 0.4,
+//! unhinted fills expand in font units rather than font-size pixels, and absorbed
+//! transform scales do not scale the expansion amount.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with

@@ -388,12 +388,18 @@ impl<'a> VelloHybridSceneSink<'a> {
             Style::Fill(fill) => self.scene.set_fill_rule(*fill),
             Style::Stroke(stroke) => self.scene.set_stroke(stroke.clone()),
         }
+        // TODO: glifo must scale embolden amounts with cached outline size and
+        // absorbed transforms upstream. Keep native behavior until that is fixed.
         let result = match &mut self.resources {
             SceneSinkResources::Borrowed(resources) => {
                 let builder = self
                     .scene
                     .glyph_run(resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
+                    .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(
+                        glyph_run.font_embolden.x,
+                        glyph_run.font_embolden.y,
+                    )))
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
@@ -417,6 +423,10 @@ impl<'a> VelloHybridSceneSink<'a> {
                     },
                 )
                 .font_size(glyph_run.font_size)
+                .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(
+                    glyph_run.font_embolden.x,
+                    glyph_run.font_embolden.y,
+                )))
                 .hint(glyph_run.hint)
                 .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {

@@ -1174,6 +1174,7 @@ dependencies = [
 name = "imaging_vello_cpu"
 version = "0.0.2"
 dependencies = [
+ "glifo",
  "imaging",
  "kurbo",
  "peniko",
