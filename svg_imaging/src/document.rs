@@ -309,12 +309,13 @@ mod tests {
         let group = scene.group(group_id);
         let mask = group.mask.as_ref().expect("group should carry mask");
         assert_eq!(scene.mask(mask.mask).mode, MaskMode::Alpha);
+        let mask_scene = &scene.mask(mask.mask).scene;
         assert!(
-            scene.commands().iter().any(|command| match command {
-                record::Command::PushGroup(group) => scene.group(*group).clip.is_some(),
+            mask_scene.commands().iter().any(|command| match command {
+                record::Command::PushGroup(group) => mask_scene.group(*group).clip.is_some(),
                 _ => false,
             }),
-            "mask region should also create an isolated clip layer"
+            "the reusable mask definition should clip its content to the mask region"
         );
     }
 

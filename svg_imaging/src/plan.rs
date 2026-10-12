@@ -41,7 +41,7 @@ pub(crate) struct PlanGroup {
     /// Isolated clip chain applied to the group result.
     ///
     /// Multiple entries represent intersected isolated clips, including nested `clip-path`
-    /// references and mask regions.
+    /// references.
     pub(crate) clips: Vec<PlanClip>,
     /// Optional retained mask applied to the group result before compositing.
     pub(crate) mask: Option<PlanAppliedMask>,
@@ -53,11 +53,16 @@ pub(crate) struct PlanGroup {
 
 /// Lowered group clip.
 #[derive(Clone, Debug)]
-pub(crate) struct PlanClip {
-    /// Clip path geometry in final user-space coordinates.
-    pub(crate) path: BezPath,
-    /// Fill rule used for the clip.
-    pub(crate) fill_rule: Fill,
+pub(crate) enum PlanClip {
+    /// Clip path geometry in the containing scene's coordinates.
+    Path {
+        /// Clip geometry.
+        path: BezPath,
+        /// Fill rule used for the clip.
+        fill_rule: Fill,
+    },
+    /// Union of independently filled or clipped shapes, retained as alpha coverage.
+    Mask(PlanAppliedMask),
 }
 
 /// Identifier for a lowered mask definition.
@@ -79,6 +84,8 @@ pub(crate) struct PlanMask {
 pub(crate) struct PlanAppliedMask {
     /// Referenced mask definition.
     pub(crate) mask: PlanMaskId,
+    /// Maps the reusable mask definition into destination coordinates.
+    pub(crate) transform: Affine,
 }
 
 /// Lowered fill draw.
