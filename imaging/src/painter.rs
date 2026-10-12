@@ -970,7 +970,10 @@ where
         self
     }
 
-    /// Set the synthetic embolden amount applied to glyph outlines.
+    /// Set outward outline expansion in font-size pixels along each glyph-local axis.
+    ///
+    /// Components must be finite and nonnegative. Expansion precedes glyph and run
+    /// transforms. Bitmap and color glyphs are unaffected.
     pub fn font_embolden(mut self, font_embolden: Vec2) -> Self {
         self.font_embolden = font_embolden;
         self

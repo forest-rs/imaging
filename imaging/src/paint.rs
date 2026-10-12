@@ -596,7 +596,10 @@ pub struct GlyphRunRef<'a> {
     pub brush_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
-    /// Synthetic embolden amount applied to glyph outlines in X/Y device units.
+    /// Outward expansion of glyph outlines along each glyph-local axis, in font-size pixels.
+    ///
+    /// Components must be finite and nonnegative. Expansion precedes the glyph and run
+    /// transforms; zero leaves that axis unchanged. Bitmap and color glyphs are unaffected.
     pub font_embolden: Vec2,
     /// Whether glyph hinting is enabled.
     pub hint: bool,

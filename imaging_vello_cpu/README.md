@@ -30,6 +30,10 @@ Filter chains use nested single-primitive layers. Blurs and drop shadows require
 X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
 or sheared blur kernel return [`Error::UnsupportedFilter`].
 
+Synthetic emboldening uses glifo's native outline expansion. In glifo 0.4,
+unhinted fills expand in font units rather than font-size pixels, and absorbed
+transform scales do not scale the expansion amount.
+
 # Render A Recorded Scene
 
 Record commands into [`imaging::record::Scene`], then render them with [`VelloCpuRenderer`].

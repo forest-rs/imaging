@@ -161,7 +161,8 @@ struct GlyphCacheKey {
     x_bin: u8,
     y_bin: u8,
     hint: bool,
-    embolden_strength_bits: u32,
+    embolden_x_bits: u64,
+    embolden_y_bits: u64,
     skew_bits: u32,
 }
 
@@ -173,7 +174,7 @@ struct GlyphKeyInput {
     x: f32,
     y: f32,
     hint: bool,
-    embolden_strength: f32,
+    embolden: Vec2,
     skew: Option<f32>,
 }
 
@@ -214,7 +215,8 @@ impl GlyphCacheKey {
                 x_bin,
                 y_bin,
                 hint: input.hint,
-                embolden_strength_bits: input.embolden_strength.to_bits(),
+                embolden_x_bits: input.embolden.x.to_bits(),
+                embolden_y_bits: input.embolden.y.to_bits(),
                 skew_bits,
             },
             x_floor,
@@ -259,7 +261,7 @@ struct GlyphRasterRequest<'a> {
     font_size: f32,
     hint: bool,
     normalized_coords: &'a [i16],
-    embolden_strength: f32,
+    embolden: Vec2,
     skew: Option<f32>,
     offset_x: f32,
     offset_y: f32,
@@ -279,6 +281,68 @@ fn cache_glyph(caches: &mut RendererCaches, request: GlyphRasterRequest<'_>) -> 
     cache_glyph_miss(caches, request, c.to_u32(), now)
 }
 
+// Swash's faux bold shifts contours and uses a different strength convention.
+// Expand with Kurbo instead, matching the Vello adapters before rasterization.
+fn raster_emboldened_outline(
+    outline: &swash::scale::outline::Outline,
+    request: &GlyphRasterRequest<'_>,
+) -> swash::scale::image::Image {
+    use swash::zeno::{Command, Origin, PathData as _};
+    let point = |p: swash::zeno::Point| Point::new(f64::from(p.x), f64::from(p.y));
+    let path: BezPath = outline
+        .path()
+        .commands()
+        .map(|command| match command {
+            Command::MoveTo(p) => PathEl::MoveTo(point(p)),
+            Command::LineTo(p) => PathEl::LineTo(point(p)),
+            Command::QuadTo(a, b) => PathEl::QuadTo(point(a), point(b)),
+            Command::CurveTo(a, b, c) => PathEl::CurveTo(point(a), point(b), point(c)),
+            Command::Close => PathEl::ClosePath,
+        })
+        .collect();
+    let expanded = kurbo::expand_path(
+        &path,
+        kurbo::Diagonal2::new(request.embolden.x, request.embolden.y),
+        Join::Miter,
+        4.0,
+        0.1,
+    );
+    let point = |p: Point| swash::zeno::Point::new(f64_to_f32(p.x), f64_to_f32(p.y));
+    let commands: Vec<_> = expanded
+        .elements()
+        .iter()
+        .map(|element| match *element {
+            PathEl::MoveTo(p) => Command::MoveTo(point(p)),
+            PathEl::LineTo(p) => Command::LineTo(point(p)),
+            PathEl::QuadTo(a, b) => Command::QuadTo(point(a), point(b)),
+            PathEl::CurveTo(a, b, c) => Command::CurveTo(point(a), point(b), point(c)),
+            PathEl::ClosePath => Command::Close,
+        })
+        .collect();
+    let transform = request.skew.map(|angle| {
+        swash::zeno::Transform::skew(
+            swash::zeno::Angle::from_degrees(angle),
+            swash::zeno::Angle::ZERO,
+        )
+    });
+    let offset = swash::zeno::Vector::new(request.offset_x.fract(), request.offset_y.fract());
+    let mut data = Vec::new();
+    let placement = swash::zeno::Mask::new(&commands)
+        .format(Format::Alpha)
+        .origin(Origin::BottomLeft)
+        .transform(transform)
+        .offset(offset)
+        .render_offset(offset)
+        .inspect(|format, width, height| data.resize(format.buffer_size(width, height), 0))
+        .render_into(&mut data, None);
+    swash::scale::image::Image {
+        source: Source::Outline,
+        content: Content::Mask,
+        placement,
+        data,
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn cache_glyph_miss(
@@ -296,25 +360,38 @@ fn cache_glyph_miss(
         .normalized_coords(request.normalized_coords)
         .build();
 
-    let mut render = Render::new(&[
-        Source::ColorOutline(0),
-        Source::ColorBitmap(StrikeWith::BestFit),
-        Source::Outline,
-    ]);
+    let sources: &[Source] = if request.embolden == Vec2::ZERO {
+        &[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::Outline,
+        ]
+    } else {
+        // Synthetic weight affects monochrome outlines only.
+        &[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+        ]
+    };
+    let mut render = Render::new(sources);
     render
         .format(Format::Alpha)
         .offset(swash::zeno::Vector::new(
             request.offset_x.fract(),
             request.offset_y.fract(),
-        ))
-        .embolden(request.embolden_strength);
+        ));
     if let Some(angle) = request.skew {
         render.transform(Some(swash::zeno::Transform::skew(
             swash::zeno::Angle::from_degrees(angle),
             swash::zeno::Angle::ZERO,
         )));
     }
-    let image = render.render(&mut scaler, request.cache_key.glyph_id)?;
+    let image = render
+        .render(&mut scaler, request.cache_key.glyph_id)
+        .or_else(|| {
+            let outline = scaler.scale_outline(request.cache_key.glyph_id)?;
+            Some(raster_emboldened_outline(&outline, &request))
+        })?;
 
     let result = if image.placement.width == 0 || image.placement.height == 0 {
         // We can't create an empty `Pixmap`
@@ -3653,11 +3730,10 @@ fn draw_solid_color_glyphs_into_layer<'a>(
     };
     let font_blob_id = font.data.id();
     let skew = glyph_transform.map(|transform| transform.skew_x_degrees);
-    // swash exposes isotropic emboldening, so preserve the strongest requested axis.
-    let embolden_strength = f64_to_f32(run.font_embolden.x.max(run.font_embolden.y).max(0.0));
     let glyph_font_size_scale = glyph_transform.map_or(1.0, |transform| transform.font_size_scale);
-    let scaled_font_size =
-        run.font_size * f64_to_f32(effective_raster_scale * glyph_font_size_scale);
+    let outline_scale = effective_raster_scale * glyph_font_size_scale;
+    let scaled_font_size = run.font_size * f64_to_f32(outline_scale);
+    let embolden = run.font_embolden * outline_scale;
 
     for glyph in glyphs {
         let glyph_x = f64_to_f32(raster_origin.x + glyph.x as f64 * effective_raster_scale);
@@ -3674,7 +3750,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
             x: glyph_x,
             y: glyph_y,
             hint: run.hint,
-            embolden_strength,
+            embolden,
             skew,
         });
 
@@ -3688,7 +3764,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
                 font_size: scaled_font_size,
                 hint: run.hint,
                 normalized_coords: run.normalized_coords,
-                embolden_strength,
+                embolden,
                 skew,
                 offset_x: new_x + f32::from(cache_key.x_bin) / 8.0,
                 offset_y: new_y + f32::from(cache_key.y_bin) / 8.0,
@@ -6095,7 +6171,7 @@ mod tests {
             x: 12.2,
             y: 19.8,
             hint: true,
-            embolden_strength: 0.0,
+            embolden: Vec2::ZERO,
             skew: None,
         });
         assert_eq!(cache_key.x_bin, 2);

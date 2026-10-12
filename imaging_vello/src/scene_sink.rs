@@ -218,11 +218,23 @@ impl<'a> VelloSceneSink<'a> {
             return;
         };
 
+        // Vello absorbs the run's uniform scale when hinting, but leaves the
+        // embolden amount unchanged. Express expansion at that absorbed size.
+        let [a, b, c, d, _, _] = glyph_run.transform.as_coeffs();
+        let embolden_scale = if glyph_run.hint && a == d && b == 0.0 && c == 0.0 {
+            a
+        } else {
+            1.0
+        };
+        let embolden = glyph_run.font_embolden * embolden_scale;
         let builder = self
             .scene
             .draw_glyphs(glyph_run.font)
             .transform(glyph_run.transform)
             .font_size(glyph_run.font_size)
+            .font_embolden(vello::FontEmbolden::new(kurbo::Diagonal2::new(
+                embolden.x, embolden.y,
+            )))
             .hint(glyph_run.hint)
             .normalized_coords(glyph_run.normalized_coords)
             .brush(&paint);

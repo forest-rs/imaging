@@ -139,8 +139,8 @@ impl SnapshotCase for GmGlyphRunsEmbolden {
         "gm_glyph_runs_embolden"
     }
 
-    fn supports_backend(&self, backend: &str) -> bool {
-        backend == "tiny_skia"
+    fn vello_max_diff_pixels(&self) -> u64 {
+        4
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {

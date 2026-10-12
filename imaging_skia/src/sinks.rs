@@ -205,7 +205,18 @@ fn draw_glyph_run(
     glyph_run: GlyphRunRef<'_>,
     glyphs: &mut dyn Iterator<Item = record::Glyph>,
 ) {
-    let Some(mut font) = skia_font_from_glyph_run(font_cache, &glyph_run) else {
+    let embolden = glyph_run.font_embolden != kurbo::Vec2::ZERO;
+    // Outline expansion precedes the per-glyph transform. Native glyph drawing
+    // folds that transform into the font; retain an untransformed font here.
+    let font_run = GlyphRunRef {
+        glyph_transform: if embolden {
+            None
+        } else {
+            glyph_run.glyph_transform
+        },
+        ..glyph_run.clone()
+    };
+    let Some(mut font) = skia_font_from_glyph_run(font_cache, &font_run) else {
         state.set_error_once(Error::InvalidFontData);
         return;
     };
@@ -246,6 +257,45 @@ fn draw_glyph_run(
     }
 
     font.set_subpixel(true);
+    if embolden {
+        for (&id, position) in glyph_ids.iter().zip(&positions) {
+            if let Some(path) = font.get_path(id) {
+                let path = skia_outline_to_bez(&path);
+                let mut path = kurbo::expand_path(
+                    &path,
+                    kurbo::Diagonal2::new(glyph_run.font_embolden.x, glyph_run.font_embolden.y),
+                    kurbo::Join::Miter,
+                    4.0,
+                    0.1,
+                );
+                path.apply_affine(
+                    Affine::translate((f64::from(position.x), f64::from(position.y)))
+                        * glyph_run.glyph_transform.unwrap_or(Affine::IDENTITY),
+                );
+                if let Some(path) = bez_to_sk_path(&path) {
+                    let path = match glyph_run.style {
+                        peniko::Style::Fill(rule) => path_with_fill_rule(&path, *rule),
+                        peniko::Style::Stroke(_) => path,
+                    };
+                    canvas.draw_path(&path, &sk_paint);
+                }
+            } else {
+                // Bitmap and color glyphs retain native rendering.
+                let Some(font) = skia_font_from_glyph_run(font_cache, &glyph_run) else {
+                    state.set_error_once(Error::UnsupportedGlyphTransform);
+                    return;
+                };
+                canvas.draw_glyphs_at(
+                    &[id],
+                    core::slice::from_ref(position),
+                    sk::Point::new(0.0, 0.0),
+                    &font,
+                    &sk_paint,
+                );
+            }
+        }
+        return;
+    }
     canvas.draw_glyphs_at(
         &glyph_ids,
         positions.as_slice(),
@@ -253,6 +303,42 @@ fn draw_glyph_run(
         &font,
         &sk_paint,
     );
+}
+
+fn skia_outline_to_bez(path: &sk::Path) -> kurbo::BezPath {
+    let point = |p: sk::Point| kurbo::Point::new(f64::from(p.x), f64::from(p.y));
+    let mut result = kurbo::BezPath::new();
+    let mut iter = sk::path::Iter::new(path, false);
+    while let Some((verb, points)) = iter.next() {
+        match verb {
+            sk::path::Verb::Move => result.move_to(point(points[0])),
+            sk::path::Verb::Line => result.line_to(point(points[1])),
+            sk::path::Verb::Quad => result.quad_to(point(points[1]), point(points[2])),
+            sk::path::Verb::Cubic => {
+                result.curve_to(point(points[1]), point(points[2]), point(points[3]));
+            }
+            sk::path::Verb::Conic => {
+                // Font outlines normally contain polynomial curves. Retain conics
+                // too, using Skia's bounded subdivision into quadratic segments.
+                let mut quads = [sk::Point::new(0.0, 0.0); 65];
+                let count = sk::Path::convert_conic_to_quads(
+                    points[0],
+                    points[1],
+                    points[2],
+                    iter.conic_weight().expect("conic verb has a weight"),
+                    &mut quads,
+                    5,
+                )
+                .expect("storage covers 32 quadratics");
+                for i in 0..count {
+                    result.quad_to(point(quads[2 * i + 1]), point(quads[2 * i + 2]));
+                }
+            }
+            sk::path::Verb::Close => result.close_path(),
+            sk::path::Verb::Done => break,
+        }
+    }
+    result
 }
 
 fn draw_blurred_rounded_rect(
