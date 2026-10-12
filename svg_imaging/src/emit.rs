@@ -7,7 +7,9 @@ use alloc::{vec, vec::Vec};
 
 use imaging::{ClipRef, GroupRef, PaintSink, Painter, record};
 
-use crate::plan::{PlanFill, PlanGroup, PlanImage, PlanMask, PlanMaskId, PlanNode, PlanStroke};
+use crate::plan::{
+    PlanClip, PlanFill, PlanGroup, PlanImage, PlanMask, PlanMaskId, PlanNode, PlanStroke,
+};
 
 /// Emit a lowered render plan into a painter.
 pub(crate) fn emit_plan<S>(plan: &crate::plan::RenderPlan, painter: &mut Painter<'_, S>)
@@ -56,55 +58,53 @@ impl<'a> EmitCx<'a> {
     where
         S: PaintSink + ?Sized,
     {
-        self.emit_group_layers(&group.clips, group, painter);
+        let mask = group
+            .mask
+            .map(|applied| self.materialize_mask(applied.mask));
+        let mut group_ref = GroupRef::new().with_composite(group.composite);
+        if let (Some(mask), Some(applied)) = (&mask, group.mask) {
+            group_ref = group_ref.with_mask_transformed(mask.as_ref(), applied.transform);
+        }
+        // The outer group owns compositing, even when its opacity and blend are defaults:
+        // an explicitly isolated SVG group must still isolate child blends from the backdrop.
+        let clips =
+            if let Some((PlanClip::Path { path, fill_rule }, rest)) = group.clips.split_first() {
+                group_ref = group_ref.with_clip(ClipRef::fill_with_rule(path, *fill_rule));
+                rest
+            } else {
+                &group.clips
+            };
+        painter.with_group(group_ref, |painter| {
+            self.emit_clip_layers(clips, &group.children, painter);
+        });
     }
 
-    fn emit_group_layers<S>(
+    fn emit_clip_layers<S>(
         &mut self,
-        clips: &[crate::plan::PlanClip],
-        group: &PlanGroup,
+        clips: &[PlanClip],
+        children: &[PlanNode],
         painter: &mut Painter<'_, S>,
     ) where
         S: PaintSink + ?Sized,
     {
-        if let Some((clip, rest)) = clips.split_first() {
-            let group_ref = GroupRef::new()
-                .with_clip(ClipRef::fill_with_rule(&clip.path, clip.fill_rule))
-                .with_composite(if rest.is_empty() && group.mask.is_none() {
-                    group.composite
-                } else {
-                    imaging::Composite::default()
-                });
-            painter.with_group(group_ref, |painter| {
-                if rest.is_empty() {
-                    self.emit_masked_children(group, painter);
-                } else {
-                    self.emit_group_layers(rest, group, painter);
-                }
-            });
-        } else {
-            self.emit_masked_children(group, painter);
-        }
-    }
-
-    fn emit_masked_children<S>(&mut self, group: &PlanGroup, painter: &mut Painter<'_, S>)
-    where
-        S: PaintSink + ?Sized,
-    {
-        if let Some(mask) = group.mask {
-            let mask = self.materialize_mask(mask.mask);
-            let group_ref = GroupRef::new()
-                .with_mask(mask.as_ref())
-                .with_composite(group.composite);
-            painter.with_group(group_ref, |painter| {
-                self.emit_nodes(&group.children, painter);
-            });
-        } else if group.composite == imaging::Composite::default() {
-            self.emit_nodes(&group.children, painter);
-        } else {
-            painter.with_group(GroupRef::new().with_composite(group.composite), |painter| {
-                self.emit_nodes(&group.children, painter);
-            });
+        let Some((clip, rest)) = clips.split_first() else {
+            self.emit_nodes(children, painter);
+            return;
+        };
+        match clip {
+            PlanClip::Path { path, fill_rule } => {
+                painter.with_group(
+                    GroupRef::new().with_clip(ClipRef::fill_with_rule(path, *fill_rule)),
+                    |painter| self.emit_clip_layers(rest, children, painter),
+                );
+            }
+            PlanClip::Mask(applied) => {
+                let mask = self.materialize_mask(applied.mask);
+                painter.with_group(
+                    GroupRef::new().with_mask_transformed(mask.as_ref(), applied.transform),
+                    |painter| self.emit_clip_layers(rest, children, painter),
+                );
+            }
         }
     }
 

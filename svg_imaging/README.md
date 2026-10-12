@@ -32,8 +32,9 @@ This crate is explicit about gaps. Unsupported features are reported in [`Render
 instead of being silently discarded.
 
 Current support includes path fills and strokes, gradients, paint order, isolated group
-compositing, clip paths including referenced clip-path chains, masks lowered through reusable
-`imaging` mask definitions, text lowered through `usvg`'s flattened vector output, nested SVG
+compositing, clip paths including unions of independently filled children and referenced
+clip-path chains, nested and referenced masks lowered through reusable `imaging` mask
+definitions, text lowered through `usvg`'s flattened vector output, nested SVG
 `<image>` nodes, and raster PNG/JPEG/GIF/WebP `<image>` nodes. Filters and pattern paints are
 still reported as unsupported.
 
