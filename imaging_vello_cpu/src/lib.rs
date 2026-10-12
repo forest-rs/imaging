@@ -7,7 +7,8 @@
 //! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 //!
 //! Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
-//! X/Y standard deviations; anisotropic filters return [`Error::UnsupportedFilter`].
+//! X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
+//! or sheared blur kernel return [`Error::UnsupportedFilter`].
 //!
 //! # Render A Recorded Scene
 //!
@@ -580,6 +581,10 @@ fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     u8::try_from(value.min(u32::from(u8::MAX))).expect("unpremultiplied channel must fit in u8")
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "native filter parameters use f32"
+)]
 fn filter_to_vello(filter: Filter) -> Result<VelloFilter, Error> {
     let primitive = match filter {
         Filter::Flood { color } => FilterPrimitive::Flood { color },
@@ -587,11 +592,13 @@ fn filter_to_vello(filter: Filter) -> Result<VelloFilter, Error> {
             std_deviation_x,
             std_deviation_y,
         } => {
-            if std_deviation_x != std_deviation_y {
+            let (sigma_x, sigma_y) = (std_deviation_x as f32, std_deviation_y as f32);
+            // Native blur planning computes its variance in f32.
+            if sigma_x != sigma_y || !(sigma_x * sigma_x).is_finite() {
                 return Err(Error::UnsupportedFilter);
             }
             FilterPrimitive::GaussianBlur {
-                std_deviation: std_deviation_x,
+                std_deviation: sigma_x,
                 edge_mode: EdgeMode::None,
             }
         }
@@ -602,18 +609,30 @@ fn filter_to_vello(filter: Filter) -> Result<VelloFilter, Error> {
             std_deviation_y,
             color,
         } => {
-            if std_deviation_x != std_deviation_y {
+            let (sigma_x, sigma_y) = (std_deviation_x as f32, std_deviation_y as f32);
+            // Native blur planning computes its variance in f32.
+            if sigma_x != sigma_y || !(sigma_x * sigma_x).is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            let (dx, dy) = (dx as f32, dy as f32);
+            if !dx.is_finite() || !dy.is_finite() {
                 return Err(Error::UnsupportedFilter);
             }
             FilterPrimitive::DropShadow {
                 dx,
                 dy,
-                std_deviation: std_deviation_x,
+                std_deviation: sigma_x,
                 color,
                 edge_mode: EdgeMode::None,
             }
         }
-        Filter::Offset { dx, dy } => FilterPrimitive::Offset { dx, dy },
+        Filter::Offset { dx, dy } => {
+            let (dx, dy) = (dx as f32, dy as f32);
+            if !dx.is_finite() || !dy.is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::Offset { dx, dy }
+        }
     };
     Ok(VelloFilter::from_primitive(primitive))
 }
@@ -650,7 +669,12 @@ impl PaintSink for VelloCpuRenderer {
             .filters
             .iter()
             .copied()
-            .map(filter_to_vello)
+            .map(|filter| {
+                filter
+                    .in_device_space(group.filter_transform)
+                    .ok_or(Error::UnsupportedFilter)
+                    .and_then(filter_to_vello)
+            })
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(filters) => filters,
@@ -1025,19 +1049,27 @@ mod tests {
     }
     #[test]
     fn anisotropic_group_filters_return_unsupported_without_panicking() {
-        let mut scene = Scene::new();
-        scene.push_group(imaging::record::Group {
-            filters: vec![Filter::blur(1.0), Filter::blur_xy(2.0, 1.0)],
-            ..Default::default()
-        });
-        Painter::new(&mut scene).fill_rect(Rect::new(8.0, 8.0, 24.0, 24.0), Color::WHITE);
-        scene.pop_group();
-        scene.validate().unwrap();
         let mut renderer = VelloCpuRenderer::new(32, 32);
-        assert!(matches!(
-            renderer.render_scene(&scene, 32, 32),
-            Err(Error::UnsupportedFilter)
-        ));
+        for (filter, filter_transform) in [
+            (Filter::blur_xy(2.0, 1.0), Affine::IDENTITY),
+            (Filter::blur(1.0), Affine::scale_non_uniform(2.0, 1.0)),
+            (Filter::blur(1.0), Affine::skew(0.5, 0.0)),
+            (Filter::offset(f64::from(f32::MAX), 0.0), Affine::scale(2.0)),
+        ] {
+            let mut scene = Scene::new();
+            scene.push_group(imaging::record::Group {
+                filters: vec![Filter::blur(1.0), filter],
+                filter_transform,
+                ..Default::default()
+            });
+            Painter::new(&mut scene).fill_rect(Rect::new(8.0, 8.0, 24.0, 24.0), Color::WHITE);
+            scene.pop_group();
+            scene.validate().unwrap();
+            assert!(matches!(
+                renderer.render_scene(&scene, 32, 32),
+                Err(Error::UnsupportedFilter)
+            ));
+        }
         assert!(
             renderer.render_scene(&Scene::new(), 32, 32).is_ok(),
             "renderer must recover on the next frame"

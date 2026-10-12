@@ -2021,22 +2021,44 @@ fn build_filter_chain(filters: &[Filter]) -> Option<sk::ImageFilter> {
             Filter::Blur {
                 std_deviation_x,
                 std_deviation_y,
-            } => image_filters::blur((std_deviation_x, std_deviation_y), None, current, None)?,
+            } => {
+                let sigma = (f64_to_f32(std_deviation_x), f64_to_f32(std_deviation_y));
+                if !sigma.0.is_finite() || !sigma.1.is_finite() {
+                    return None;
+                }
+                image_filters::blur(sigma, None, current, None)?
+            }
             Filter::DropShadow {
                 dx,
                 dy,
                 std_deviation_x,
                 std_deviation_y,
                 color,
-            } => image_filters::drop_shadow(
-                (dx, dy),
-                (std_deviation_x, std_deviation_y),
-                color_to_sk_color4f(color),
-                None,
-                current,
-                None,
-            )?,
-            Filter::Offset { dx, dy } => image_filters::offset((dx, dy), current, None)?,
+            } => {
+                let offset = (f64_to_f32(dx), f64_to_f32(dy));
+                let sigma = (f64_to_f32(std_deviation_x), f64_to_f32(std_deviation_y));
+                if ![offset.0, offset.1, sigma.0, sigma.1]
+                    .into_iter()
+                    .all(f32::is_finite)
+                {
+                    return None;
+                }
+                image_filters::drop_shadow(
+                    offset,
+                    sigma,
+                    color_to_sk_color4f(color),
+                    None,
+                    current,
+                    None,
+                )?
+            }
+            Filter::Offset { dx, dy } => {
+                let offset = (f64_to_f32(dx), f64_to_f32(dy));
+                if !offset.0.is_finite() || !offset.1.is_finite() {
+                    return None;
+                }
+                image_filters::offset(offset, current, None)?
+            }
         });
     }
     current
@@ -2176,7 +2198,8 @@ mod tests {
         let mut scene = Scene::new();
         Painter::new(&mut scene).with_group(
             GroupRef::new()
-                .with_filters(&[Filter::offset(4.0, 0.0)])
+                .with_filters(&[Filter::offset(2.0, 0.0)])
+                .with_filter_transform(Affine::scale(2.0))
                 .with_mask(mask.as_ref())
                 .with_clip(imaging::ClipRef::fill(Rect::new(5.0, 0.0, 7.0, 8.0)))
                 .with_composite(imaging::Composite::new(peniko::BlendMode::default(), 0.5)),
@@ -2219,6 +2242,21 @@ mod tests {
             assert_filtered_mask(&renderer.render_picture(&picture, 16, 8).unwrap(), mode);
             assert_filtered_mask(&renderer.render_scene(&scene, 16, 8).unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn singular_non_axis_aligned_filter_returns_unsupported() {
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(
+            GroupRef::new()
+                .with_filters(&[Filter::blur(1.0)])
+                .with_filter_transform(Affine::new([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])),
+            |p| p.fill_rect(Rect::new(0.0, 0.0, 8.0, 8.0), Color::WHITE),
+        );
+        assert!(matches!(
+            SkiaCpuRenderer::new().render_scene(&scene, 8, 8),
+            Err(Error::UnsupportedFilter)
+        ));
     }
 
     #[test]

@@ -270,6 +270,10 @@ pub struct Group {
     pub mask: Option<AppliedMask>,
     /// Filter chain applied in vector order before the mask, isolated clip, and compositing.
     pub filters: Vec<crate::Filter>,
+    /// Maps filter user-space coordinates to the destination coordinate system.
+    ///
+    /// Defaults to identity. Transformed replay prefixes this transform along with the content.
+    pub filter_transform: Affine,
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,
 }
@@ -281,6 +285,7 @@ impl Default for Group {
             clip: None,
             mask: None,
             filters: Vec::new(),
+            filter_transform: Affine::IDENTITY,
             composite: Composite::default(),
         }
     }
@@ -725,7 +730,7 @@ impl Scene {
             .collect()
     }
 
-    /// Validate well-nested stacks.
+    /// Validate well-nested stacks, filter parameters and transforms, and retained masks.
     pub fn validate(&self) -> Result<(), ValidateError> {
         let mut context_depth = 0_u32;
         let mut context_stack = Vec::new();
@@ -760,7 +765,19 @@ impl Scene {
                         }
                     })?;
                 }
-                Command::PushGroup(_) => group_depth += 1,
+                Command::PushGroup(id) => {
+                    let group = self.group(*id);
+                    if !group.filter_transform.is_finite()
+                        || group.filters.iter().any(|filter| {
+                            !crate::validation::filter_is_valid(filter, group.filter_transform)
+                        })
+                    {
+                        return Err(ValidateError::InvalidFilter {
+                            contexts: self.context_notes_for_stack(&context_stack),
+                        });
+                    }
+                    group_depth += 1;
+                }
                 Command::PopGroup => {
                     group_depth = group_depth.checked_sub(1).ok_or_else(|| {
                         ValidateError::UnbalancedPopGroup {
@@ -905,6 +922,11 @@ pub enum ValidateError {
         /// Enclosing context stack still open at the end of validation.
         contexts: Vec<ContextNote>,
     },
+    /// A filter's parameters or transform were invalid.
+    InvalidFilter {
+        /// Enclosing context stack active at the point of failure.
+        contexts: Vec<ContextNote>,
+    },
     /// A retained mask definition was invalid.
     InvalidMask(Box<Self>),
 }
@@ -930,6 +952,9 @@ impl core::fmt::Display for ValidateError {
             Self::UnclosedContexts { .. } => {
                 f.write_str("scene validation failed: scene ended with unclosed contexts")
             }
+            Self::InvalidFilter { .. } => {
+                f.write_str("scene validation failed: invalid filter parameters or transform")
+            }
             Self::InvalidMask(_) => {
                 f.write_str("scene validation failed: retained mask definition is invalid")
             }
@@ -941,7 +966,8 @@ impl core::error::Error for ValidateError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::InvalidMask(error) => Some(error.as_ref()),
-            Self::UnbalancedPopClip { .. }
+            Self::InvalidFilter { .. }
+            | Self::UnbalancedPopClip { .. }
             | Self::UnbalancedPopGroup { .. }
             | Self::UnbalancedPopContext { .. }
             | Self::UnclosedClips { .. }

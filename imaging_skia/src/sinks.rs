@@ -36,6 +36,7 @@ enum GroupFrame {
 struct MaskedGroupFrame {
     clip: Option<record::Clip>,
     filters: Vec<imaging::Filter>,
+    filter_transform: Affine,
     composite: imaging::Composite,
     mode: MaskMode,
     transform: Affine,
@@ -124,11 +125,8 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
     {
         state.set_error_once(Error::UnsupportedExternalImage);
     }
-    let filter = if group.filters.is_empty() {
-        None
-    } else {
-        build_filter_chain(group.filters)
-    };
+    let (filter, filter_transform) =
+        build_transformed_filter_chain(group.filters, group.filter_transform);
     if !group.filters.is_empty() && filter.is_none() {
         state.set_error_once(Error::UnsupportedFilter);
     }
@@ -140,13 +138,45 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
     canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&paint));
     let mut restores = 1_u8;
     if let Some(filter) = filter {
+        set_matrix(canvas, filter_transform);
         let mut filter_paint = sk::Paint::default();
         filter_paint.set_image_filter(filter);
         canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&filter_paint));
+        set_matrix(canvas, Affine::IDENTITY);
         restores += 1;
     }
 
     restores
+}
+
+fn build_transformed_filter_chain(
+    filters: &[imaging::Filter],
+    transform: Affine,
+) -> (Option<sk::ImageFilter>, Affine) {
+    // Prefer device-space parameters, including for singular transforms that Skia's CTM
+    // would otherwise treat as invisible. Preserve native affine kernels when needed.
+    if let Some(filters) = filters
+        .iter()
+        .map(|filter| filter.in_device_space(transform))
+        .collect::<Option<Vec<_>>>()
+    {
+        (build_filter_chain(&filters), Affine::IDENTITY)
+    } else if !transform.is_finite() || transform.determinant() == 0.0 {
+        (None, Affine::IDENTITY)
+    } else {
+        // Filter parameters use only the linear part. Check Skia's matrix range here,
+        // at the native boundary, rather than constraining the shared geometry model.
+        let transform = transform.with_translation(kurbo::Vec2::ZERO);
+        if !transform
+            .as_coeffs()
+            .into_iter()
+            .map(f64_to_f32)
+            .all(f32::is_finite)
+        {
+            return (None, Affine::IDENTITY);
+        }
+        (build_filter_chain(filters), transform)
+    }
 }
 
 fn apply_isolated_clip(canvas: &sk::Canvas, state: &mut StreamState, clip: ClipRef<'_>) {
@@ -294,7 +324,8 @@ fn draw_masked_group(
     paint.set_anti_alias(true);
     paint.set_blend_mode(map_blend_mode(&masked.composite.blend));
     paint.set_alpha_f(masked.composite.alpha.clamp(0.0, 1.0));
-    let filter = build_filter_chain(&masked.filters);
+    let (filter, filter_transform) =
+        build_transformed_filter_chain(&masked.filters, masked.filter_transform);
     if !masked.filters.is_empty() && filter.is_none() {
         state.set_error_once(Error::UnsupportedFilter);
         return;
@@ -311,10 +342,12 @@ fn draw_masked_group(
 
     // Filter the content before it is modulated by the fully rendered mask.
     if let Some(filter) = filter.as_ref() {
+        set_matrix(canvas, filter_transform);
         let mut filter_paint = sk::Paint::default();
         filter_paint.set_image_filter(filter.clone());
         let rec = sk::canvas::SaveLayerRec::default().paint(&filter_paint);
         canvas.save_layer(&rec);
+        set_matrix(canvas, Affine::IDENTITY);
     }
 
     if !replay_scene_into_canvas(
@@ -416,6 +449,7 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
             .push(GroupFrame::Masked(Box::new(MaskedGroupFrame {
                 clip: group.clip.map(ClipRef::to_owned),
                 filters: group.filters.to_vec(),
+                filter_transform: group.filter_transform,
                 composite: group.composite,
                 mode: mask.mask.mode,
                 transform: mask.transform,

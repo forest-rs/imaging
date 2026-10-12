@@ -23,7 +23,8 @@
 //! blending, and image bindings. Luminance masks remain unsupported by this backend.
 //!
 //! Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
-//! X/Y standard deviations; anisotropic filters return [`Error::UnsupportedFilter`].
+//! X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
+//! or sheared blur kernel return [`Error::UnsupportedFilter`].
 //! Blurred rounded rectangles use the renderer's native analytic draw.
 //!
 //! # Render A Recorded Scene

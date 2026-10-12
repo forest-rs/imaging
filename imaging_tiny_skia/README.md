@@ -29,6 +29,9 @@ This crate provides a CPU renderer that consumes `imaging::record::Scene` values
 The implementation was integrated from Floem's tiny-skia renderer and adapted to match the
 public renderer shape used by the other `imaging_*` backends.
 
+Group filters are evaluated in destination coordinates. Transforms that require a rotated
+anisotropic or sheared blur kernel return [`Error::UnsupportedFilter`].
+
 <!-- cargo-rdme end -->
 
 ## Minimum supported Rust Version (MSRV)

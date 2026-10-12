@@ -76,7 +76,7 @@ use crate::{
     PaintSink, StrokeRef,
     record::{self, Geometry, Glyph},
 };
-use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke, Vec2};
 
 /// Decision returned by a [`ValidatingSink`] violation hook.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -146,6 +146,40 @@ pub enum ValidationError {
         /// Remaining group depth.
         depth: u32,
     },
+}
+
+// Shared filter validity rules for retained preflight and streaming validation.
+pub(crate) fn filter_is_valid(filter: &Filter, transform: Affine) -> bool {
+    let [a, b, c, d, ..] = transform.as_coeffs();
+    let offset_is_valid = |dx: f64, dy: f64| {
+        dx.is_finite()
+            && dy.is_finite()
+            && (a * dx + c * dy).is_finite()
+            && (b * dx + d * dy).is_finite()
+    };
+    let blur_is_valid = |sx: f64, sy: f64| {
+        sx.is_finite()
+            && sy.is_finite()
+            && sx >= 0.0
+            && sy >= 0.0
+            && Vec2::new(a * sx, c * sy).hypot().is_finite()
+            && Vec2::new(b * sx, d * sy).hypot().is_finite()
+    };
+    match *filter {
+        Filter::Flood { .. } => true,
+        Filter::Blur {
+            std_deviation_x,
+            std_deviation_y,
+        } => blur_is_valid(std_deviation_x, std_deviation_y),
+        Filter::DropShadow {
+            dx,
+            dy,
+            std_deviation_x,
+            std_deviation_y,
+            ..
+        } => offset_is_valid(dx, dy) && blur_is_valid(std_deviation_x, std_deviation_y),
+        Filter::Offset { dx, dy } => offset_is_valid(dx, dy),
+    }
 }
 
 /// Default violation hook for [`ValidatingSink`].
@@ -337,34 +371,8 @@ where
         }
     }
 
-    fn validate_filter(&mut self, filter: &Filter) -> bool {
-        let ok = match *filter {
-            Filter::Flood { .. } => true,
-            Filter::Blur {
-                std_deviation_x,
-                std_deviation_y,
-            } => {
-                std_deviation_x.is_finite()
-                    && std_deviation_y.is_finite()
-                    && std_deviation_x >= 0.0
-                    && std_deviation_y >= 0.0
-            }
-            Filter::DropShadow {
-                dx,
-                dy,
-                std_deviation_x,
-                std_deviation_y,
-                ..
-            } => {
-                dx.is_finite()
-                    && dy.is_finite()
-                    && std_deviation_x.is_finite()
-                    && std_deviation_y.is_finite()
-                    && std_deviation_x >= 0.0
-                    && std_deviation_y >= 0.0
-            }
-            Filter::Offset { dx, dy } => dx.is_finite() && dy.is_finite(),
-        };
+    fn validate_filter(&mut self, filter: &Filter, transform: Affine) -> bool {
+        let ok = filter_is_valid(filter, transform);
         if ok {
             true
         } else {
@@ -604,6 +612,7 @@ where
         }
 
         let mut ok = self.validate_composite(&group.composite);
+        ok &= self.validate_affine("Group::filter_transform", &group.filter_transform);
         if let Some(clip) = group.clip.clone() {
             ok &= self.validate_clip(clip, "Group::clip::transform");
         }
@@ -611,7 +620,7 @@ where
             ok &= self.validate_group_mask(mask);
         }
         for filter in group.filters {
-            ok &= self.validate_filter(filter);
+            ok &= self.validate_filter(filter, group.filter_transform);
         }
         if !ok {
             return;
@@ -712,6 +721,73 @@ mod tests {
     };
 
     #[test]
+    fn group_filter_transform_must_be_finite() {
+        let mut sink = ValidatingSink::new(Scene::new());
+        sink.push_group(GroupRef::new().with_filter_transform(Affine::scale(f64::NAN)));
+        assert!(matches!(
+            sink.first_error(),
+            Some(ValidationError::NonFinite { .. })
+        ));
+        assert!(sink.inner().commands().is_empty());
+    }
+
+    #[test]
+    fn invalid_filters_are_rejected_before_forwarding() {
+        for (filter, transform) in [
+            (Filter::blur(-1.0), Affine::IDENTITY),
+            (Filter::blur(f64::NAN), Affine::IDENTITY),
+            (Filter::offset(f64::INFINITY, 0.0), Affine::IDENTITY),
+            (Filter::blur(f64::MAX), Affine::scale(2.0)),
+            (Filter::offset(f64::MAX, 0.0), Affine::scale(2.0)),
+            // Check numeric validity even when the kernel is not axis-aligned.
+            (
+                Filter::blur(2.0),
+                Affine::new([f64::MAX, 1.0, 1.0, 1.0, 0.0, 0.0]),
+            ),
+        ] {
+            let mut sink = ValidatingSink::new(Scene::new());
+            sink.push_group(
+                GroupRef::new()
+                    .with_filters(&[filter])
+                    .with_filter_transform(transform),
+            );
+            assert_eq!(sink.first_error(), Some(&ValidationError::InvalidFilter));
+            assert!(sink.inner().commands().is_empty());
+
+            let mut scene = Scene::new();
+            PaintSink::push_group(
+                &mut scene,
+                GroupRef::new()
+                    .with_filters(&[filter])
+                    .with_filter_transform(transform),
+            );
+            PaintSink::pop_group(&mut scene);
+            assert_eq!(
+                scene.validate(),
+                Err(record::ValidateError::InvalidFilter { contexts: vec![] })
+            );
+        }
+    }
+
+    #[test]
+    fn filter_validation_does_not_impose_backend_limits() {
+        let filters = [
+            Filter::blur(f64::from(f32::MAX)),
+            Filter::offset(f64::from(f32::MAX), 0.0),
+        ];
+        let mut sink = ValidatingSink::new(Scene::new());
+        sink.push_group(
+            GroupRef::new()
+                .with_filters(&filters)
+                .with_filter_transform(Affine::scale(2.0)),
+        );
+        sink.pop_group();
+        assert_eq!(sink.finish(), Ok(()));
+        assert_eq!(sink.inner().commands().len(), 2);
+        assert_eq!(sink.inner().validate(), Ok(()));
+    }
+
+    #[test]
     fn validating_sink_records_nan_and_aborts_by_default() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
@@ -798,7 +874,7 @@ mod tests {
                 glyph_transform: None,
                 brush_transform: None,
                 font_size: -1.0,
-                font_embolden: kurbo::Vec2::ZERO,
+                font_embolden: Vec2::ZERO,
                 hint: false,
                 normalized_coords: &[],
                 style: &style,
