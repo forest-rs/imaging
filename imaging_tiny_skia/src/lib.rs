@@ -395,6 +395,7 @@ struct Glyph {
 #[derive(Clone)]
 pub(crate) struct ClipPath {
     path: Path,
+    fill_rule: FillRule,
     rect: Rect,
     simple_rect: Option<Rect>,
     stroke_source: Option<(Path, TinyStroke)>,
@@ -810,7 +811,7 @@ impl<'a> Layer<'a> {
         if clip.simple_rect.is_some() {
             Self::write_mask_rect_to(mask, clip.rect);
         } else {
-            mask.fill_path(&clip.path, FillRule::Winding, true, Transform::identity());
+            mask.fill_path(&clip.path, clip.fill_rule, true, Transform::identity());
         }
     }
 
@@ -829,7 +830,7 @@ impl<'a> Layer<'a> {
             }
             return;
         }
-        mask.intersect_path(&clip.path, FillRule::Winding, true, Transform::identity());
+        mask.intersect_path(&clip.path, clip.fill_rule, true, Transform::identity());
     }
 
     fn intersect_clip_path(&mut self, clip: &ClipPath) {
@@ -1379,6 +1380,7 @@ impl<'a> Layer<'a> {
     fn try_fill_image_fallback<T>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         image_pixmap: &Pixmap,
         image: &peniko::ImageBrush<T>,
         brush_transform: Option<Affine>,
@@ -1422,7 +1424,7 @@ impl<'a> Layer<'a> {
         };
         coverage.fill_path(
             &path,
-            FillRule::Winding,
+            fill_rule,
             true,
             self.skia_transform()
                 .post_translate(-(x0 as f32), -(y0 as f32)),
@@ -1624,6 +1626,7 @@ impl<'a> Layer<'a> {
     fn fill_image_with_pixmap_and_mode<T>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         image_pixmap: &Pixmap,
         image: &peniko::ImageBrush<T>,
         brush_transform: Option<Affine>,
@@ -1634,6 +1637,7 @@ impl<'a> Layer<'a> {
     {
         if self.try_fill_image_fallback(
             shape,
+            fill_rule,
             image_pixmap,
             image,
             brush_transform,
@@ -1667,13 +1671,8 @@ impl<'a> Layer<'a> {
             let path = try_ret!(shape_to_path(shape));
             self.materialize_simple_clip_mask();
             let clip_mask = self.clip.is_some().then_some(&self.mask);
-            self.pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                self.skia_transform(),
-                clip_mask,
-            );
+            self.pixmap
+                .fill_path(&path, &paint, fill_rule, self.skia_transform(), clip_mask);
         }
     }
 
@@ -1724,6 +1723,7 @@ impl Layer<'_> {
             try_ret!(shape_to_path(shape).and_then(|path| path.transform(self.skia_transform())));
         self.set_base_clip(Some(ClipPath {
             path,
+            fill_rule: FillRule::Winding,
             rect: self
                 .device_transform()
                 .transform_rect_bbox(shape.bounding_box()),
@@ -1783,17 +1783,19 @@ impl Layer<'_> {
     }
 
     fn fill<'b>(&mut self, shape: &impl Shape, brush: impl Into<BrushRef<'b>>) {
-        self.fill_with_brush_transform(shape, brush, None);
+        self.fill_with_brush_transform(shape, FillRule::Winding, brush, None);
     }
 
     fn fill_with_brush_transform<'b>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
     ) {
         self.fill_with_brush_transform_and_mode(
             shape,
+            fill_rule,
             brush,
             brush_transform,
             1.0,
@@ -1804,6 +1806,7 @@ impl Layer<'_> {
     fn fill_with_brush_transform_and_mode<'b>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
         opacity: f32,
@@ -1814,6 +1817,7 @@ impl Layer<'_> {
             let image_pixmap = try_ret!(image_brush_pixmap(&image));
             self.fill_image_with_pixmap_and_mode(
                 shape,
+                fill_rule,
                 &image_pixmap,
                 &image,
                 brush_transform,
@@ -1846,13 +1850,8 @@ impl Layer<'_> {
             let path = try_ret!(shape_to_path(shape));
             self.materialize_simple_clip_mask();
             let clip_mask = self.clip.is_some().then_some(&self.mask);
-            self.pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                self.skia_transform(),
-                clip_mask,
-            );
+            self.pixmap
+                .fill_path(&path, &paint, fill_rule, self.skia_transform(), clip_mask);
         }
     }
 }
@@ -1932,6 +1931,13 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     }
 }
 
+fn to_fill_rule(rule: peniko::Fill) -> FillRule {
+    match rule {
+        peniko::Fill::NonZero => FillRule::Winding,
+        peniko::Fill::EvenOdd => FillRule::EvenOdd,
+    }
+}
+
 fn translate_clip_path(clip: &ClipPath, dx: f64, dy: f64) -> ClipPath {
     let path = clip
         .path
@@ -1948,6 +1954,7 @@ fn translate_clip_path(clip: &ClipPath, dx: f64, dy: f64) -> ClipPath {
     });
     ClipPath {
         path,
+        fill_rule: clip.fill_rule,
         rect: translate_rect(clip.rect, dx, dy),
         simple_rect: clip.simple_rect.map(|rect| translate_rect(rect, dx, dy)),
         stroke_source,
@@ -1979,7 +1986,11 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
 
     fn default_group_clip(&self) -> Option<ClipPath> {
         let rect = self.canvas_size().to_rect();
-        self.clip_path_for_geometry(imaging::GeometryRef::Rect(rect), Affine::IDENTITY)
+        self.clip_path_for_geometry(
+            imaging::GeometryRef::Rect(rect),
+            Affine::IDENTITY,
+            FillRule::Winding,
+        )
     }
 
     fn group_clip_path(&self, clip: Option<ClipRef<'_>>) -> Option<ClipPath> {
@@ -2232,8 +2243,10 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn clip_path_for_clip(&self, clip: ClipRef<'_>) -> Option<ClipPath> {
         match clip {
             ClipRef::Fill {
-                transform, shape, ..
-            } => self.clip_path_for_geometry(shape, transform),
+                transform,
+                shape,
+                fill_rule,
+            } => self.clip_path_for_geometry(shape, transform, to_fill_rule(fill_rule)),
             ClipRef::Stroke {
                 transform,
                 shape,
@@ -2261,6 +2274,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 let path = stroked.transform(affine_to_skia(transform))?;
                 Some(ClipPath {
                     path,
+                    fill_rule: FillRule::Winding,
                     rect: transform.transform_rect_bbox(rect),
                     simple_rect: None,
                     stroke_source: Some((
@@ -2276,6 +2290,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         &self,
         shape: imaging::GeometryRef<'_>,
         transform: Affine,
+        fill_rule: FillRule,
     ) -> Option<ClipPath> {
         let origin = self.current_layer().origin;
         let transform = Affine::translate((-origin.x, -origin.y)) * transform;
@@ -2302,6 +2317,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
 
         Some(ClipPath {
             path,
+            fill_rule,
             rect: transform.transform_rect_bbox(bounds),
             simple_rect,
             stroke_source: None,
@@ -2424,21 +2440,22 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn fill_geometry<'b>(
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
     ) {
         match shape {
             imaging::GeometryRef::Rect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, brush_transform);
+                layer.fill_with_brush_transform(rect, fill_rule, brush, brush_transform);
             }
             imaging::GeometryRef::RoundedRect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, brush_transform);
+                layer.fill_with_brush_transform(rect, fill_rule, brush, brush_transform);
             }
             imaging::GeometryRef::Path(path) => {
-                layer.fill_with_brush_transform(path, brush, brush_transform);
+                layer.fill_with_brush_transform(path, fill_rule, brush, brush_transform);
             }
             imaging::GeometryRef::OwnedPath(path) => {
-                layer.fill_with_brush_transform(path, brush, brush_transform);
+                layer.fill_with_brush_transform(path, fill_rule, brush, brush_transform);
             }
         }
     }
@@ -2446,6 +2463,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn fill_geometry_with_mode<'b>(
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
         opacity: f32,
@@ -2454,6 +2472,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         match shape {
             imaging::GeometryRef::Rect(rect) => layer.fill_with_brush_transform_and_mode(
                 rect,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2461,6 +2480,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::RoundedRect(rect) => layer.fill_with_brush_transform_and_mode(
                 rect,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2468,6 +2488,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::Path(path) => layer.fill_with_brush_transform_and_mode(
                 path,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2475,6 +2496,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::OwnedPath(path) => layer.fill_with_brush_transform_and_mode(
                 path,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2486,6 +2508,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn fill_image_geometry_with_mode(
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
+        fill_rule: FillRule,
         image_pixmap: &Pixmap,
         image: &peniko::ImageBrush,
         brush_transform: Option<Affine>,
@@ -2495,6 +2518,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         match shape {
             imaging::GeometryRef::Rect(rect) => layer.fill_image_with_pixmap_and_mode(
                 rect,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2503,6 +2527,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::RoundedRect(rect) => layer.fill_image_with_pixmap_and_mode(
                 rect,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2511,6 +2536,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::Path(path) => layer.fill_image_with_pixmap_and_mode(
                 path,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2519,6 +2545,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::OwnedPath(path) => layer.fill_image_with_pixmap_and_mode(
                 path,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2818,6 +2845,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
+        let fill_rule = to_fill_rule(draw.fill_rule);
         if self.discarding_group() {
             return;
         }
@@ -2843,6 +2871,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
                 Self::fill_image_geometry_with_mode(
                     layer,
                     &draw.shape,
+                    fill_rule,
                     &image_pixmap,
                     image,
                     draw.brush_transform,
@@ -2859,6 +2888,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             Self::fill_image_geometry_with_mode(
                 &mut child,
                 &draw.shape,
+                fill_rule,
                 &image_pixmap,
                 image,
                 draw.brush_transform,
@@ -2878,6 +2908,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             Self::fill_geometry_with_mode(
                 layer,
                 &draw.shape,
+                fill_rule,
                 &brush,
                 draw.brush_transform,
                 draw.composite.alpha,
@@ -2890,7 +2921,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         let brush_transform = draw.brush_transform;
         self.draw_with_composite(draw.composite, |layer| {
             layer.transform = transform;
-            Self::fill_geometry(layer, &draw.shape, &brush, brush_transform);
+            Self::fill_geometry(layer, &draw.shape, fill_rule, &brush, brush_transform);
         });
     }
 
@@ -3756,6 +3787,7 @@ fn draw_brushed_glyphs_into_layer<'a>(
             * run.brush_transform.unwrap_or(Affine::IDENTITY);
     content_layer.fill_with_brush_transform_and_mode(
         &canvas_rect,
+        FillRule::Winding,
         run.brush
             .as_raster()
             .expect("glyph brush was checked before rendering"),
@@ -4718,6 +4750,18 @@ fn layer_composite_rect(layer: &Layer<'_>, parent: &Layer<'_>) -> Option<IntRect
         rect = rect.intersect(parent_clip);
     }
 
+    // Cropping the source must also advance the destination. Constrain the root-space
+    // rectangle here so converting it to local coordinates cannot silently crop it later.
+    for surface in [layer, parent] {
+        rect = rect.intersect(Rect::from_origin_size(
+            surface.origin,
+            Size::new(
+                f64::from(surface.pixmap.width()),
+                f64::from(surface.pixmap.height()),
+            ),
+        ));
+    }
+
     if rect.is_zero_area() {
         return None;
     }
@@ -5449,6 +5493,123 @@ mod tests {
     use peniko::color::{ColorSpaceTag, HueDirection, palette::css};
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 
+    fn ring_path() -> BezPath {
+        let mut path = Rect::new(2.0, 2.0, 14.0, 14.0).to_path(0.1);
+        path.extend(Rect::new(4.0, 4.0, 12.0, 12.0).to_path(0.1));
+        path
+    }
+
+    #[test]
+    fn even_odd_fills_preserve_holes_across_brushes_and_composites() {
+        let data = ImageData {
+            data: Blob::from(vec![255; 4]),
+            width: 1,
+            height: 1,
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+        };
+        let brushes = [
+            imaging::Brush::Solid(Color::WHITE),
+            imaging::Brush::Gradient(
+                Gradient::new_linear((0.0, 0.0), (16.0, 0.0))
+                    .with_stops([Color::WHITE, Color::WHITE].as_slice()),
+            ),
+            imaging::Brush::Image(imaging::ImageBrush::new(data.clone())),
+            imaging::Brush::Image(
+                imaging::ImageBrush::new(data).with_sampler(
+                    peniko::ImageSampler::default()
+                        .with_x_extend(Extend::Repeat)
+                        .with_y_extend(Extend::Pad),
+                ),
+            ),
+        ];
+        let mut renderer = TinySkiaRenderer::new();
+        for brush in brushes {
+            for blend in [
+                BlendMode::default(),
+                Compose::Copy.into(),
+                BlendMode::new(Mix::Multiply, Compose::Copy),
+            ] {
+                for rule in [peniko::Fill::NonZero, peniko::Fill::EvenOdd] {
+                    let mut scene = Scene::new();
+                    Painter::new(&mut scene)
+                        .fill(ring_path(), &brush)
+                        .fill_rule(rule)
+                        .composite(Composite::new(blend, 1.0))
+                        .draw();
+                    let image = renderer.render_source(&mut &scene, 16, 16).unwrap();
+                    assert_eq!(
+                        image.data[(3 * 16 + 3) * 4 + 3],
+                        255,
+                        "ring must be painted"
+                    );
+                    let expected = if rule == peniko::Fill::EvenOdd {
+                        0
+                    } else {
+                        255
+                    };
+                    assert_eq!(
+                        image.data[(8 * 16 + 8) * 4 + 3],
+                        expected,
+                        "hole for {rule:?}, {blend:?}, {brush:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn even_odd_clips_preserve_holes_in_nested_and_offset_groups() {
+        let mut renderer = TinySkiaRenderer::new();
+        for isolated in [false, true] {
+            let mut scene = Scene::new();
+            let path = ring_path();
+            let mut painter = Painter::new(&mut scene);
+            painter.with_group(
+                GroupRef::new().with_clip(ClipRef::fill(Rect::new(1.0, 1.0, 15.0, 15.0))),
+                |p| {
+                    let clip = ClipRef::fill_with_rule(&path, peniko::Fill::EvenOdd);
+                    if isolated {
+                        p.with_group(GroupRef::new().with_clip(clip), |p| {
+                            p.fill_rect(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE);
+                        });
+                    } else {
+                        p.with_clip(clip, |p| {
+                            p.fill_rect(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE);
+                        });
+                    }
+                },
+            );
+            let image = renderer.render_source(&mut &scene, 16, 16).unwrap();
+            assert_eq!(image.data[(3 * 16 + 3) * 4 + 3], 255);
+            assert_eq!(image.data[(8 * 16 + 8) * 4 + 3], 0, "isolated={isolated}");
+        }
+    }
+
+    #[test]
+    fn groups_clipped_beyond_the_surface_keep_their_destination_origin() {
+        let mut renderer = TinySkiaRenderer::new();
+        for blend in [BlendMode::default(), Mix::Multiply.into()] {
+            let mut scene = Scene::new();
+            let mut painter = Painter::new(&mut scene);
+            painter.fill_rect(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE);
+            painter.with_group(
+                GroupRef::new()
+                    .with_clip(ClipRef::fill(Rect::new(-2.0, -2.0, 18.0, 18.0)))
+                    .with_composite(Composite::new(blend, 1.0)),
+                |p| p.fill_rect(Rect::new(-4.0, -4.0, 20.0, 20.0), Color::BLACK),
+            );
+            let image = renderer.render_source(&mut &scene, 16, 16).unwrap();
+            assert!(
+                image
+                    .data
+                    .chunks_exact(4)
+                    .all(|pixel| pixel == [0, 0, 0, 255]),
+                "cropping must preserve source placement for {blend:?}"
+            );
+        }
+    }
+
     #[test]
     fn unrepresentable_filter_transform_returns_unsupported_and_recovers() {
         let mut scene = Scene::new();
@@ -5815,6 +5976,7 @@ mod tests {
         let clip_path = builder.finish().expect("failed to create clip path");
         child.set_base_clip(Some(ClipPath {
             path: clip_path,
+            fill_rule: FillRule::Winding,
             rect: Rect::new(0.0, 0.0, 6.0, 6.0),
             simple_rect: None,
             stroke_source: None,
@@ -5875,6 +6037,7 @@ mod tests {
         let mut transformed = make_layer(8, 2);
         transformed.fill_with_brush_transform(
             &Rect::new(0.0, 0.0, 8.0, 2.0),
+            FillRule::Winding,
             &gradient,
             Some(Affine::translate((2.0, 0.0))),
         );
