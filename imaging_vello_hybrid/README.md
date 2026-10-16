@@ -238,3 +238,11 @@ as defined in the Apache-2.0 license, shall be dual licensed as above, without a
 [LICENSE-MIT]: https://github.com/forest-rs/imaging/blob/main/LICENSE-MIT
 [Rust code of conduct]: https://www.rust-lang.org/policies/code-of-conduct
 [AUTHORS]: https://github.com/forest-rs/imaging/blob/main/AUTHORS
+
+## Caller-owned encoding
+
+`VelloHybridRenderer::encode_to_texture_view` appends rendering to a caller-owned
+command encoder. Existing `render_to_texture_view` callers need no migration;
+they still submit immediately. Use the encoding method for timestamp queries or
+to combine rendering and presentation work in one submission. Submit on the same
+device and queue supplied at renderer construction. Discard the encoder on error.
