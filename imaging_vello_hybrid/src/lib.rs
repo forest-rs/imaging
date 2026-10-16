@@ -324,13 +324,30 @@ impl VelloHybridRendererState {
         self.queue.submit([encoder.finish()]);
     }
 
-    /// Lower a semantic [`imaging::record::Scene`] into a native [`VelloHybridScene`].
     fn render_to_view(
         &mut self,
         scene: &VelloHybridScene,
         texture_view: &wgpu::TextureView,
         width: u32,
         height: u32,
+    ) -> Result<(), Error> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("imaging_vello_hybrid render"),
+            });
+        self.encode_to_view(scene, texture_view, width, height, &mut encoder)?;
+        self.queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
+    fn encode_to_view(
+        &mut self,
+        scene: &VelloHybridScene,
+        texture_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), Error> {
         if let Some(identity) = &scene.renderer
             && !Arc::ptr_eq(identity, &self.identity)
@@ -339,12 +356,6 @@ impl VelloHybridRendererState {
         }
         let (width, height) = Self::checked_size(width, height)?;
         let render_size = RenderSize { width, height };
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("imaging_vello_hybrid render"),
-            });
-
         let mut bindings = TextureBindings::new();
         for (index, image) in scene.external_images.iter().enumerate() {
             bindings.insert(vello_common::TextureId(index as u64), image.view.clone());
@@ -355,17 +366,14 @@ impl VelloHybridRendererState {
                 &mut self.resources,
                 &self.device,
                 &self.queue,
-                &mut encoder,
+                encoder,
                 &render_size,
                 texture_view,
                 None,
                 &bindings,
                 vello_gpu::TargetInit::Clear(vello_gpu::ClearSettings::default()),
             )
-            .map_err(Error::Render)?;
-
-        self.queue.submit([encoder.finish()]);
-        Ok(())
+            .map_err(Error::Render)
     }
 }
 
@@ -442,6 +450,30 @@ impl VelloHybridRenderer {
     ) -> Result<(), Error> {
         self.state
             .render_to_view(scene, texture_view, width, height)
+    }
+
+    /// Encode a native scene into a caller-owned command encoder.
+    ///
+    /// The encoder and target must belong to this renderer's device. Submit the
+    /// finished encoder on this renderer's queue to execute the rendering. This
+    /// method does not finish or submit the encoder; it may enqueue resource
+    /// uploads on the queue. The target must support `RENDER_ATTACHMENT` usage.
+    /// Submit this encoder before rendering again or resetting this renderer,
+    /// because later work may reuse its intermediate resources.
+    ///
+    /// Use this to bracket rendering with timestamp queries, combine rendering
+    /// and a final blit in one submission, or control submission boundaries.
+    /// On error, discard the encoder: it may contain partially encoded work.
+    pub fn encode_to_texture_view(
+        &mut self,
+        scene: &VelloHybridScene,
+        texture_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), Error> {
+        self.state
+            .encode_to_view(scene, texture_view, width, height, encoder)
     }
 
     fn ensure_target(&mut self, width: u16, height: u16) -> &OffscreenTarget {
@@ -771,8 +803,8 @@ mod tests {
             image.data.len(),
             usize::try_from(image.width).unwrap() * usize::try_from(image.height).unwrap() * 4
         );
-        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
-            assert_eq!(pixel, expected, "pixel {index} did not match");
+        for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*pixel, expected, "pixel {index} did not match");
         }
     }
 
@@ -916,7 +948,12 @@ mod tests {
         let clipped = renderer.encode_scene(&clipped, 4, 2).unwrap();
         let mut pixels = renderer.render(&clipped, 4, 2).unwrap().data;
         // Straight-alpha RGB is unspecified for completely transparent samples.
-        for pixel in pixels.chunks_exact_mut(4).filter(|pixel| pixel[3] == 0) {
+        for pixel in pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .filter(|pixel| pixel[3] == 0)
+        {
             pixel[..3].fill(0);
         }
         assert_eq!(
@@ -1170,7 +1207,12 @@ mod tests {
             }
             let image = renderer.render(&scene, 64, 64).unwrap();
             assert!(
-                image.data.chunks_exact(4).any(|pixel| pixel[3] > 0),
+                image
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0),
                 "standalone glyphs must produce visible pixels for {style:?}"
             );
         }
@@ -1283,6 +1325,51 @@ mod tests {
         renderer
             .render_to_texture_view(&native, &texture_view, 24, 24)
             .unwrap();
+
+        let mut image = RgbaImage::new(24, 24);
+        read_texture_into(&device, &queue, &texture, 24, 24, &mut image).unwrap();
+        assert_solid_rgba_image(&image, [0xd9, 0x77, 0x06, 0xff]);
+    }
+
+    #[test]
+    fn caller_owned_encoder_renders_when_submitted() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device.clone(), queue.clone());
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter
+                .fill(
+                    Rect::new(0.0, 0.0, 24.0, 24.0),
+                    Color::from_rgb8(0xd9, 0x77, 0x06),
+                )
+                .draw();
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_vello_hybrid target"),
+            size: Extent3d {
+                width: 24,
+                height: 24,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let native = renderer.encode_scene(&scene, 24, 24).unwrap();
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        renderer
+            .encode_to_texture_view(&native, &texture_view, 24, 24, &mut encoder)
+            .unwrap();
+        queue.submit([encoder.finish()]);
 
         let mut image = RgbaImage::new(24, 24);
         read_texture_into(&device, &queue, &texture, 24, 24, &mut image).unwrap();

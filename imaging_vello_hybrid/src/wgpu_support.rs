@@ -169,7 +169,7 @@ pub(crate) fn unpremultiply_rgba8_in_place(bytes: &mut [u8]) {
         "RGBA8 buffers should have a whole number of pixels"
     );
 
-    for rgba in bytes.chunks_exact_mut(4) {
+    for rgba in bytes.as_chunks_mut::<4>().0 {
         let alpha = rgba[3];
         if alpha == 0 || alpha == 255 {
             continue;
