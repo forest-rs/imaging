@@ -16,10 +16,12 @@
 //! anisotropic or sheared blur kernel return [`Error::UnsupportedFilter`].
 
 #![deny(unsafe_code)]
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
