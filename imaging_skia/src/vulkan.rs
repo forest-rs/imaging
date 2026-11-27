@@ -31,13 +31,19 @@ impl VulkanBackend {
                 .ok_or(Error::CreateGpuContext("missing Vulkan queue"))?
         };
 
+        // wgpu-hal 30 requests at most Vulkan 1.3 in VkApplicationInfo.
+        // Its instance_api_version() reports the loader's version, which can be higher.
+        let max_api_version = device
+            .shared_instance()
+            .instance_api_version()
+            .min(ash::vk::API_VERSION_1_3);
         let context = create_gr_context(
             device.shared_instance().raw_instance().handle(),
             device.raw_physical_device(),
             device.raw_device().handle(),
             queue.as_raw(),
             device.queue_family_index(),
-            device.shared_instance().instance_api_version(),
+            max_api_version,
             |gpo| unsafe {
                 let get_device_proc_addr = device
                     .shared_instance()
@@ -129,7 +135,7 @@ fn create_gr_context(
     device: ash::vk::Device,
     queue: ash::vk::Queue,
     queue_family_index: u32,
-    instance_api_version: u32,
+    max_api_version: u32,
     get_proc: impl Fn(sk::gpu::vk::GetProcOf) -> sk::gpu::vk::GetProcResult,
 ) -> Result<sk::gpu::DirectContext, Error> {
     let backend_context = unsafe {
@@ -139,7 +145,7 @@ fn create_gr_context(
             device.as_raw() as _,
             (queue.as_raw() as _, queue_family_index as usize),
             &get_proc,
-            Some(instance_api_version.into()),
+            Some(max_api_version.into()),
         )
         .build()
     };
