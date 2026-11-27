@@ -683,8 +683,8 @@ mod tests {
             image.data.len(),
             usize::try_from(image.width).unwrap() * usize::try_from(image.height).unwrap() * 4
         );
-        for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
-            assert_eq!(*pixel, expected, "pixel {index} did not match");
+        for (index, pixel) in image.data.chunks_exact(expected.len()).enumerate() {
+            assert_eq!(pixel, expected, "pixel {index} did not match");
         }
     }
 
@@ -798,12 +798,8 @@ mod tests {
         let clipped = renderer.encode_scene(&clipped, 4, 2).unwrap();
         let mut pixels = renderer.render(&clipped, 4, 2).unwrap().data;
         // Straight-alpha RGB is unspecified for completely transparent samples.
-        for pixel in pixels
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .filter(|pixel| pixel[3] == 0)
-        {
+        let (rgba, _) = pixels.as_chunks_mut::<4>();
+        for pixel in rgba.iter_mut().filter(|pixel| pixel[3] == 0) {
             pixel[..3].fill(0);
         }
         assert_eq!(
@@ -1225,14 +1221,8 @@ mod tests {
                     );
                 let native = renderer.encode_scene(&scene, 64, 64).unwrap();
                 let image = renderer.render(&native, 64, 64).unwrap();
-                let alpha = image
-                    .data
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|pixel| pixel[3])
-                    .max()
-                    .unwrap();
+                let (pixels, _) = image.data.as_chunks::<4>();
+                let alpha = pixels.iter().map(|pixel| pixel[3]).max().unwrap();
                 assert!(
                     (127..=128).contains(&alpha),
                     "{brush:?}/{style:?}: maximum alpha was {alpha}"

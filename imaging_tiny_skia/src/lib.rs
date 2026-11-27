@@ -447,11 +447,11 @@ fn cache_glyph_miss(
                 let pixels = pixmap.pixels_mut();
                 for (row_idx, row) in image.data.chunks_exact(width * 4).enumerate() {
                     let dst_row = (row_idx + pad_usize) * padded_width + pad_usize;
-                    for (col_idx, b) in row.as_chunks::<4>().0.iter().enumerate() {
-                        pixels[dst_row + col_idx] =
-                            tiny_skia::Color::from_rgba8(b[0], b[1], b[2], b[3])
-                                .premultiply()
-                                .to_color_u8();
+                    let (src_pixels, _) = row.as_chunks::<4>();
+                    for (col_idx, &[r, g, b, a]) in src_pixels.iter().enumerate() {
+                        pixels[dst_row + col_idx] = tiny_skia::Color::from_rgba8(r, g, b, a)
+                            .premultiply()
+                            .to_color_u8();
                     }
                 }
             }
@@ -3994,7 +3994,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
 
     fn finish_direct_rgba8_opaque(&mut self) -> Option<()> {
         self.finalize_frame();
-        for pixel in self.layers[0].pixmap.data_mut().as_chunks_mut::<4>().0 {
+        let (pixels, _) = self.layers[0].pixmap.data_mut().as_chunks_mut::<4>();
+        for pixel in pixels {
             pixel[3] = 0xff;
         }
         Some(())
@@ -4044,12 +4045,9 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             .chunks_exact(width * 4)
             .zip(dst.chunks_exact_mut(bytes_per_row))
         {
-            for (src, out) in src_row
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst_row[..width * 4].as_chunks_mut::<4>().0)
-            {
+            let (src_pixels, _) = src_row.as_chunks::<4>();
+            let (dst_pixels, _) = dst_row[..width * 4].as_chunks_mut::<4>();
+            for (src, out) in src_pixels.iter().zip(dst_pixels) {
                 let alpha = src[3];
                 let red = unpremultiply_channel(src[0], alpha);
                 let green = unpremultiply_channel(src[1], alpha);
@@ -4130,13 +4128,10 @@ fn realize_image_pixmap(image: &ImageData) -> Option<Pixmap> {
         return None;
     }
     let mut pixmap = Pixmap::new(image.width, image.height)?;
-    for (pixel, bytes) in pixmap
-        .pixels_mut()
-        .iter_mut()
-        .zip(image.data.data().as_chunks::<4>().0)
-    {
+    let (src_pixels, _) = image.data.data().as_chunks::<4>();
+    for (pixel, &bytes) in pixmap.pixels_mut().iter_mut().zip(src_pixels) {
         let [r, g, b, a] = match image.format {
-            peniko::ImageFormat::Rgba8 => [bytes[0], bytes[1], bytes[2], bytes[3]],
+            peniko::ImageFormat::Rgba8 => bytes,
             peniko::ImageFormat::Bgra8 => [bytes[2], bytes[1], bytes[0], bytes[3]],
             _ => return None,
         };
@@ -5015,19 +5010,10 @@ fn apply_alpha_mask_from_pixmap(target: &mut Pixmap, mask_source: PixmapRef<'_>)
 }
 
 fn coverage_from_mask_pixmap(pixmap: &Pixmap, mode: MaskMode) -> Arc<[u8]> {
+    let (pixels, _) = pixmap.data().as_chunks::<4>();
     match mode {
-        MaskMode::Alpha => pixmap
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|px| px[3])
-            .collect::<Vec<_>>()
-            .into(),
-        MaskMode::Luminance => pixmap
-            .data()
-            .as_chunks::<4>()
-            .0
+        MaskMode::Alpha => pixels.iter().map(|px| px[3]).collect::<Vec<_>>().into(),
+        MaskMode::Luminance => pixels
             .iter()
             .map(|px| {
                 let coverage =
@@ -5077,12 +5063,8 @@ fn apply_group_mask_to_pixmap(target: &mut Pixmap, group_mask: &GroupMask) {
         let mask_row = y * mask_width;
         let target_row_bytes = &mut target_bytes[target_row..target_row + width * 4];
         let mask_row_bytes = &mask_source[mask_row..mask_row + width];
-        for (pixel, &coverage) in target_row_bytes
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(mask_row_bytes.iter())
-        {
+        let (pixels, _) = target_row_bytes.as_chunks_mut::<4>();
+        for (pixel, &coverage) in pixels.iter_mut().zip(mask_row_bytes) {
             if coverage == 255 {
                 continue;
             }
@@ -5727,13 +5709,12 @@ mod tests {
                 |p| p.fill_rect(Rect::new(-4.0, -4.0, 20.0, 20.0), Color::BLACK),
             );
             let image = renderer.render_source(&mut &scene, 16, 16).unwrap();
+            let expected = [0, 0, 0, 255];
             assert!(
                 image
                     .data
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .all(|pixel| *pixel == [0, 0, 0, 255]),
+                    .chunks_exact(expected.len())
+                    .all(|pixel| pixel == expected),
                 "cropping must preserve source placement for {blend:?}"
             );
         }

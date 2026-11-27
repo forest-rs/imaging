@@ -569,7 +569,8 @@ fn f64_to_f32(v: f64) -> f32 {
 }
 
 fn unpremultiply_rgba8_in_place(bytes: &mut [u8]) {
-    for rgba in bytes.as_chunks_mut::<4>().0 {
+    let (pixels, _) = bytes.as_chunks_mut::<4>();
+    for rgba in pixels {
         let alpha = rgba[3];
         if alpha == 0 || alpha == u8::MAX {
             continue;
