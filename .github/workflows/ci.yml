@@ -188,6 +188,18 @@ jobs:
       - name: cargo clippy (no_std)
         run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --exclude-all-features --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none -- -D warnings
 
+      - name: check Vello graphics backend features
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for package in imaging_vello imaging_vello_hybrid; do
+            features=$(cargo tree --locked --package "$package" --edges normal,build --invert wgpu --depth 0 --format '{f}')
+            if [[ ",$features," =~ ,(angle|custom|default|drm|dx12|gles|metal|noop|vulkan|vulkan-portability|webgl|webgpu), ]]; then
+              echo "Unexpected wgpu features for $package ($features)"
+              exit 1
+            fi
+          done
+
       - name: cargo clippy
         run: cargo hack clippy --workspace --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std -- -D warnings
 

@@ -1153,7 +1153,7 @@ dependencies = [
  "pollster",
  "skrifa 0.49.0",
  "svg_imaging",
- "vello_gpu",
+ "wgpu",
 ]
 
 [[package]]
@@ -1181,6 +1181,7 @@ dependencies = [
  "peniko",
  "pollster",
  "vello",
+ "wgpu",
 ]
 
 [[package]]

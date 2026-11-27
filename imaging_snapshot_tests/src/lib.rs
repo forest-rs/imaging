@@ -23,10 +23,10 @@ use imaging_tiny_skia as _;
 #[cfg(feature = "vello_hybrid")]
 use imaging_vello_hybrid as _;
 
-#[cfg(feature = "vello_hybrid")]
-use vello_gpu as _;
-
 #[cfg(feature = "vello")]
 use imaging_vello as _;
+
+#[cfg(any(feature = "vello", feature = "vello_hybrid"))]
+use wgpu as _;
 
 pub mod cases;

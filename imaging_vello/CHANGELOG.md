@@ -13,6 +13,11 @@ The latest published `imaging_vello` release is [0.0.2](#002-2026-05-30), which 
 
 ## [Unreleased]
 
+### Changed
+
+- Applications select graphics backends through their `wgpu` 30 dependency. Add `wgpu = "30.0.2"`
+  to keep using the default backends.
+
 ## [0.0.2][] (2026-05-30)
 
 This release has an [MSRV][] of 1.92.
