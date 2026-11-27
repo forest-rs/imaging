@@ -38,7 +38,7 @@ impl SvgDocument {
         Self { tree }
     }
 
-    /// Parse an SVG document from raw bytes.
+    /// Parse an SVG or gzip-compressed SVGZ document from bytes.
     pub fn from_data(data: &[u8], options: &ParseOptions<'_>) -> Result<Self, Error> {
         Ok(Self {
             tree: usvg::Tree::from_data(data, options)?,
@@ -166,6 +166,17 @@ mod tests {
             &ParseOptions::default(),
         )
         .expect("parse SVG");
+
+        assert_eq!(document.size(), kurbo::Size::new(12.0, 34.0));
+    }
+
+    #[test]
+    fn parses_compressed_svg() {
+        let document = SvgDocument::from_data(
+            include_bytes!("../tests/fixtures/size.svgz"),
+            &ParseOptions::default(),
+        )
+        .expect("parse SVGZ");
 
         assert_eq!(document.size(), kurbo::Size::new(12.0, 34.0));
     }
