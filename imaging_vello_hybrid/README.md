@@ -34,7 +34,7 @@ In UI integrations, the host application should usually own the `wgpu` device, q
 presentation targets, then pass those handles into [`VelloHybridRenderer`].
 
 Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
-and translated to backend-managed opaque image ids. Encoded scenes retain these uploads
+and bound as sampled textures. Encoded scenes retain these uploads
 until reset or dropped. Use [`VelloHybridSceneSink::with_renderer`]
 when recording directly into a native [`VelloHybridScene`] and you want the same image
 support.
@@ -42,14 +42,21 @@ support.
 Alpha masks render the mask scene into an isolated `DestIn` layer, preserving its paint,
 blending, and image bindings. Luminance masks remain unsupported by this backend.
 
-Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
-X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
-or sheared blur kernel return [`Error::UnsupportedFilter`].
+Filter chains use nested single-primitive layers. Gaussian blurs support independent
+X/Y standard deviations in destination coordinates. Drop shadows require equal
+deviations. Filters that require a non-axis-aligned blur kernel return
+[`Error::UnsupportedFilter`].
 Blurred rounded rectangles use the renderer's native analytic draw.
 
-Synthetic emboldening uses glifo's native outline expansion. In glifo 0.4,
-unhinted fills expand in font units rather than font-size pixels, and absorbed
-transform scales do not scale the expansion amount.
+Synthetic emboldening expands the outline by the requested amount in font-size
+pixels before the glyph and run transforms are applied.
+
+# Migrating to Vello GPU 0.4
+
+When rendering into a caller-provided texture view, pass the full texture width and
+height and use a view of mip level zero. A size mismatch returns
+[`Error::InvalidTargetDimensions`]. [`VelloHybridRenderer`] supplies the texture bindings
+for encoded images when rendering a [`VelloHybridScene`].
 
 # Render A Recorded Scene
 

@@ -32,7 +32,7 @@ Semantic [`imaging::record::Scene`] values can be lowered to native Vello scenes
 In UI integrations, the host application should usually own the `wgpu` device, queue, and
 presentation targets, then pass those handles into [`VelloRenderer`].
 
-This crate uses Vello 0.11 with `wgpu` 30.
+This crate uses Vello 0.12 with `wgpu` 30.
 
 # Render A Recorded Scene
 

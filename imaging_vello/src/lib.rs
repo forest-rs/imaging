@@ -12,7 +12,7 @@
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
 //! presentation targets, then pass those handles into [`VelloRenderer`].
 //!
-//! This crate uses Vello 0.11 with `wgpu` 30.
+//! This crate uses Vello 0.12 with `wgpu` 30.
 //!
 //! # Render A Recorded Scene
 //!
@@ -243,7 +243,7 @@ impl VelloRendererState {
         })
     }
 
-    /// Lower a semantic [`imaging::record::Scene`] into a encoded [`VelloScene`].
+    /// Lower a semantic [`imaging::record::Scene`] into an encoded [`VelloScene`].
     fn encode_scene(&self, scene: &Scene, width: u32, height: u32) -> Result<VelloScene, Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         let mut native = VelloScene::new();
@@ -337,7 +337,7 @@ impl VelloRenderer {
         })
     }
 
-    /// Lower a semantic [`imaging::record::Scene`] into a encoded [`VelloScene`].
+    /// Lower a semantic [`imaging::record::Scene`] into an encoded [`VelloScene`].
     pub fn encode_scene(
         &self,
         scene: &Scene,
@@ -356,7 +356,7 @@ impl VelloRenderer {
         self.state.encode_source(source, width, height)
     }
 
-    /// Render a encoded [`VelloScene`] into a caller-provided texture view.
+    /// Render an encoded [`VelloScene`] into a caller-provided texture view.
     pub fn render_to_texture_view(
         &mut self,
         scene: &VelloScene,
@@ -434,7 +434,7 @@ impl TextureRenderer for VelloRenderer {
 }
 
 impl VelloRenderer {
-    /// Render a encoded [`VelloScene`] into an RGBA8 image (unpremultiplied).
+    /// Render an encoded [`VelloScene`] into an RGBA8 image (unpremultiplied).
     pub fn render_into(
         &mut self,
         scene: &VelloScene,
@@ -458,7 +458,7 @@ impl VelloRenderer {
         )
     }
 
-    /// Render a encoded [`VelloScene`] and return an RGBA8 image (unpremultiplied).
+    /// Render an encoded [`VelloScene`] and return an RGBA8 image (unpremultiplied).
     pub fn render(
         &mut self,
         scene: &VelloScene,

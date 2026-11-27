@@ -15,7 +15,7 @@ imaging = { features = ["std"], workspace = true }
 imaging_wgpu = { default-features = false, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
-vello = "0.11.0"
+vello = "0.12.0"
 
 [dev-dependencies]
 pollster = "0.4.0"

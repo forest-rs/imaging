@@ -223,7 +223,7 @@ fn brush_and_opacity(renderer: &mut dyn ImageRenderer) {
 }
 
 macro_rules! backend_tests {
-    ($backend:ident, $renderer:expr $(, $limitation:literal)?) => {
+    ($backend:ident, $renderer:expr) => {
         mod $backend {
             use super::*;
             fn check(contract: fn(&mut dyn ImageRenderer)) {
@@ -233,18 +233,18 @@ macro_rules! backend_tests {
                 }
             }
             #[test]
-            fn brush_and_opacity() { check(super::brush_and_opacity); }
+            fn brush_and_opacity() {
+                check(super::brush_and_opacity);
+            }
             #[test]
             fn hinted_axes() {
                 check(|renderer| super::independent_axes(renderer, true));
             }
             #[test]
-            $(#[ignore = $limitation])?
             fn unhinted_axes() {
                 check(|renderer| super::independent_axes(renderer, false));
             }
             #[test]
-            $(#[ignore = $limitation])?
             fn transformed_expansion() {
                 check(super::transformed_expansion);
             }
@@ -260,8 +260,7 @@ backend_tests!(
 #[cfg(feature = "vello_cpu")]
 backend_tests!(
     vello_cpu,
-    Some(Box::new(imaging_vello_cpu::VelloCpuRenderer::new(128, 128))),
-    "glifo 0.4 applies embolden in cache units without correcting font or absorbed transform scales"
+    Some(Box::new(imaging_vello_cpu::VelloCpuRenderer::new(128, 128)))
 );
 #[cfg(feature = "skia")]
 backend_tests!(skia, Some(Box::new(imaging_skia::SkiaCpuRenderer::new())));
@@ -308,6 +307,5 @@ backend_tests!(
         Box::new(imaging_vello_hybrid::VelloHybridRenderer::new(
             device, queue,
         )) as Box<dyn ImageRenderer>
-    }),
-    "glifo 0.4 applies embolden in cache units without correcting font or absorbed transform scales"
+    })
 );

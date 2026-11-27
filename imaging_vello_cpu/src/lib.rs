@@ -6,13 +6,13 @@
 //! This crate provides a CPU renderer that consumes `imaging::record::Scene` (or accepts commands
 //! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 //!
-//! Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
-//! X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
-//! or sheared blur kernel return [`Error::UnsupportedFilter`].
+//! Filter chains use nested single-primitive layers. Gaussian blurs support independent
+//! X/Y standard deviations in destination coordinates. Drop shadows require equal
+//! deviations. Filters that require a non-axis-aligned blur kernel return
+//! [`Error::UnsupportedFilter`].
 //!
-//! Synthetic emboldening uses glifo's native outline expansion. In glifo 0.4,
-//! unhinted fills expand in font units rather than font-size pixels, and absorbed
-//! transform scales do not scale the expansion amount.
+//! Synthetic emboldening expands the outline by the requested amount in font-size
+//! pixels before the glyph and run transforms are applied.
 //!
 //! # Render A Recorded Scene
 //!
@@ -375,8 +375,6 @@ impl VelloCpuRenderer {
             })
             .collect::<Vec<_>>();
 
-        // TODO: glifo must scale embolden amounts with cached outline size and
-        // absorbed transforms upstream. Keep native behavior until that is fixed.
         let result = match glyph_run.style {
             Style::Fill(fill_rule) => {
                 self.ctx.set_fill_rule(*fill_rule);
@@ -431,7 +429,6 @@ impl VelloCpuRenderer {
             &draw.rect,
             f64_to_f32(draw.radius),
             f64_to_f32(draw.std_dev),
-            false,
         );
     }
 
@@ -608,11 +605,12 @@ fn filter_to_vello(filter: Filter) -> Result<VelloFilter, Error> {
         } => {
             let (sigma_x, sigma_y) = (std_deviation_x as f32, std_deviation_y as f32);
             // Native blur planning computes its variance in f32.
-            if sigma_x != sigma_y || !(sigma_x * sigma_x).is_finite() {
+            if !(sigma_x * sigma_x).is_finite() || !(sigma_y * sigma_y).is_finite() {
                 return Err(Error::UnsupportedFilter);
             }
             FilterPrimitive::GaussianBlur {
-                std_deviation: sigma_x,
+                std_deviation_x: sigma_x,
+                std_deviation_y: sigma_y,
                 edge_mode: EdgeMode::None,
             }
         }
@@ -1062,12 +1060,49 @@ mod tests {
         ));
     }
     #[test]
-    fn anisotropic_group_filters_return_unsupported_without_panicking() {
+    fn one_axis_gaussian_blur_renders_in_device_space() {
+        let mut renderer = VelloCpuRenderer::new(64, 64);
+        for (filter_transform, blurred, sharp) in [
+            (Affine::IDENTITY, (21, 32), (32, 21)),
+            (
+                Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+                (32, 21),
+                (21, 32),
+            ),
+        ] {
+            let mut scene = Scene::new();
+            Painter::new(&mut scene).with_group(
+                GroupRef::new()
+                    .with_filters(&[Filter::blur_xy(4.0, 0.0)])
+                    .with_filter_transform(filter_transform),
+                |p| p.fill_rect(Rect::new(24.0, 24.0, 40.0, 40.0), Color::WHITE),
+            );
+            let image = renderer.render_scene(&scene, 64, 64).unwrap();
+            let alpha = |(x, y): (usize, usize)| image.data[(y * 64 + x) * 4 + 3];
+            assert!(
+                alpha(blurred) > 0,
+                "the blurred axis must extend past the source"
+            );
+            assert_eq!(alpha(sharp), 0, "the other axis must remain sharp");
+        }
+    }
+
+    #[test]
+    fn unsupported_group_filters_do_not_poison_the_next_frame() {
         let mut renderer = VelloCpuRenderer::new(32, 32);
         for (filter, filter_transform) in [
-            (Filter::blur_xy(2.0, 1.0), Affine::IDENTITY),
-            (Filter::blur(1.0), Affine::scale_non_uniform(2.0, 1.0)),
             (Filter::blur(1.0), Affine::skew(0.5, 0.0)),
+            (Filter::blur_xy(1.0, f64::from(f32::MAX)), Affine::IDENTITY),
+            (
+                Filter::DropShadow {
+                    dx: 0.0,
+                    dy: 0.0,
+                    std_deviation_x: 2.0,
+                    std_deviation_y: 1.0,
+                    color: Color::BLACK,
+                },
+                Affine::IDENTITY,
+            ),
             (Filter::offset(f64::from(f32::MAX), 0.0), Affine::scale(2.0)),
         ] {
             let mut scene = Scene::new();
