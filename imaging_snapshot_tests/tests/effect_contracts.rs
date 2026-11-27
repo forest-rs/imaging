@@ -31,8 +31,10 @@ fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
     assert!(
         image
             .data
-            .chunks_exact(4)
-            .all(|pixel| pixel == [255, 0, 0, 255]),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [255, 0, 0, 255]),
         "default groups must isolate child blending from the parent backdrop: {:?}",
         &image.data[..4]
     );
@@ -98,7 +100,7 @@ fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
     );
     let image = renderer.render_source(&mut &text, 16, 8).unwrap();
     let mut painted = 0;
-    for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+    for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
         if pixel[3] < 32 {
             continue;
         }
@@ -227,7 +229,12 @@ fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
     );
     let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
     assert!(
-        image.data.chunks_exact(4).all(|pixel| pixel[3] == 0),
+        image
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 0),
         "an empty mask must clear the entire group"
     );
 }
@@ -289,7 +296,12 @@ fn check_filter_contract(renderer: &mut dyn ImageRenderer) {
     );
     let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
     assert!(
-        image.data.chunks_exact(4).all(|pixel| pixel[3] == 0),
+        image
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 0),
         "filters must run before masks: the offset moves all content outside the mask"
     );
 
@@ -341,9 +353,9 @@ fn check_filter_contract(renderer: &mut dyn ImageRenderer) {
         |_| {},
     );
     let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
-    for pixel in image.data.chunks_exact(4) {
+    for pixel in image.data.as_chunks::<4>().0 {
         assert_eq!(
-            pixel,
+            *pixel,
             [255, 0, 0, 128],
             "flood must not depend on source draw bounds"
         );
@@ -359,8 +371,8 @@ fn check_filter_contract(renderer: &mut dyn ImageRenderer) {
         |_| {},
     );
     let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
-    for pixel in image.data.chunks_exact(4) {
-        assert_eq!(pixel, [0, 0, 255, 128], "filters must run in slice order");
+    for pixel in image.data.as_chunks::<4>().0 {
+        assert_eq!(*pixel, [0, 0, 255, 128], "filters must run in slice order");
     }
 }
 
@@ -390,7 +402,7 @@ fn check_filter_coordinates(renderer: &mut dyn ImageRenderer) {
         let mut scene = Scene::new();
         imaging::record::replay_transformed(&source, &mut scene, Affine::scale(2.0));
         let image = renderer.render_source(&mut &scene, 16, 8).unwrap();
-        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+        for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
             let expected = if (4..8).contains(&(index % 16)) {
                 255
             } else {
