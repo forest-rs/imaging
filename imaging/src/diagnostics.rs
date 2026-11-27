@@ -40,17 +40,17 @@ pub enum DiagnosticLevel {
 /// Kind of diagnostic reported by [`DiagnosingSink`] or [`Scene::diagnose`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DiagnosticKind {
-    /// A context scope contains no draw commands.
+    /// A context scope contains no draws or filters that can generate pixels.
     EmptyContext,
-    /// A clip scope contains no draw commands.
+    /// A clip scope contains no draws or filters that can generate pixels.
     EmptyClip,
-    /// An isolated group contains no draw commands.
+    /// An isolated group contains no draws or filters that can generate pixels.
     EmptyGroup,
     /// A draw is fully transparent and will not contribute visible output.
     TransparentDraw,
     /// An isolated group has no clip, no mask, no filters, and default compositing.
     IdentityGroup,
-    /// A group references a retained mask scene that draws nothing.
+    /// A group references a retained mask with no draws or filters that can generate pixels.
     EmptyMaskScene,
     /// A path-backed clip or draw contains no path elements.
     EmptyPath,

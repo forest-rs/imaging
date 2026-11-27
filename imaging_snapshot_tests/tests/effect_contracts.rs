@@ -12,12 +12,11 @@
 ))]
 
 use imaging::{
-    Composite, GroupRef, ImageRenderer, ImageRendererError, MaskMode, MaskRef, Painter,
+    Composite, GroupRef, ImageRenderer, MaskMode, MaskRef, Painter,
     filter::{
         FilterColorSpace, FilterGraph, FilterId, FilterInput, FilterPrimitive, FilterPrimitiveKind,
     },
     record::Scene,
-    render::RenderUnsupportedError,
 };
 use kurbo::{Affine, Rect};
 use peniko::{Blob, Color, Compose, ImageAlphaType, ImageData, ImageFormat};
@@ -60,8 +59,8 @@ fn check_filter_graph_rejection(renderer: &mut dyn ImageRenderer) {
         assert!(
             matches!(
                 renderer.render_source(&mut &scene, 16, 8),
-                Err(ImageRendererError::Unsupported(
-                    RenderUnsupportedError::Filter
+                Err(imaging::ImageRendererError::Unsupported(
+                    imaging::render::RenderUnsupportedError::Filter
                 ))
             ),
             "filter graph requires an explicit capability error"
