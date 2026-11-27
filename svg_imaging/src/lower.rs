@@ -6,8 +6,8 @@
 use alloc::{vec, vec::Vec};
 use hashbrown::HashMap;
 
-use imaging::MaskMode;
-use kurbo::{Affine, BezPath, Cap, Join, Point, Shape as _, Stroke};
+use imaging::{Filter, MaskMode};
+use kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Shape as _, Stroke};
 use peniko::{
     BlendMode, Blob, Brush, ColorStop, Compose, Extend, Fill, Gradient, ImageAlphaType, ImageBrush,
     ImageData, ImageFormat, ImageQuality, Mix,
@@ -18,8 +18,8 @@ use crate::{
     RenderOptions,
     diagnostics::{RenderReport, UnsupportedFeatureKind},
     plan::{
-        PlanAppliedMask, PlanClip, PlanFill, PlanGroup, PlanImage, PlanMask, PlanMaskId, PlanNode,
-        PlanStroke,
+        PlanAppliedMask, PlanClip, PlanFill, PlanFilterChain, PlanFilterStep, PlanGroup, PlanImage,
+        PlanMask, PlanMaskId, PlanNode, PlanStroke,
     },
 };
 
@@ -45,10 +45,11 @@ struct LowerCx {
 
 impl LowerCx {
     fn lower_group(&mut self, group: &usvg::Group, root_transform: Affine) -> Vec<PlanNode> {
-        if !group.filters().is_empty() {
+        let transform = root_transform * convert_transform(group.abs_transform());
+        let filters = lower_filters(group);
+        if filters.is_none() && !group.filters().is_empty() {
             self.unsupported(UnsupportedFeatureKind::Filter, group.id());
         }
-        let transform = root_transform * convert_transform(group.abs_transform());
         let clips = group
             .clip_path()
             .and_then(|clip_path| self.lower_clip_path_chain(clip_path, transform, group.id()))
@@ -61,6 +62,13 @@ impl LowerCx {
         let mut children = Vec::new();
         for child in group.children() {
             children.extend(self.lower_node(child, root_transform));
+        }
+        if let Some(chain) = filters {
+            children = vec![PlanNode::Filtered {
+                chain,
+                transform,
+                children,
+            }];
         }
 
         let composite =
@@ -178,7 +186,7 @@ impl LowerCx {
         node_id: &str,
     ) -> Option<(Brush, Option<Affine>)> {
         match paint {
-            usvg::Paint::Color(color) => Some((convert_color(*color, opacity), None)),
+            usvg::Paint::Color(color) => Some((Brush::Solid(convert_color(*color, opacity)), None)),
             usvg::Paint::LinearGradient(gradient) => Some((
                 Brush::Gradient(convert_linear_gradient(gradient).multiply_alpha(opacity)),
                 affine_if_non_identity(gradient.transform()),
@@ -298,15 +306,8 @@ impl LowerCx {
     }
 
     fn lower_mask_region(mask: &usvg::Mask) -> PlanClip {
-        let rect = mask.rect().to_rect();
-        let rect = kurbo::Rect::new(
-            f64::from(rect.left()),
-            f64::from(rect.top()),
-            f64::from(rect.right()),
-            f64::from(rect.bottom()),
-        );
         PlanClip::Path {
-            path: rect.to_path(0.1),
+            path: convert_rect(mask.rect()).to_path(0.1),
             fill_rule: Fill::NonZero,
         }
     }
@@ -416,6 +417,88 @@ impl LowerCx {
     }
 }
 
+fn lower_filters(group: &usvg::Group) -> Option<PlanFilterChain> {
+    let filters = group.filters();
+    let source_region = convert_rect(filters.first()?.rect());
+    let mut steps: Vec<PlanFilterStep> = Vec::new();
+    for filter in filters {
+        let region = convert_rect(filter.rect());
+        // This filter sees the previous filter's output as SourceGraphic, cropped
+        // to the new filter region. Its named results start fresh.
+        if let Some(step) = steps.last_mut() {
+            step.output_region = step.output_region.intersect(region);
+        }
+        let mut previous = None;
+        let mut output_region = region;
+        for primitive in filter.primitives() {
+            let (effect, input) = lower_filter_primitive(primitive)?;
+            match (input, previous) {
+                (None, _) | (Some(usvg::filter::Input::SourceGraphic), None) => {}
+                (Some(usvg::filter::Input::Reference(name)), Some(result)) if name == result => {}
+                _ => return None,
+            }
+            // As in AnyRender and resvg, an offset inherits its input's subregion.
+            if !matches!(effect, Filter::Offset { .. }) {
+                output_region = region.intersect(convert_rect(primitive.rect()));
+            }
+            steps.push(PlanFilterStep {
+                effect,
+                output_region,
+            });
+            previous = Some(primitive.result());
+        }
+    }
+    Some(PlanFilterChain {
+        source_region,
+        steps,
+    })
+}
+
+fn lower_filter_primitive(
+    primitive: &usvg::filter::Primitive,
+) -> Option<(Filter, Option<&usvg::filter::Input>)> {
+    use usvg::filter::{ColorInterpolation, Kind};
+
+    let srgb = primitive.color_interpolation() == ColorInterpolation::SRGB;
+    Some(match primitive.kind() {
+        Kind::Flood(fe) => (
+            Filter::flood(convert_color(fe.color(), fe.opacity().get())),
+            None,
+        ),
+        Kind::Offset(fe) if fe.dx().is_finite() && fe.dy().is_finite() => (
+            Filter::offset(f64::from(fe.dx()), f64::from(fe.dy())),
+            Some(fe.input()),
+        ),
+        Kind::GaussianBlur(fe) if srgb => (
+            Filter::blur_xy(
+                f64::from(fe.std_dev_x().get()),
+                f64::from(fe.std_dev_y().get()),
+            ),
+            Some(fe.input()),
+        ),
+        Kind::DropShadow(fe) if srgb && fe.dx().is_finite() && fe.dy().is_finite() => (
+            Filter::DropShadow {
+                dx: f64::from(fe.dx()),
+                dy: f64::from(fe.dy()),
+                std_deviation_x: f64::from(fe.std_dev_x().get()),
+                std_deviation_y: f64::from(fe.std_dev_y().get()),
+                color: convert_color(fe.color(), fe.opacity().get()),
+            },
+            Some(fe.input()),
+        ),
+        _ => return None,
+    })
+}
+
+fn convert_rect(rect: usvg::NonZeroRect) -> Rect {
+    Rect::new(
+        f64::from(rect.left()),
+        f64::from(rect.top()),
+        f64::from(rect.right()),
+        f64::from(rect.bottom()),
+    )
+}
+
 fn convert_path(path: &usvg::tiny_skia_path::Path) -> BezPath {
     let mut bez = BezPath::new();
     for segment in path.segments() {
@@ -467,14 +550,9 @@ fn lower_mask_mode(kind: usvg::MaskType) -> MaskMode {
     }
 }
 
-fn convert_color(color: usvg::Color, opacity: f32) -> Brush {
+fn convert_color(color: usvg::Color, opacity: f32) -> peniko::Color {
     let alpha = opacity_to_u8(opacity);
-    Brush::Solid(peniko::Color::from_rgba8(
-        color.red,
-        color.green,
-        color.blue,
-        alpha,
-    ))
+    peniko::Color::from_rgba8(color.red, color.green, color.blue, alpha)
 }
 
 fn with_rendering_quality(image: ImageBrush, rendering_mode: usvg::ImageRendering) -> ImageBrush {

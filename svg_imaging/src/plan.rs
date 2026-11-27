@@ -5,8 +5,8 @@
 
 use alloc::vec::Vec;
 
-use imaging::{Composite, MaskMode};
-use kurbo::{Affine, BezPath, Stroke};
+use imaging::{Composite, Filter, MaskMode};
+use kurbo::{Affine, BezPath, Rect, Stroke};
 use peniko::{Brush, Fill, ImageBrush};
 
 use crate::RenderReport;
@@ -27,12 +27,33 @@ pub(crate) struct RenderPlan {
 pub(crate) enum PlanNode {
     /// Isolated group with explicit compositing.
     Group(PlanGroup),
+    /// Filtered content before its SVG clip, mask, opacity, and blend are applied.
+    Filtered {
+        chain: PlanFilterChain,
+        transform: Affine,
+        children: Vec<Self>,
+    },
     /// Filled path draw.
     Fill(PlanFill),
     /// Raster image draw.
     Image(PlanImage),
     /// Stroked path draw.
     Stroke(PlanStroke),
+}
+
+/// Ordered filters with clips between them in filter user space.
+#[derive(Clone, Debug)]
+pub(crate) struct PlanFilterChain {
+    /// Crop applied to the incoming SourceGraphic.
+    pub(crate) source_region: Rect,
+    pub(crate) steps: Vec<PlanFilterStep>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlanFilterStep {
+    pub(crate) effect: Filter,
+    /// Crop applied before passing the effect's result to the next step.
+    pub(crate) output_region: Rect,
 }
 
 /// Lowered isolated group.

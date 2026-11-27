@@ -12,7 +12,7 @@ pub enum UnsupportedFeatureKind {
     ClipPath,
     /// A mask feature could not be lowered.
     Mask,
-    /// SVG filter graphs are not lowered yet.
+    /// A filter chain uses a primitive, input, or color space that cannot be lowered.
     Filter,
     /// Raster image nodes that failed to decode.
     Image,

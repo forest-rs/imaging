@@ -13,6 +13,12 @@ The latest published `svg_imaging` release is [0.0.1](#001-2026-05-21), which wa
 
 ## [Unreleased]
 
+### Added
+
+- Lower ordered SVG filter chains of `feFlood`, `feOffset`, and sRGB `feGaussianBlur` and
+  `feDropShadow`, preserving filter regions and applying group clips, masks, and opacity
+  after filtering.
+
 ### Changed
 
 - Updated the SVG parser to `usvg` 0.50, which preserves the SVG `lighter` composite operator in parsed filter trees. Applications that pass their own `usvg::Tree` or `usvg::Options` to `SvgDocument` should update their `usvg` dependency to 0.50.
