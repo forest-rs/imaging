@@ -82,7 +82,7 @@ pub enum Error {
     InvalidTargetBuffer,
     /// This renderer cannot sample externally bound images.
     UnsupportedExternalImage,
-    /// The transformed filter kernel cannot be represented by this renderer.
+    /// The filter graph or transformed filter kernel is unsupported.
     UnsupportedFilter,
     /// An internal invariant was violated.
     Internal(&'static str),

@@ -261,3 +261,161 @@ fn light_is_valid(light: &LightSource) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use kurbo::Vec2;
+
+    use super::*;
+    use crate::filter::{EdgeMode, FilterColorSpace, FilterPrimitive};
+    use crate::{
+        GroupRef, PaintSink, Painter,
+        record::Scene,
+        validation::{ValidatingSink, ValidationError},
+    };
+
+    fn graph() -> FilterGraph {
+        let region = Rect::new(0.0, 0.0, 10.0, 10.0);
+        FilterGraph {
+            region,
+            primitives: vec![
+                FilterPrimitive {
+                    subregion: Some(region),
+                    color_space: FilterColorSpace::Srgb,
+                    kind: FilterPrimitiveKind::GaussianBlur {
+                        input: FilterInput::SourceAlpha,
+                        std_deviation: Vec2::new(1.0, 2.0),
+                    },
+                },
+                FilterPrimitive {
+                    subregion: None,
+                    color_space: FilterColorSpace::LinearRgb,
+                    kind: FilterPrimitiveKind::Composite {
+                        source: FilterInput::SourceGraphic,
+                        backdrop: FilterInput::Result(FilterId(0)),
+                        operator: CompositeOperator::Over,
+                    },
+                },
+            ],
+            output: FilterInput::Result(FilterId(0)),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_explicit_output_and_rejects_invalid_edges() {
+        let mut graph = graph();
+        assert_eq!(graph.validate(), Ok(()));
+        graph.output = FilterInput::Result(FilterId(2));
+        assert_eq!(
+            graph.validate(),
+            Err(FilterGraphError::InvalidOutput(FilterId(2)))
+        );
+        graph.output = FilterInput::SourceGraphic;
+        for result in [FilterId(0), FilterId(1), FilterId(2)] {
+            graph.primitives[0].kind = FilterPrimitiveKind::Offset {
+                input: FilterInput::Result(result),
+                offset: Vec2::ZERO,
+            };
+            assert_eq!(
+                graph.validate(),
+                Err(FilterGraphError::InvalidInput {
+                    primitive: FilterId(0),
+                    result,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn validate_checks_regions_and_parameters() {
+        let mut graph = graph();
+        let region = graph.region;
+        graph.region.x0 = f64::NAN;
+        assert_eq!(graph.validate(), Err(FilterGraphError::InvalidRegion));
+        graph.region = region;
+        graph.primitives[0].subregion = Some(Rect::new(4.0, 4.0, 1.0, 1.0));
+        assert_eq!(
+            graph.validate(),
+            Err(FilterGraphError::InvalidSubregion(FilterId(0)))
+        );
+        graph.primitives[0].subregion = None;
+        for kind in [
+            FilterPrimitiveKind::ConvolveMatrix {
+                input: FilterInput::SourceGraphic,
+                order: [u32::MAX, u32::MAX],
+                target: [0, 0],
+                kernel: vec![1.0],
+                divisor: 1.0,
+                bias: 0.0,
+                edge_mode: EdgeMode::Duplicate,
+                preserve_alpha: false,
+            },
+            FilterPrimitiveKind::GaussianBlur {
+                input: FilterInput::SourceGraphic,
+                std_deviation: Vec2::new(-1.0, 1.0),
+            },
+        ] {
+            graph.primitives[0].kind = kind;
+            assert_eq!(
+                graph.validate(),
+                Err(FilterGraphError::InvalidParameters(FilterId(0)))
+            );
+        }
+        graph.primitives[0].kind = FilterPrimitiveKind::Offset {
+            input: FilterInput::SourceGraphic,
+            offset: Vec2::new(f64::MAX, 0.0),
+        };
+        assert_eq!(graph.validate(), Ok(()));
+        assert_eq!(
+            graph.validate_transformed(Affine::scale(2.0)),
+            Err(FilterGraphError::InvalidParameters(FilterId(0)))
+        );
+    }
+
+    #[test]
+    fn validate_reports_invalid_retained_image() {
+        let mut graph = graph();
+        let mut image = Scene::new();
+        image.pop_group();
+        graph.primitives[0].kind = FilterPrimitiveKind::Image {
+            scene: Box::new(image),
+        };
+        assert_eq!(
+            graph.validate(),
+            Err(FilterGraphError::InvalidImage {
+                primitive: FilterId(0),
+                error: Box::new(ValidateError::UnbalancedPopGroup { contexts: vec![] }),
+            })
+        );
+    }
+
+    #[test]
+    fn streaming_and_retained_preflight_report_graph_errors() {
+        let mut graph = graph();
+        graph.output = FilterInput::Result(FilterId(9));
+        let group = GroupRef::new().with_filter_graph(&graph);
+        let error = FilterGraphError::InvalidOutput(FilterId(9));
+        let mut sink = ValidatingSink::new(Scene::new());
+        sink.push_group(group.clone());
+        assert_eq!(
+            sink.finish(),
+            Err(ValidationError::InvalidFilterGraph(error.clone()))
+        );
+        assert!(sink.inner().is_empty());
+
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_context("graphic", None, |painter| {
+            painter.with_group(group, |_| {});
+        });
+        let Err(ValidateError::InvalidFilterGraph {
+            error: retained_error,
+            contexts,
+        }) = scene.validate()
+        else {
+            panic!("expected graph validation error");
+        };
+        assert_eq!(retained_error, error);
+        assert_eq!(contexts[0].label, "graphic");
+    }
+}

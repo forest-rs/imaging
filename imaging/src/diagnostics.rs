@@ -481,6 +481,37 @@ mod tests {
     };
 
     #[test]
+    fn diagnose_treats_source_independent_graphs_as_paint() {
+        use crate::filter::{
+            FilterColorSpace, FilterGraph, FilterId, FilterInput, FilterPrimitive,
+            FilterPrimitiveKind,
+        };
+
+        let region = Rect::new(0.0, 0.0, 4.0, 4.0);
+        let graph = FilterGraph {
+            region,
+            primitives: vec![FilterPrimitive {
+                subregion: Some(region),
+                color_space: FilterColorSpace::Srgb,
+                kind: FilterPrimitiveKind::Flood {
+                    color: Color::WHITE,
+                },
+            }],
+            output: FilterInput::Result(FilterId(0)),
+        };
+        let mut mask = Scene::new();
+        Painter::new(&mut mask).with_group(GroupRef::new().with_filter_graph(&graph), |_| {});
+        assert!(mask.diagnose().is_empty());
+
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(
+            GroupRef::new().with_mask(crate::MaskRef::new(MaskMode::Alpha, &mask)),
+            |painter| painter.fill_rect(region, Color::WHITE),
+        );
+        assert!(scene.diagnose().is_empty());
+    }
+
+    #[test]
     fn diagnose_reports_empty_scopes_and_transparent_draws() {
         let mut scene = Scene::new();
         scene.push_context(

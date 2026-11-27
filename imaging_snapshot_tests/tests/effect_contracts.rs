@@ -11,12 +11,60 @@
     feature = "vello_hybrid"
 ))]
 
-use imaging::{Composite, GroupRef, ImageRenderer, MaskMode, MaskRef, Painter, record::Scene};
+use imaging::{
+    Composite, GroupRef, ImageRenderer, ImageRendererError, MaskMode, MaskRef, Painter,
+    filter::{
+        FilterColorSpace, FilterGraph, FilterId, FilterInput, FilterPrimitive, FilterPrimitiveKind,
+    },
+    record::Scene,
+    render::RenderUnsupportedError,
+};
 use kurbo::{Affine, Rect};
 use peniko::{Blob, Color, Compose, ImageAlphaType, ImageData, ImageFormat};
 use std::sync::Arc;
 
 const SURFACE: Rect = Rect::new(0.0, 0.0, 16.0, 8.0);
+
+fn check_filter_graph_rejection(renderer: &mut dyn ImageRenderer) {
+    let graph = FilterGraph {
+        region: SURFACE,
+        primitives: vec![FilterPrimitive {
+            subregion: Some(SURFACE),
+            color_space: FilterColorSpace::Srgb,
+            kind: FilterPrimitiveKind::Flood {
+                color: Color::WHITE,
+            },
+        }],
+        output: FilterInput::Result(FilterId(0)),
+    };
+    let filtered = GroupRef::new().with_filter_graph(&graph);
+    let mut filtered_scene = Scene::new();
+    Painter::new(&mut filtered_scene).with_group(filtered.clone(), |_| {});
+    let filtered_mask = MaskRef::new(MaskMode::Alpha, &filtered_scene);
+    let mut solid_scene = Scene::new();
+    Painter::new(&mut solid_scene).fill_rect(SURFACE, Color::WHITE);
+    let solid_mask = MaskRef::new(MaskMode::Alpha, &solid_scene);
+
+    for group in [
+        filtered.clone(),
+        filtered.with_mask(solid_mask),
+        GroupRef::new().with_mask(filtered_mask),
+    ] {
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(group, |painter| {
+            painter.fill_rect(SURFACE, Color::WHITE);
+        });
+        assert!(
+            matches!(
+                renderer.render_source(&mut &scene, 16, 8),
+                Err(ImageRendererError::Unsupported(
+                    RenderUnsupportedError::Filter
+                ))
+            ),
+            "filter graph requires an explicit capability error"
+        );
+    }
+}
 
 fn check_alpha_mask_contract(renderer: &mut dyn ImageRenderer) {
     let mut isolated = Scene::new();
@@ -515,6 +563,7 @@ fn tiny_skia_alpha_masks() {
     let mut renderer = imaging_tiny_skia::TinySkiaRenderer::new();
     check_alpha_mask_contract(&mut renderer);
     check_filter_contract(&mut renderer);
+    check_filter_graph_rejection(&mut renderer);
 }
 
 #[test]
@@ -523,6 +572,7 @@ fn vello_cpu_alpha_masks() {
     let mut renderer = imaging_vello_cpu::VelloCpuRenderer::new(16, 8);
     check_alpha_mask_contract(&mut renderer);
     check_filter_contract(&mut renderer);
+    check_filter_graph_rejection(&mut renderer);
 }
 
 #[test]
@@ -531,6 +581,7 @@ fn skia_alpha_masks() {
     let mut renderer = imaging_skia::SkiaCpuRenderer::new();
     check_alpha_mask_contract(&mut renderer);
     check_filter_contract(&mut renderer);
+    check_filter_graph_rejection(&mut renderer);
 }
 
 #[cfg(any(feature = "vello", feature = "vello_hybrid"))]
@@ -542,7 +593,9 @@ fn vello_alpha_masks() {
     let Some((device, queue)) = gpu::device() else {
         return;
     };
-    check_alpha_mask_contract(&mut imaging_vello::VelloRenderer::new(device, queue).unwrap());
+    let mut renderer = imaging_vello::VelloRenderer::new(device, queue).unwrap();
+    check_alpha_mask_contract(&mut renderer);
+    check_filter_graph_rejection(&mut renderer);
 }
 
 #[test]
@@ -554,4 +607,5 @@ fn hybrid_alpha_masks() {
     let mut renderer = imaging_vello_hybrid::VelloHybridRenderer::new(device, queue);
     check_alpha_mask_contract(&mut renderer);
     check_filter_contract(&mut renderer);
+    check_filter_graph_rejection(&mut renderer);
 }
