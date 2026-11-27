@@ -44,7 +44,7 @@ pub(crate) enum PlanNode {
 /// Ordered filters with clips between them in filter user space.
 #[derive(Clone, Debug)]
 pub(crate) struct PlanFilterChain {
-    /// Crop applied to the incoming SourceGraphic.
+    /// Crop applied to the incoming `SourceGraphic`.
     pub(crate) source_region: Rect,
     pub(crate) steps: Vec<PlanFilterStep>,
 }
