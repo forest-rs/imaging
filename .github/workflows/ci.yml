@@ -81,6 +81,7 @@ env:
 # The MSRV jobs run only cargo check because different clippy versions can disagree on goals and
 # running tests introduces dev dependencies which may require a higher MSRV than the bare package.
 #
+# Keep cargo-hack's base case for no_std so each package is built with libm alone.
 # For no_std checks we target x86_64-unknown-none, because this target doesn't support std
 # and as such will error out if our dependency tree accidentally tries to use std.
 # https://doc.rust-lang.org/stable/rustc/platform-support/x86_64-unknown-none.html
@@ -185,7 +186,7 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo clippy (no_std)
-        run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none -- -D warnings
+        run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --exclude-all-features --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none -- -D warnings
 
       - name: cargo clippy
         run: cargo hack clippy --workspace --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std -- -D warnings
@@ -375,7 +376,7 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo check (no_std)
-        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.RUST_STD_ONLY_PKGS }} --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.RUST_STD_ONLY_PKGS }} --locked --optional-deps --each-feature --exclude-all-features --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none
 
       - name: cargo check
         run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --exclude-no-default-features --exclude-all-features --ignore-unknown-features --features std
