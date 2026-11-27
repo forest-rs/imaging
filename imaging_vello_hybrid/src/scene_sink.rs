@@ -10,6 +10,7 @@ use glifo::Glyph as VelloGlyph;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, StrokeRef,
+    filter::FilterEffectsRef,
     record::{Scene, replay_transformed},
 };
 use kurbo::{Affine, Shape as _};
@@ -540,6 +541,10 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         if self.error.is_some() {
             return;
         }
+        let FilterEffectsRef::Chain(filters) = group.filters else {
+            self.set_error_once(Error::UnsupportedFilter);
+            return;
+        };
         if group
             .mask
             .as_ref()
@@ -548,8 +553,7 @@ impl PaintSink for VelloHybridSceneSink<'_> {
             self.set_error_once(Error::UnsupportedMask);
             return;
         }
-        let filters = match group
-            .filters
+        let filters = match filters
             .iter()
             .copied()
             .map(|filter| {

@@ -14,6 +14,7 @@ use peniko::{Fill, Style};
 
 use crate::{
     BlurredRoundedRect, Composite, Filter, MaskMode, NormalizedCoord,
+    filter::{FilterEffectsRef, FilterGraph},
     record::{
         AppliedMask, Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group,
         GroupId, Mask, MaskId, Scene,
@@ -232,7 +233,7 @@ impl<'a> ClipRef<'a> {
 
 /// Borrowed isolated group payload.
 ///
-/// The group renders its content in isolation, applies filters in slice order, then applies
+/// The group renders its content in isolation, applies its filters, then applies
 /// the mask and isolated clip. Group opacity and blending apply once to that result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupRef<'a> {
@@ -240,12 +241,12 @@ pub struct GroupRef<'a> {
     pub clip: Option<ClipRef<'a>>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMaskRef<'a>>,
-    /// Filter chain applied in slice order before the mask, isolated clip, and compositing.
-    pub filters: &'a [Filter],
+    /// Filters applied before the mask, isolated clip, and compositing.
+    pub filters: FilterEffectsRef<'a>,
     /// Maps filter user-space coordinates to the destination coordinate system.
     ///
-    /// This transforms filter offsets and blur kernels, independently of content, clips, and masks.
     /// Defaults to identity. Transformed replay prefixes this transform along with the content.
+    /// Filter geometry and any embedded filter scenes stay in filter-local coordinates.
     pub filter_transform: Affine,
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,
@@ -258,7 +259,7 @@ impl<'a> GroupRef<'a> {
         Self {
             clip: None,
             mask: None,
-            filters: &[],
+            filters: FilterEffectsRef::Chain(&[]),
             filter_transform: Affine::IDENTITY,
             composite: Composite::default(),
         }
@@ -289,10 +290,17 @@ impl<'a> GroupRef<'a> {
         self
     }
 
-    /// Set the filter chain applied to the group result.
+    /// Set the filter chain applied to the group result, replacing any previously set effects.
     #[must_use]
     pub fn with_filters(mut self, filters: &'a [Filter]) -> Self {
-        self.filters = filters;
+        self.filters = FilterEffectsRef::Chain(filters);
+        self
+    }
+
+    /// Set the filter graph applied to the group result, replacing any previously set effects.
+    #[must_use]
+    pub fn with_filter_graph(mut self, graph: &'a FilterGraph) -> Self {
+        self.filters = FilterEffectsRef::Graph(graph);
         self
     }
 
@@ -317,7 +325,7 @@ impl<'a> GroupRef<'a> {
         Group {
             clip: self.clip.map(ClipRef::to_owned),
             mask: self.mask.map(|mask| mask.into_owned_with(define_mask)),
-            filters: self.filters.to_vec(),
+            filters: self.filters.to_owned(),
             filter_transform: self.filter_transform,
             composite: self.composite,
         }
@@ -997,7 +1005,7 @@ impl Group {
                 .mask
                 .as_ref()
                 .map(|mask| mask.as_ref(scene.mask(mask.mask))),
-            filters: &self.filters,
+            filters: self.filters.as_ref(),
             filter_transform: self.filter_transform,
             composite: self.composite,
         }
@@ -1271,7 +1279,7 @@ mod tests {
                     stroke: &stroke,
                 }),
                 mask: None,
-                filters: &[],
+                filters: FilterEffectsRef::Chain(&[]),
                 filter_transform: Affine::translate((5.0, 6.0)),
                 composite: Composite::default(),
             }
@@ -1363,7 +1371,7 @@ mod tests {
                 stroke: Stroke::new(2.0),
             }),
             mask: None,
-            filters: vec![Filter::offset(2.0, 3.0)],
+            filters: crate::filter::FilterEffects::Chain(vec![Filter::offset(2.0, 3.0)]),
             filter_transform: Affine::scale(2.0),
             composite: Composite::default(),
         });
@@ -1435,7 +1443,7 @@ mod tests {
                     stroke: Stroke::new(2.0),
                 }),
                 mask: None,
-                filters: vec![Filter::offset(2.0, 3.0)],
+                filters: crate::filter::FilterEffects::Chain(vec![Filter::offset(2.0, 3.0)]),
                 filter_transform: transform * Affine::scale(2.0),
                 composite: Composite::default(),
             }

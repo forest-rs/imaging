@@ -9,6 +9,7 @@ use super::{
 use imaging::{
     BlurredRoundedRect, ClipRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode, PaintSink,
     StrokeRef,
+    filter::FilterEffectsRef,
     record::{self, replay_transformed},
 };
 use kurbo::{Affine, Rect, Shape as _};
@@ -117,7 +118,12 @@ fn clip_path(canvas: &sk::Canvas, state: &mut StreamState, clip: ClipRef<'_>) ->
     }
 }
 
-fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef<'_>) -> u8 {
+fn push_group_impl(
+    canvas: &sk::Canvas,
+    state: &mut StreamState,
+    group: GroupRef<'_>,
+    filters: &[imaging::Filter],
+) -> u8 {
     if group
         .mask
         .as_ref()
@@ -126,8 +132,8 @@ fn push_group_impl(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef
         state.set_error_once(Error::UnsupportedExternalImage);
     }
     let (filter, filter_transform) =
-        build_transformed_filter_chain(group.filters, group.filter_transform);
-    if !group.filters.is_empty() && filter.is_none() {
+        build_transformed_filter_chain(filters, group.filter_transform);
+    if !filters.is_empty() && filter.is_none() {
         state.set_error_once(Error::UnsupportedFilter);
     }
 
@@ -579,6 +585,10 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
     if state.error.is_some() {
         return;
     }
+    let FilterEffectsRef::Chain(filters) = group.filters else {
+        state.set_error_once(Error::UnsupportedFilter);
+        return;
+    };
     if let Some(frame) = active_masked_group_mut(state) {
         PaintSink::push_group(&mut frame.content, group);
         frame.nested_group_depth += 1;
@@ -589,7 +599,7 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
             .group_stack
             .push(GroupFrame::Masked(Box::new(MaskedGroupFrame {
                 clip: group.clip.map(ClipRef::to_owned),
-                filters: group.filters.to_vec(),
+                filters: filters.to_vec(),
                 filter_transform: group.filter_transform,
                 composite: group.composite,
                 mode: mask.mask.mode,
@@ -601,7 +611,7 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
         return;
     }
     let clip = group.clip.as_ref().map(|clip| clip.clone().to_owned());
-    let restores = push_group_impl(canvas, state, group);
+    let restores = push_group_impl(canvas, state, group, filters);
     state
         .group_stack
         .push(GroupFrame::Direct { restores, clip });

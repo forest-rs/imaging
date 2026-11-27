@@ -77,6 +77,7 @@ use alloc::vec::Vec;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
     MaskMode, PaintSink, RgbaImage, StrokeRef,
+    filter::FilterEffectsRef,
     record::{Scene, ValidateError, replay, replay_transformed},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
@@ -678,8 +679,11 @@ impl PaintSink for VelloCpuRenderer {
         if self.error.is_some() {
             return;
         }
-        let filters = match group
-            .filters
+        let FilterEffectsRef::Chain(filters) = group.filters else {
+            self.set_error_once(Error::UnsupportedFilter);
+            return;
+        };
+        let filters = match filters
             .iter()
             .copied()
             .map(|filter| {
@@ -1108,7 +1112,7 @@ mod tests {
         ] {
             let mut scene = Scene::new();
             scene.push_group(imaging::record::Group {
-                filters: vec![Filter::blur(1.0), filter],
+                filters: imaging::filter::FilterEffects::Chain(vec![Filter::blur(1.0), filter]),
                 filter_transform,
                 ..Default::default()
             });

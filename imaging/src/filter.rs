@@ -4,12 +4,14 @@
 //! Filter effects applied to the isolated contents of a group.
 
 mod graph;
+mod validate;
 
 pub use graph::{
     ColorChannel, ColorMatrix, CompositeOperator, EdgeMode, FilterColorSpace, FilterEffects,
     FilterEffectsRef, FilterGraph, FilterId, FilterInput, FilterPrimitive, FilterPrimitiveKind,
     LightSource, MorphologyOperator, TransferFunction, TurbulenceKind,
 };
+pub use validate::FilterGraphError;
 
 use kurbo::{Affine, Vec2};
 

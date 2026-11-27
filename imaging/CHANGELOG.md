@@ -13,6 +13,17 @@ The latest published `imaging` release is [0.0.1](#001-2026-05-21), which was re
 
 ## [Unreleased]
 
+### Added
+
+- Isolated groups can retain a filter graph with `GroupRef::with_filter_graph`. Filter graphs
+  describe filter regions, primitive inputs, color interpolation, and a selected output.
+
+### Changed
+
+- For struct literals and direct assignment, wrap `GroupRef::filters` in
+  `FilterEffectsRef::Chain` and `record::Group::filters` in `FilterEffects::Chain`.
+  `GroupRef::with_filters` accepts a simple filter slice.
+
 ## [0.0.1][] (2026-05-21)
 
 This release has an [MSRV][] of 1.92.
