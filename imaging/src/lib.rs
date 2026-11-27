@@ -110,7 +110,7 @@ pub mod guide {
     #[doc = include_str!("guide/backends.md")]
     pub mod backends {}
 }
-mod filter;
+pub mod filter;
 mod image;
 mod paint;
 mod painter;
