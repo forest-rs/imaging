@@ -2581,8 +2581,8 @@ mod tests {
             image.data.len(),
             usize::try_from(image.width).unwrap() * usize::try_from(image.height).unwrap() * 4
         );
-        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
-            assert_eq!(pixel, expected, "pixel {index} did not match");
+        for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*pixel, expected, "pixel {index} did not match");
         }
     }
 
@@ -2657,7 +2657,7 @@ mod tests {
             },
         )
         .unwrap();
-        for pixel in float.chunks_exact(8) {
+        for pixel in float.as_chunks::<8>().0 {
             assert_eq!(u16::from_le_bytes([pixel[0], pixel[1]]), 0x3c00);
             assert_eq!(&pixel[2..6], &[0; 4]);
             assert_eq!(u16::from_le_bytes([pixel[6], pixel[7]]), 0x3804);

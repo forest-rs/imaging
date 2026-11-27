@@ -61,7 +61,7 @@ fn render(
 
 fn bounds(image: &RgbaImage) -> [i32; 4] {
     let mut bounds = [128, 128, -1, -1];
-    for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+    for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
         if pixel[3] < 128 {
             continue;
         }
@@ -200,7 +200,7 @@ fn brush_and_opacity(renderer: &mut dyn ImageRenderer) {
     );
     let image = renderer.render_source(&mut &scene, 128, 128).unwrap();
     let mut colors = [false; 2];
-    for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+    for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
         assert!(pixel[3] <= 129, "opacity must be applied once: {pixel:?}");
         if pixel[3] < 120 {
             continue;

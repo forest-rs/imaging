@@ -29,7 +29,7 @@ fn render(renderer: &mut dyn ImageRenderer, body: &str, transform: Affine) -> Rg
 }
 
 fn assert_alpha(image: &RgbaImage, expected: impl Fn(usize, usize) -> u8) {
-    for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+    for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
         let (x, y) = (index % 32, index / 32);
         let alpha = expected(x, y);
         assert!(
@@ -277,7 +277,7 @@ fn clipped_group_blend(renderer: &mut dyn ImageRenderer) {
          </g>",
         Affine::IDENTITY,
     );
-    for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+    for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
         let (x, y) = (index % 32, index / 32);
         let blue = if (2..14).contains(&x) && (2..14).contains(&y) {
             127
@@ -318,13 +318,13 @@ fn isolated_blending(renderer: &mut dyn ImageRenderer) {
          </g>",
         Affine::IDENTITY,
     );
-    for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+    for (index, pixel) in image.data.as_chunks::<4>().0.iter().enumerate() {
         let expected = if index % 32 < 16 {
             [255, 0, 0, 255]
         } else {
             [0, 0, 255, 255]
         };
-        assert_eq!(pixel, expected, "isolated blend at pixel {index}");
+        assert_eq!(*pixel, expected, "isolated blend at pixel {index}");
     }
 }
 
