@@ -1,7 +1,7 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Pixel contracts for SVG clipping, masking, and group composition.
+//! Pixel contracts for SVG clipping, masking, filters, and group composition.
 
 #![cfg(any(
     feature = "tiny_skia",
@@ -329,6 +329,65 @@ fn isolated_blending(renderer: &mut dyn ImageRenderer) {
         };
         assert_eq!(*pixel, expected, "isolated blend at pixel {index}");
     }
+}
+
+#[cfg(feature = "tiny_skia")]
+#[test]
+fn transformed_filter_chain_crops_each_stage() {
+    let mut renderer = imaging_tiny_skia::TinySkiaRenderer::new();
+    let image = render(
+        &mut renderer,
+        "<defs>
+            <filter id='first' filterUnits='userSpaceOnUse' x='2' y='1' width='12' height='6'>
+                <feOffset dx='3'/>
+            </filter>
+            <filter id='second' filterUnits='userSpaceOnUse' x='6' y='1' width='12' height='6'>
+                <feOffset in='SourceGraphic' dx='3'/>
+            </filter>
+         </defs>
+         <g transform='translate(1 0)' filter='url(#first) url(#second)'>
+            <rect width='8' height='6' fill='white'/>
+         </g>",
+        Affine::translate((0.0, 2.0)) * Affine::scale(2.0),
+    );
+    assert_alpha(&image, |x, y| {
+        if (20..30).contains(&x) && (4..14).contains(&y) {
+            255
+        } else {
+            0
+        }
+    });
+}
+
+#[cfg(feature = "tiny_skia")]
+#[test]
+fn flood_and_offset_apply_before_group_clip_mask_and_opacity() {
+    let mut renderer = imaging_tiny_skia::TinySkiaRenderer::new();
+    let image = render(
+        &mut renderer,
+        "<defs>
+            <filter id='f' filterUnits='userSpaceOnUse' x='0' y='0' width='13' height='16'>
+                <feFlood x='5' y='2' width='12' height='12' flood-color='white'/>
+                <feOffset dx='3'/>
+            </filter>
+            <clipPath id='c'><rect x='6' y='3' width='8' height='9'/></clipPath>
+            <mask id='m' mask-type='alpha' maskUnits='userSpaceOnUse'
+                  x='0' y='0' width='32' height='16'>
+                <rect x='7' width='12' height='16'/>
+            </mask>
+         </defs>
+         <g filter='url(#f)' clip-path='url(#c)' mask='url(#m)' opacity='.5'>
+            <rect x='1' width='2' height='1'/>
+         </g>",
+        Affine::IDENTITY,
+    );
+    assert_alpha(&image, |x, y| {
+        if (8..13).contains(&x) && (3..12).contains(&y) {
+            128
+        } else {
+            0
+        }
+    });
 }
 
 macro_rules! backend_tests {

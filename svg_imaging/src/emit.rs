@@ -48,6 +48,30 @@ impl<'a> EmitCx<'a> {
     {
         match node {
             PlanNode::Group(group) => self.emit_group(group, painter),
+            PlanNode::Filtered {
+                chain,
+                transform,
+                children,
+            } => {
+                // Nested groups close inside out, so push the stages in reverse order.
+                // Each group clips its filter output before the next stage uses it.
+                for step in chain.steps.iter().rev() {
+                    painter.push_group(
+                        GroupRef::new()
+                            .with_clip(ClipRef::fill(step.output_region).with_transform(*transform))
+                            .with_filters(core::slice::from_ref(&step.effect))
+                            .with_filter_transform(*transform),
+                    );
+                }
+                painter.with_group(
+                    GroupRef::new()
+                        .with_clip(ClipRef::fill(chain.source_region).with_transform(*transform)),
+                    |painter| self.emit_nodes(children, painter),
+                );
+                for _ in &chain.steps {
+                    painter.pop_group();
+                }
+            }
             PlanNode::Fill(fill) => emit_fill(fill, painter),
             PlanNode::Image(image) => emit_image(image, painter),
             PlanNode::Stroke(stroke) => emit_stroke(stroke, painter),

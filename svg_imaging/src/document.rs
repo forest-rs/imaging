@@ -82,11 +82,12 @@ impl SvgDocument {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{borrow::ToOwned, boxed::Box, vec, vec::Vec};
+    use alloc::{borrow::ToOwned, boxed::Box, format, vec, vec::Vec};
     use std::sync::Arc;
 
     use imaging::Brush;
     use imaging::{MaskMode, Painter, record};
+    use kurbo::Affine;
 
     use super::{ParseOptions, RenderOptions, SvgDocument};
 
@@ -160,6 +161,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_compressed_svg() {
+        let document = SvgDocument::from_data(
+            include_bytes!("../tests/fixtures/size.svgz"),
+            &ParseOptions::default(),
+        )
+        .expect("parse SVGZ");
+
+        assert_eq!(document.size(), kurbo::Size::new(12.0, 34.0));
+    }
+
+    #[test]
     fn parses_document_size() {
         let document = SvgDocument::from_data(
             br#"<svg xmlns='http://www.w3.org/2000/svg' width='12' height='34'/>"#,
@@ -171,14 +183,109 @@ mod tests {
     }
 
     #[test]
-    fn parses_compressed_svg() {
-        let document = SvgDocument::from_data(
-            include_bytes!("../tests/fixtures/size.svgz"),
+    fn lowers_linear_filter_inputs_and_resolves_primitive_units() {
+        let document = SvgDocument::from_str(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80'>
+                <defs><filter id='effects' primitiveUnits='objectBoundingBox'
+                        color-interpolation-filters='sRGB'>
+                    <feGaussianBlur in='SourceGraphic' stdDeviation='.125 .25' result='soft'/>
+                    <feOffset in='soft' dx='.5' dy='.25'/>
+                    <feDropShadow dx='.125' dy='.25' stdDeviation='.125 .25'
+                        flood-color='#123456' flood-opacity='.5'/>
+                </filter></defs>
+                <g transform='translate(2 3) scale(2)' filter='url(#effects)'>
+                    <rect width='16' height='4'/>
+                </g>
+            </svg>",
             &ParseOptions::default(),
         )
-        .expect("parse SVGZ");
+        .unwrap();
+        let transform = Affine::translate((5.0, 7.0)) * Affine::scale(1.5);
+        let mut scene = record::Scene::new();
+        let report = document
+            .render(&mut Painter::new(&mut scene), &RenderOptions { transform })
+            .unwrap();
 
-        assert_eq!(document.size(), kurbo::Size::new(12.0, 34.0));
+        assert!(report.is_fully_supported(), "{report:?}");
+        scene.validate().unwrap();
+        let groups: Vec<_> = scene
+            .commands()
+            .iter()
+            .rev()
+            .filter_map(|command| match command {
+                record::Command::PushGroup(id) if !scene.group(*id).filters.is_empty() => {
+                    Some(scene.group(*id))
+                }
+                _ => None,
+            })
+            .collect();
+        let filters: Vec<_> = groups.iter().flat_map(|group| &group.filters).collect();
+        assert_eq!(
+            filters,
+            [
+                &imaging::Filter::blur_xy(2.0, 1.0),
+                &imaging::Filter::offset(8.0, 1.0),
+                &imaging::Filter::DropShadow {
+                    dx: 2.0,
+                    dy: 1.0,
+                    std_deviation_x: 2.0,
+                    std_deviation_y: 1.0,
+                    color: peniko::Color::from_rgba8(0x12, 0x34, 0x56, 128),
+                },
+            ]
+        );
+        for group in groups {
+            assert_eq!(
+                group.filter_transform,
+                transform * Affine::translate((2.0, 3.0)) * Affine::scale(2.0),
+            );
+        }
+    }
+
+    #[test]
+    fn falls_back_to_unfiltered_content_when_a_chain_cannot_be_lowered() {
+        for unsupported in [
+            "<feOffset in='SourceAlpha'/>",
+            "<feOffset in='SourceGraphic'/>",
+            "<feOffset in='first'/>",
+            "<feGaussianBlur stdDeviation='2'/>",
+            "<feColorMatrix type='saturate' values='0'/>",
+        ] {
+            let svg = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'>
+                    <defs><filter id='unsupported'>
+                        <feOffset dx='1' result='first'/><feOffset dx='2'/>{unsupported}
+                    </filter></defs>
+                    <g id='subject' opacity='.5' filter='url(#unsupported)'>
+                        <rect width='20' height='20' fill='red'/>
+                    </g>
+                </svg>"
+            );
+            let document = SvgDocument::from_str(&svg, &ParseOptions::default()).unwrap();
+            let mut scene = record::Scene::new();
+            let report = document
+                .render(&mut Painter::new(&mut scene), &RenderOptions::default())
+                .unwrap();
+            assert_eq!(
+                report.unsupported_features,
+                [crate::UnsupportedFeature {
+                    kind: crate::UnsupportedFeatureKind::Filter,
+                    node_id: Some("subject".to_owned()),
+                }],
+            );
+            let [
+                record::Command::PushGroup(group),
+                record::Command::Draw(_),
+                record::Command::PopGroup,
+            ] = scene.commands()
+            else {
+                panic!("expected unfiltered content with opacity for {unsupported}");
+            };
+            let group = scene.group(*group);
+            assert!(group.filters.is_empty());
+            assert_eq!(group.composite.alpha, 0.5);
+            scene.validate().unwrap();
+        }
     }
 
     #[test]
@@ -423,7 +530,7 @@ mod tests {
         assert!(matches!(draw.0, Brush::Gradient(_)));
         assert_eq!(
             draw.1,
-            &Some(kurbo::Affine::new([10.0, 0.0, 0.0, 10.0, 10.0, 20.0]))
+            &Some(Affine::new([10.0, 0.0, 0.0, 10.0, 10.0, 20.0]))
         );
     }
 

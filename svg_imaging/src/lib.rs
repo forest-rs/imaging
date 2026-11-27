@@ -15,8 +15,14 @@
 //! compositing, clip paths including unions of independently filled children and referenced
 //! clip-path chains, nested and referenced masks lowered through reusable `imaging` mask
 //! definitions, text lowered through `usvg`'s flattened vector output, nested SVG
-//! `<image>` nodes, and raster PNG/JPEG/GIF/WebP `<image>` nodes. Filters and pattern paints are
-//! still reported as unsupported.
+//! `<image>` nodes, and raster PNG/JPEG/GIF/WebP `<image>` nodes. Pattern paints are reported
+//! as unsupported.
+//!
+//! Filters support ordered chains of `feFlood`, `feOffset`, and sRGB `feGaussianBlur` and
+//! `feDropShadow`, with filter and primitive regions resolved by `usvg`. Each stage that takes
+//! an input must use the preceding result, or `SourceGraphic` at the start of each filter.
+//! If a group uses any unsupported filter primitive, input, or color space, lowering reports
+//! the chain and draws the group unfiltered. Filter execution depends on the Imaging backend.
 //!
 //! Text rendering depends on the parse options' font database. `usvg::Options::default()` starts
 //! with an empty font database, so callers that need text should load fonts into
