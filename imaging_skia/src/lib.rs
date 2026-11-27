@@ -1493,8 +1493,8 @@ impl FontCache {
             hint: glyph_run.hint,
         };
 
-        let mut font = if let Some(font) = self.fonts.get(&font_key) {
-            font.clone()
+        if let Some(font) = self.fonts.get(&font_key) {
+            Some(font.clone())
         } else {
             let typeface = self.typeface_for_key(&typeface_key, glyph_run.font)?;
             let mut font = sk::Font::from_typeface(typeface, glyph_run.font_size);
@@ -1504,11 +1504,8 @@ impl FontCache {
                 sk::FontHinting::None
             });
             self.fonts.insert(font_key, font.clone());
-            font
-        };
-
-        apply_glyph_transform(&mut font, glyph_run.glyph_transform, glyph_run.font_size)?;
-        Some(font)
+            Some(font)
+        }
     }
 
     fn typeface_for_key(
@@ -1631,26 +1628,6 @@ fn skia_font_from_glyph_run(
         Some(font_cache) => font_cache.borrow_mut().font_from_glyph_run(glyph_run),
         None => FontCache::new().font_from_glyph_run(glyph_run),
     }
-}
-
-fn apply_glyph_transform(
-    font: &mut sk::Font,
-    glyph_transform: Option<Affine>,
-    font_size: f32,
-) -> Option<()> {
-    let Some(transform) = glyph_transform else {
-        return Some(());
-    };
-
-    let [a, b, c, d, e, f] = transform.as_coeffs();
-    if b != 0.0 || e != 0.0 || f != 0.0 || d <= 0.0 {
-        return None;
-    }
-
-    font.set_size(f64_to_f32(font_size as f64 * d));
-    font.set_scale_x(f64_to_f32(a / d));
-    font.set_skew_x(f64_to_f32(c / d));
-    Some(())
 }
 
 fn sk_path_fill_type_from_fill_rule(rule: peniko::Fill) -> sk::PathFillType {
@@ -2095,6 +2072,12 @@ mod tests {
             .clone()
     }
 
+    fn test_typeface() -> sk::Typeface {
+        sk::FontMgr::default()
+            .new_from_data(sk::Data::new_copy(TEST_FONT_BYTES), 0)
+            .unwrap()
+    }
+
     fn masked_scene(mode: MaskMode) -> Scene {
         let mask = Painter::<Scene>::record_mask(mode, |mask| {
             mask.fill(
@@ -2486,6 +2469,146 @@ mod tests {
         let mut second_renderer = SkiaCpuRenderer::new_with_config(config);
         second_renderer.render_scene(&scene, 48, 48).unwrap();
         assert_eq!(caches.font_cache().counts(), counts);
+    }
+
+    #[test]
+    fn glyph_transform_precedes_placement_and_keeps_brush_in_run_space() {
+        let font = test_font();
+        let id = u32::from(test_typeface().unichar_to_glyph('H' as i32));
+        let glyphs = [
+            Glyph {
+                id,
+                x: 20.0,
+                y: 32.0,
+            },
+            Glyph {
+                id,
+                x: 60.0,
+                y: 46.0,
+            },
+        ];
+        let run_transform = Affine::translate((7.0, 11.0));
+        let brush_transform = Affine::translate((15.0, 0.0)) * Affine::scale(2.0);
+        let gradient = peniko::Gradient::new_linear((0.0, 0.0), (40.0, 0.0))
+            .with_stops([Color::from_rgb8(255, 0, 0), Color::from_rgb8(0, 0, 255)]);
+        let style = Style::Fill(Fill::NonZero);
+        let mut renderer = SkiaCpuRenderer::new();
+
+        for glyph_transform in [
+            Affine::translate((4.0, -2.0)),
+            Affine::new([1.0, 0.5, -0.25, 1.0, 4.0, -2.0]),
+            Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+            Affine::scale_non_uniform(1.0, -1.0),
+        ] {
+            let mut actual_scene = Scene::new();
+            Painter::new(&mut actual_scene)
+                .glyphs(&font, &gradient)
+                .font_size(22.0)
+                .transform(run_transform)
+                .glyph_transform(Some(glyph_transform))
+                .brush_transform(Some(brush_transform))
+                .draw(&style, glyphs);
+
+            let mut expected_scene = Scene::new();
+            let mut painter = Painter::new(&mut expected_scene);
+            for glyph in glyphs {
+                let glyph_to_run =
+                    Affine::translate((f64::from(glyph.x), f64::from(glyph.y))) * glyph_transform;
+                painter
+                    .glyphs(&font, &gradient)
+                    .font_size(22.0)
+                    .transform(run_transform * glyph_to_run)
+                    .brush_transform(Some(glyph_to_run.inverse() * brush_transform))
+                    .draw(&style, [Glyph { id, x: 0.0, y: 0.0 }]);
+            }
+
+            let expected = renderer.render_scene(&expected_scene, 112, 112).unwrap();
+            assert!(
+                expected
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0)
+            );
+            let actual = renderer.render_scene(&actual_scene, 112, 112).unwrap();
+            assert!(
+                actual.data == expected.data,
+                "direct draw for {glyph_transform:?}"
+            );
+
+            let mut picture = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 112.0, 112.0));
+            replay(&actual_scene, &mut picture);
+            let actual = renderer
+                .render_picture(&picture.finish_picture().unwrap(), 112, 112)
+                .unwrap();
+            assert!(
+                actual.data == expected.data,
+                "picture draw for {glyph_transform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transformed_glyph_outline_is_stroked_in_run_space() {
+        let font = test_font();
+        let typeface = test_typeface();
+        let id = typeface.unichar_to_glyph('H' as i32);
+        let glyph = Glyph {
+            id: u32::from(id),
+            x: 24.0,
+            y: 48.0,
+        };
+        let font_size = 22.0;
+        let stroke = kurbo::Stroke::new(3.0).with_dashes(0.0, [4.0, 3.0]);
+        let run_transform = Affine::translate((7.0, 11.0));
+        let glyph_transform = Affine::new([2.0, 0.5, 0.0, 1.0, 4.0, -2.0]);
+        let mut scene = Scene::new();
+        Painter::new(&mut scene)
+            .glyphs(&font, Color::WHITE)
+            .font_size(font_size)
+            .transform(run_transform)
+            .glyph_transform(Some(glyph_transform))
+            .draw(&Style::Stroke(stroke.clone()), [glyph]);
+
+        let mut native_font = sk::Font::from_typeface(typeface, font_size);
+        native_font
+            .set_hinting(sk::FontHinting::None)
+            .set_subpixel(true);
+        let path = native_font
+            .get_path(id)
+            .unwrap()
+            .with_transform(&affine_to_matrix(
+                Affine::translate((f64::from(glyph.x), f64::from(glyph.y))) * glyph_transform,
+            ));
+        let mut paint = sk::Paint::default();
+        paint.set_anti_alias(true).set_color(sk::Color::WHITE);
+        apply_stroke_style(&mut paint, &stroke);
+
+        let mut renderer = SkiaCpuRenderer::new();
+        renderer.resize(112, 112);
+        renderer
+            .surface
+            .canvas()
+            .concat(&affine_to_matrix(run_transform))
+            .draw_path(&path, &paint);
+        let mut expected = RgbaImage::new(112, 112);
+        renderer
+            .read_into_target(ImageBufferTarget::from_rgba_image(&mut expected))
+            .unwrap();
+        assert!(
+            expected
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] > 0)
+        );
+        let actual = renderer.render_scene(&scene, 112, 112).unwrap();
+        assert!(
+            actual.data == expected.data,
+            "affine glyph stroke width and dashes"
+        );
     }
 
     #[cfg(feature = "gpu")]
