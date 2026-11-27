@@ -205,21 +205,18 @@ fn draw_glyph_run(
     glyph_run: GlyphRunRef<'_>,
     glyphs: &mut dyn Iterator<Item = record::Glyph>,
 ) {
-    let embolden = glyph_run.font_embolden != kurbo::Vec2::ZERO;
-    // Outline expansion precedes the per-glyph transform. Native glyph drawing
-    // folds that transform into the font; retain an untransformed font here.
-    let font_run = GlyphRunRef {
-        glyph_transform: if embolden {
-            None
-        } else {
-            glyph_run.glyph_transform
-        },
-        ..glyph_run.clone()
-    };
-    let Some(mut font) = skia_font_from_glyph_run(font_cache, &font_run) else {
+    let Some(mut font) = skia_font_from_glyph_run(font_cache, &glyph_run) else {
         state.set_error_once(Error::InvalidFontData);
         return;
     };
+    let glyph_transform = glyph_run.glyph_transform.unwrap_or(Affine::IDENTITY);
+    if !glyph_transform.is_finite() {
+        state.set_error_once(Error::UnsupportedGlyphTransform);
+        return;
+    }
+    if glyph_transform.determinant() == 0.0 {
+        return;
+    }
 
     set_matrix(canvas, glyph_run.transform);
 
@@ -257,7 +254,7 @@ fn draw_glyph_run(
     }
 
     font.set_subpixel(true);
-    if embolden {
+    if glyph_run.font_embolden != kurbo::Vec2::ZERO {
         for (&id, position) in glyph_ids.iter().zip(&positions) {
             if let Some(path) = font.get_path(id) {
                 let path = skia_outline_to_bez(&path);
@@ -270,7 +267,7 @@ fn draw_glyph_run(
                 );
                 path.apply_affine(
                     Affine::translate((f64::from(position.x), f64::from(position.y)))
-                        * glyph_run.glyph_transform.unwrap_or(Affine::IDENTITY),
+                        * glyph_transform,
                 );
                 if let Some(path) = bez_to_sk_path(&path) {
                     let path = match glyph_run.style {
@@ -281,28 +278,86 @@ fn draw_glyph_run(
                 }
             } else {
                 // Bitmap and color glyphs retain native rendering.
-                let Some(font) = skia_font_from_glyph_run(font_cache, &glyph_run) else {
-                    state.set_error_once(Error::UnsupportedGlyphTransform);
-                    return;
-                };
-                canvas.draw_glyphs_at(
+                draw_native_glyphs(
+                    canvas,
+                    font.clone(),
                     &[id],
-                    core::slice::from_ref(position),
-                    sk::Point::new(0.0, 0.0),
-                    &font,
+                    &mut [*position],
                     &sk_paint,
+                    glyph_run.transform,
+                    glyph_transform,
                 );
             }
         }
         return;
     }
-    canvas.draw_glyphs_at(
+    draw_native_glyphs(
+        canvas,
+        font,
         &glyph_ids,
-        positions.as_slice(),
-        sk::Point::new(0.0, 0.0),
-        &font,
+        &mut positions,
         &sk_paint,
+        glyph_run.transform,
+        glyph_transform,
     );
+}
+
+fn draw_native_glyphs(
+    canvas: &sk::Canvas,
+    mut font: sk::Font,
+    glyph_ids: &[sk::GlyphId],
+    positions: &mut [sk::Point],
+    paint: &sk::Paint,
+    run_transform: Affine,
+    glyph_transform: Affine,
+) {
+    let [a, b, c, d, x, y] = glyph_transform.as_coeffs();
+    let origin = sk::Point::new(0.0, 0.0);
+    if b == 0.0 && d > 0.0 {
+        // A font can express positive vertical scale, horizontal scale and X skew.
+        if a != 1.0 || c != 0.0 || d != 1.0 {
+            font.set_size(f64_to_f32(f64::from(font.size()) * d))
+                .set_scale_x(f64_to_f32(a / d))
+                .set_skew_x(f64_to_f32(c / d));
+        }
+        if x != 0.0 || y != 0.0 {
+            for position in positions.iter_mut() {
+                position.x = f64_to_f32(f64::from(position.x) + x);
+                position.y = f64_to_f32(f64::from(position.y) + y);
+            }
+        }
+        canvas.draw_glyphs_at(glyph_ids, &*positions, origin, &font, paint);
+        return;
+    }
+
+    let mut glyph_paint = paint.clone();
+    let shader = paint.shader();
+    for (&id, position) in glyph_ids.iter().zip(positions) {
+        let glyph_to_run =
+            Affine::translate((f64::from(position.x), f64::from(position.y))) * glyph_transform;
+        // Transform the outline before stroking it so the stroke width stays in run space.
+        if paint.style() == sk::PaintStyle::Stroke
+            && let Some(path) = font.get_path(id)
+        {
+            set_matrix(canvas, run_transform);
+            canvas.draw_path(&path.with_transform(&affine_to_matrix(glyph_to_run)), paint);
+            continue;
+        }
+        set_matrix(canvas, run_transform * glyph_to_run);
+        if let Some(shader) = &shader {
+            // Cancel the glyph-local matrix for the shader so the brush stays in run space.
+            glyph_paint
+                .set_shader(shader.with_local_matrix(&affine_to_matrix(glyph_to_run.inverse())));
+        }
+        canvas.draw_glyphs_at(
+            &[id],
+            core::slice::from_ref(&origin),
+            origin,
+            &font,
+            &glyph_paint,
+        );
+    }
+    set_matrix(canvas, run_transform);
 }
 
 fn skia_outline_to_bez(path: &sk::Path) -> kurbo::BezPath {
