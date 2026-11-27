@@ -38,7 +38,7 @@ use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, RgbaImage, StrokeRef,
     filter::FilterEffectsRef,
-    record::{Scene, ValidateError},
+    record::{Command, Scene, ValidateError},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
         RenderContentError, RenderSource,
@@ -2349,14 +2349,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         if let Some(coverage) = self.lookup_cached_mask(scene, mode, transform, bounds) {
             return Some(GroupMask { bounds, coverage });
         }
-        let pixmap = match rasterize_scene_mask(scene, bounds, transform) {
-            Ok(pixmap) => pixmap,
-            Err(error) => {
-                self.error.get_or_insert(error);
-                return None;
-            }
-        };
-        let coverage = coverage_from_mask_pixmap(&pixmap, mode);
+        let pixmap = rasterize_scene_mask(scene, bounds, transform)?;
+        let coverage = coverage_from_mask_pixmap(pixmap.as_ref(), mode);
         self.store_cached_mask(scene, mode, transform, bounds, coverage.clone());
         Some(GroupMask { bounds, coverage })
     }
@@ -2832,23 +2826,42 @@ impl Default for TinySkiaRenderer {
     }
 }
 
-fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Result<Pixmap> {
-    let origin = Affine::translate((-f64::from(bounds.x()), -f64::from(bounds.y())));
+fn rasterize_scene_pixmap(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    transform: Affine,
+) -> Option<Arc<Pixmap>> {
     let mut renderer = TinySkiaRenderer::new();
-    let mut render = renderer.begin(bounds.width(), bounds.height())?;
-    imaging::record::replay_transformed(scene, &mut render, origin * transform);
-    if let Some(error) = render.error {
-        return Err(error);
-    }
-    let layer = render
-        .layers
-        .into_iter()
-        .next()
-        .ok_or(Error::Internal("missing mask pixmap"))?;
+    let mut render = renderer.begin(width, height).ok()?;
+    imaging::record::replay_transformed(scene, &mut render, transform);
+    let layer = render.layers.into_iter().next()?;
     match layer.pixmap {
-        LayerPixmap::Owned(pixmap) => Ok(pixmap),
-        LayerPixmap::Borrowed(_) => Err(Error::Internal("mask pixmap must be owned")),
+        LayerPixmap::Owned(pixmap) => Some(Arc::new(pixmap)),
+        LayerPixmap::Borrowed(_) => None,
     }
+}
+
+fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Option<Arc<Pixmap>> {
+    let width = bounds.width();
+    let height = bounds.height();
+    let origin = Affine::translate((-f64::from(bounds.x()), -f64::from(bounds.y())));
+    let pixmap = rasterize_scene_pixmap(scene, width, height, origin * transform)?;
+    Some(pixmap)
+}
+
+fn mask_requires_filter_graph(scene: &Scene) -> bool {
+    scene.commands().iter().any(|command| {
+        let Command::PushGroup(id) = *command else {
+            return false;
+        };
+        let group = scene.group(id);
+        matches!(group.filters.as_ref(), FilterEffectsRef::Graph(_))
+            || group
+                .mask
+                .as_ref()
+                .is_some_and(|mask| mask_requires_filter_graph(&scene.mask(mask.mask).scene))
+    })
 }
 
 impl PaintSink for TinySkiaRender<'_, '_> {
@@ -2875,16 +2888,20 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
-        let FilterEffectsRef::Chain(filters) = group.filters else {
-            self.error.get_or_insert(Error::UnsupportedFilter);
-            self.group_frames.push(GroupFrame::Empty);
-            return;
+        let mask_scene = group.mask.as_ref().map(|mask| mask.mask.scene);
+        let filters = match group.filters {
+            FilterEffectsRef::Chain(filters)
+                if !mask_scene.is_some_and(mask_requires_filter_graph) =>
+            {
+                filters
+            }
+            _ => {
+                self.error.get_or_insert(Error::UnsupportedFilter);
+                self.group_frames.push(GroupFrame::Empty);
+                return;
+            }
         };
-        if group
-            .mask
-            .as_ref()
-            .is_some_and(|mask| mask.mask.scene.has_external_images())
-        {
+        if mask_scene.is_some_and(Scene::has_external_images) {
             self.error = Some(Error::UnsupportedExternalImage);
         }
         if self.discarding_group() {

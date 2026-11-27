@@ -26,13 +26,16 @@ use std::sync::Arc;
 const SURFACE: Rect = Rect::new(0.0, 0.0, 16.0, 8.0);
 
 fn check_filter_graph_rejection(renderer: &mut dyn ImageRenderer) {
+    let mut image = Scene::new();
+    let brush = imaging::ImageBrush::new(imaging::ExternalImage::new(16, 8, ImageAlphaType::Alpha));
+    Painter::new(&mut image).draw_image(&brush, Affine::IDENTITY);
     let graph = FilterGraph {
         region: SURFACE,
         primitives: vec![FilterPrimitive {
             subregion: Some(SURFACE),
             color_space: FilterColorSpace::Srgb,
-            kind: FilterPrimitiveKind::Flood {
-                color: Color::WHITE,
+            kind: FilterPrimitiveKind::Image {
+                scene: Box::new(image),
             },
         }],
         output: FilterInput::Result(FilterId(0)),
