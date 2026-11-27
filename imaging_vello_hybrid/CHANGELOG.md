@@ -13,6 +13,11 @@ released on 2026-05-30. You can find its changes [documented below](#002-2026-05
 
 ## [Unreleased]
 
+### Changed
+
+- Applications select graphics backends through their `wgpu` 30 dependency. Add `wgpu = "30.0.2"`
+  to keep using the default backends.
+
 ## [0.0.2][] (2026-05-30)
 
 This release has an [MSRV][] of 1.92.

@@ -1,11 +1,6 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-#[cfg(feature = "vello")]
-use imaging_vello::wgpu;
-#[cfg(not(feature = "vello"))]
-use imaging_vello_hybrid::wgpu;
-
 pub(super) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let policy = std::env::var("IMAGING_CI_GPU_SUPPORT");
     if policy.as_deref() == Ok("no") {

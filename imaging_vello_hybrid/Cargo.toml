@@ -17,7 +17,7 @@ imaging_wgpu = { default-features = false, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 vello_common = { default-features = true, workspace = true }
-vello_gpu.workspace = true
+vello_gpu = { features = ["all_shader_features", "text", "wgpu"], workspace = true }
 wgpu = { features = [
     "std",
     "wgsl",
@@ -28,6 +28,7 @@ workspace = true
 
 [dev-dependencies]
 pollster = "0.4.0"
+wgpu = { default-features = true, workspace = true }
 
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"

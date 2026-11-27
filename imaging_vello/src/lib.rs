@@ -14,6 +14,19 @@
 //!
 //! This crate uses Vello 0.12 with `wgpu` 30.
 //!
+//! # Select a `wgpu` Backend
+//!
+//! Applications choose which graphics backends to compile through their own `wgpu` dependency.
+//! This `Cargo.toml` entry selects Metal on macOS.
+//!
+//! ```toml
+//! [dependencies]
+//! wgpu = { version = "30.0.2", default-features = false, features = ["metal"] }
+//! ```
+//!
+//! If you previously relied on `imaging_vello` to enable the `wgpu` defaults, add
+//! `wgpu = "30.0.2"` to keep using the default backends.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with [`VelloRenderer`].
