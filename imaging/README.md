@@ -27,6 +27,9 @@ Full documentation at https://github.com/orium/cargo-rdme -->
 - Painting: stream borrowed commands into any [`PaintSink`] with [`Painter`].
 - Recording: retain an owned command stream in [`record::Scene`] for validation and replay.
 
+Start with [`guide::learning_path`] for runnable examples. Use [`guide::mental_model`] to
+understand the command stream and [`guide::backends`] to choose a renderer.
+
 The root of the crate is intentionally focused on the streaming surface and the shared drawing
 vocabulary. Retained scene data and low-level recording payloads live under [`record`].
 
@@ -43,57 +46,19 @@ recorder, validator, or any other [`PaintSink`] implementation without first con
 retained payloads.
 
 ```rust
-use imaging::{
-    BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, StrokeRef,
-};
-use kurbo::Rect;
-use peniko::Color;
+use imaging::{Painter, kurbo::Rect, peniko::Color, record::Scene};
 
-#[derive(Default)]
-struct CountingSink {
-    fills: usize,
-    clips: usize,
-}
-
-impl PaintSink for CountingSink {
-    fn push_clip(&mut self, _clip: ClipRef<'_>) {
-        self.clips += 1;
-    }
-
-    fn pop_clip(&mut self) {}
-
-    fn push_group(&mut self, _group: GroupRef<'_>) {}
-
-    fn pop_group(&mut self) {}
-
-    fn fill(&mut self, _draw: FillRef<'_>) {
-        self.fills += 1;
-    }
-
-    fn stroke(&mut self, _draw: StrokeRef<'_>) {}
-
-    fn glyph_run(
-        &mut self,
-        _draw: GlyphRunRef<'_>,
-        _glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
-    ) {}
-
-    fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
-}
-
-let mut sink = CountingSink::default();
-
-{
-    let mut painter = Painter::new(&mut sink);
-    painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
-    painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |p| {
-        p.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
-    });
-}
-
-assert_eq!(sink.fills, 2);
-assert_eq!(sink.clips, 1);
+let mut scene = Scene::new();
+let mut painter = Painter::new(&mut scene);
+painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::WHITE);
+painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |painter| {
+    painter.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
+});
 ```
+
+The [counting sink example] implements [`PaintSink`] to receive the same commands.
+
+[counting sink example]: https://github.com/forest-rs/imaging/blob/main/imaging_examples/examples/counting_sink.rs
 
 # Recording
 
@@ -143,6 +108,9 @@ The API is intentionally small and experimental; expect breaking changes while w
 
 <!-- cargo-rdme end -->
 
+[`guide::backends`]: https://docs.rs/imaging/latest/imaging/guide/backends/
+[`guide::learning_path`]: https://docs.rs/imaging/latest/imaging/guide/learning_path/
+[`guide::mental_model`]: https://docs.rs/imaging/latest/imaging/guide/mental_model/
 [`PaintSink`]: https://docs.rs/imaging/latest/imaging/trait.PaintSink.html
 [`Painter`]: https://docs.rs/imaging/latest/imaging/struct.Painter.html
 [`Painter::with_context`]: https://docs.rs/imaging/latest/imaging/struct.Painter.html#method.with_context

@@ -7,6 +7,9 @@
 //! - Painting: stream borrowed commands into any [`PaintSink`] with [`Painter`].
 //! - Recording: retain an owned command stream in [`record::Scene`] for validation and replay.
 //!
+//! Start with [`guide::learning_path`] for runnable examples. Use [`guide::mental_model`] to
+//! understand the command stream and [`guide::backends`] to choose a renderer.
+//!
 //! The root of the crate is intentionally focused on the streaming surface and the shared drawing
 //! vocabulary. Retained scene data and low-level recording payloads live under [`record`].
 //!
@@ -23,57 +26,19 @@
 //! retained payloads.
 //!
 //! ```rust
-//! use imaging::{
-//!     BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, StrokeRef,
-//! };
-//! use kurbo::Rect;
-//! use peniko::Color;
+//! use imaging::{Painter, kurbo::Rect, peniko::Color, record::Scene};
 //!
-//! #[derive(Default)]
-//! struct CountingSink {
-//!     fills: usize,
-//!     clips: usize,
-//! }
-//!
-//! impl PaintSink for CountingSink {
-//!     fn push_clip(&mut self, _clip: ClipRef<'_>) {
-//!         self.clips += 1;
-//!     }
-//!
-//!     fn pop_clip(&mut self) {}
-//!
-//!     fn push_group(&mut self, _group: GroupRef<'_>) {}
-//!
-//!     fn pop_group(&mut self) {}
-//!
-//!     fn fill(&mut self, _draw: FillRef<'_>) {
-//!         self.fills += 1;
-//!     }
-//!
-//!     fn stroke(&mut self, _draw: StrokeRef<'_>) {}
-//!
-//!     fn glyph_run(
-//!         &mut self,
-//!         _draw: GlyphRunRef<'_>,
-//!         _glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
-//!     ) {}
-//!
-//!     fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
-//! }
-//!
-//! let mut sink = CountingSink::default();
-//!
-//! {
-//!     let mut painter = Painter::new(&mut sink);
-//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
-//!     painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |p| {
-//!         p.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
-//!     });
-//! }
-//!
-//! assert_eq!(sink.fills, 2);
-//! assert_eq!(sink.clips, 1);
+//! let mut scene = Scene::new();
+//! let mut painter = Painter::new(&mut scene);
+//! painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::WHITE);
+//! painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |painter| {
+//!     painter.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
+//! });
 //! ```
+//!
+//! The [counting sink example] implements [`PaintSink`] to receive the same commands.
+//!
+//! [counting sink example]: https://github.com/forest-rs/imaging/blob/main/imaging_examples/examples/counting_sink.rs
 //!
 //! # Recording
 //!
@@ -132,6 +97,19 @@ use peniko::BlendMode;
 
 mod brush;
 pub mod diagnostics;
+#[cfg(doc)]
+pub mod guide {
+    //! Guides to the command stream, retained scenes, and workspace backends.
+
+    #[doc = include_str!("guide/learning_path.md")]
+    pub mod learning_path {}
+
+    #[doc = include_str!("guide/mental_model.md")]
+    pub mod mental_model {}
+
+    #[doc = include_str!("guide/backends.md")]
+    pub mod backends {}
+}
 mod filter;
 mod image;
 mod paint;
