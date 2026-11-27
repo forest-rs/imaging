@@ -9,7 +9,7 @@ use hashbrown::HashMap;
 use imaging::MaskMode;
 use kurbo::{Affine, BezPath, Cap, Join, Point, Shape as _, Stroke};
 use peniko::{
-    BlendMode, Blob, Brush, ColorStop, Extend, Fill, Gradient, ImageAlphaType, ImageBrush,
+    BlendMode, Blob, Brush, ColorStop, Compose, Extend, Fill, Gradient, ImageAlphaType, ImageBrush,
     ImageData, ImageFormat, ImageQuality, Mix,
 };
 use usvg::{Node, PaintOrder};
@@ -613,5 +613,6 @@ fn map_blend_mode(mode: usvg::BlendMode) -> BlendMode {
         usvg::BlendMode::Saturation => BlendMode::from(Mix::Saturation),
         usvg::BlendMode::Color => BlendMode::from(Mix::Color),
         usvg::BlendMode::Luminosity => BlendMode::from(Mix::Luminosity),
+        usvg::BlendMode::PlusLighter => BlendMode::from(Compose::PlusLighter),
     }
 }

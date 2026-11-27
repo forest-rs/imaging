@@ -44,7 +44,7 @@ hashbrown = { default-features = false, features = ["default-hasher"], version =
 image = { default-features = false, version = "0.25" }
 kurbo = { default-features = false, version = "0.13.1" }
 peniko = { default-features = false, version = "0.6.1" }
-usvg = { default-features = false, features = ["text"], version = "0.47.0" }
+usvg = { default-features = false, features = ["svgz", "text"], version = "0.50.0" }
 vello_common = { default-features = false, version = "0.4.0" }
 vello_gpu = { default-features = false, version = "0.4.0" }
 wgpu = { default-features = false, version = "30.0.2" }
