@@ -16,8 +16,22 @@
 //! anisotropic or sheared blur kernel return [`Error::UnsupportedFilter`].
 
 #![deny(unsafe_code)]
+#![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+extern crate alloc;
+
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use core::{
+    borrow::Borrow,
+    mem::{Discriminant, discriminant},
+};
+#[cfg(feature = "libm")]
+#[allow(unused_imports, reason = "std provides inherent float methods")]
+use core_maths::CoreFloat as _;
+// Keep the standard-library cache implementation when both features are enabled.
+#[cfg(all(feature = "std", feature = "libm"))]
+use hashbrown as _;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, RgbaImage, StrokeRef,
@@ -34,14 +48,10 @@ use peniko::{
     color::{self, ColorSpaceTag, DynamicColor, HueDirection, Srgb},
     kurbo::{PathEl, Size},
 };
+#[cfg(feature = "std")]
 use rustc_hash::FxHashMap;
-use std::{
-    borrow::Borrow,
-    collections::VecDeque,
-    mem::Discriminant,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+#[cfg(feature = "std")]
+use std::time::{Duration, Instant};
 use swash::{
     FontRef,
     scale::{Render, ScaleContext, Source, StrikeWith, image::Content},
@@ -54,6 +64,8 @@ use tiny_skia::{
     SweepGradient, Transform,
 };
 
+#[cfg(not(feature = "std"))]
+type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
 type Result<T, E = Error> = core::result::Result<T, E>;
 
 /// Errors that can occur when rendering via tiny-skia.
@@ -269,16 +281,26 @@ struct GlyphRasterRequest<'a> {
 
 fn cache_glyph(caches: &mut RendererCaches, request: GlyphRasterRequest<'_>) -> Option<Arc<Glyph>> {
     let c = request.color.to_rgba8();
+    #[cfg(feature = "std")]
     let now = Instant::now();
 
     if let Some(entry) = caches.glyph_cache.get_mut(&(request.cache_key, c.to_u32())) {
         entry.cache_color = request.cache_color;
-        entry.last_touched = now;
+        #[cfg(feature = "std")]
+        {
+            entry.last_touched = now;
+        }
         let opt_glyph = entry.glyph.clone();
         return opt_glyph;
     }
 
-    cache_glyph_miss(caches, request, c.to_u32(), now)
+    cache_glyph_miss(
+        caches,
+        request,
+        c.to_u32(),
+        #[cfg(feature = "std")]
+        now,
+    )
 }
 
 // Swash's faux bold shifts contours and uses a different strength convention.
@@ -349,7 +371,7 @@ fn cache_glyph_miss(
     caches: &mut RendererCaches,
     request: GlyphRasterRequest<'_>,
     color_key: u32,
-    now: Instant,
+    #[cfg(feature = "std")] now: Instant,
 ) -> Option<Arc<Glyph>> {
     let c = request.color.to_rgba8();
     let mut scaler = caches
@@ -446,6 +468,7 @@ fn cache_glyph_miss(
         GlyphCacheEntry {
             cache_color: request.cache_color,
             glyph: result.clone(),
+            #[cfg(feature = "std")]
             last_touched: now,
         },
     );
@@ -481,20 +504,32 @@ pub(crate) struct ClipPath {
 #[derive(PartialEq, Clone, Copy)]
 struct CacheColor(bool);
 
+#[cfg(feature = "std")]
 const GLYPH_CACHE_MIN_TTL: Duration = Duration::from_millis(100);
 
 struct GlyphCacheEntry {
     cache_color: CacheColor,
     glyph: Option<Arc<Glyph>>,
+    #[cfg(feature = "std")]
     last_touched: Instant,
 }
 
 fn should_retain_glyph_entry(
     entry: &GlyphCacheEntry,
     cache_color: CacheColor,
-    now: Instant,
+    #[cfg(feature = "std")] now: Instant,
 ) -> bool {
-    entry.cache_color == cache_color || now.duration_since(entry.last_touched) < GLYPH_CACHE_MIN_TTL
+    if entry.cache_color == cache_color {
+        return true;
+    }
+
+    #[cfg(feature = "std")]
+    {
+        now.duration_since(entry.last_touched) < GLYPH_CACHE_MIN_TTL
+    }
+
+    #[cfg(not(feature = "std"))]
+    false
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -511,8 +546,8 @@ impl ImageCacheKey {
             blob: image.data.id(),
             width: image.width,
             height: image.height,
-            format: std::mem::discriminant(&image.format),
-            alpha_type: std::mem::discriminant(&image.alpha_type),
+            format: discriminant(&image.format),
+            alpha_type: discriminant(&image.alpha_type),
         }
     }
 }
@@ -3973,10 +4008,16 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         self.caches
             .blurred_rrect_cache
             .retain(|_, (c, _)| *c == self.cache_color);
+        #[cfg(feature = "std")]
         let now = Instant::now();
-        self.caches
-            .glyph_cache
-            .retain(|_, entry| should_retain_glyph_entry(entry, self.cache_color, now));
+        self.caches.glyph_cache.retain(|_, entry| {
+            should_retain_glyph_entry(
+                entry,
+                self.cache_color,
+                #[cfg(feature = "std")]
+                now,
+            )
+        });
         self.cache_color = CacheColor(!self.cache_color.0);
         *self.cache_color_out = self.cache_color;
     }
@@ -4164,7 +4205,7 @@ where
         image: image_id,
         width,
         height,
-        quality: std::mem::discriminant(&image.sampler.quality),
+        quality: discriminant(&image.sampler.quality),
     };
     if let Some((entry_color, pixmap)) = caches.scaled_image_cache.get_mut(&key) {
         *entry_color = cache_color;
@@ -6140,7 +6181,7 @@ mod tests {
     #[test]
     fn normalized_text_transform_keeps_translation_and_rotation_separate() {
         let transform = Affine::translate((30.0, 20.0))
-            * Affine::rotate(std::f64::consts::FRAC_PI_2)
+            * Affine::rotate(core::f64::consts::FRAC_PI_2)
             * Affine::scale(2.0);
 
         let normalized = normalize_affine(transform, true);
@@ -6180,6 +6221,7 @@ mod tests {
         assert_eq!(y, 20.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn glyph_cache_entries_get_a_minimum_ttl() {
         let now = Instant::now();
@@ -6209,6 +6251,17 @@ mod tests {
             CacheColor(true),
             now
         ));
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn glyph_cache_retains_entries_used_in_the_current_frame() {
+        let entry = GlyphCacheEntry {
+            cache_color: CacheColor(true),
+            glyph: None,
+        };
+        assert!(should_retain_glyph_entry(&entry, CacheColor(true)));
+        assert!(!should_retain_glyph_entry(&entry, CacheColor(false)));
     }
 
     #[test]
