@@ -14,21 +14,28 @@ default = ["std"]
 std = [
     "imaging/std",
     "peniko/std",
+    "rustc-hash/std",
+    "swash/std",
     "tiny-skia/std",
 ]
 libm = [
+    "dep:core_maths",
+    "dep:hashbrown",
     "imaging/libm",
     "peniko/libm",
+    "swash/libm",
     "tiny-skia/no-std-float",
 ]
 
 [dependencies]
 bytemuck = { default-features = false, version = "1.24" }
+core_maths = { optional = true, version = "0.1.1" }
+hashbrown = { optional = true, workspace = true }
 imaging = { workspace = true }
 kurbo.workspace = true
 peniko.workspace = true
-rustc-hash = "2.1"
-swash = "0.2"
+rustc-hash = { default-features = false, version = "2.1" }
+swash = { default-features = false, features = ["render"], version = "0.2" }
 tiny-skia = { default-features = false, features = ["simd"], version = "0.12" }
 
 [lints]

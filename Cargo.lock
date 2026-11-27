@@ -1161,6 +1161,8 @@ name = "imaging_tiny_skia"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "core_maths",
+ "hashbrown 0.17.1",
  "imaging",
  "kurbo",
  "peniko",
@@ -2107,6 +2109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b634fabf032fab15307ffd272149b622260f55974d9fad689292a5d33df02e5"
 dependencies = [
  "bytemuck",
+ "core_maths",
  "font-types 0.11.3",
 ]
 
@@ -2450,6 +2453,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fbdfe3d2475fbd7ddd1f3e5cf8288a30eb3e5f95832829570cd88115a7434ac"
 dependencies = [
  "bytemuck",
+ "core_maths",
  "read-fonts 0.37.0",
 ]
 
@@ -2580,6 +2584,7 @@ version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "842f3cd369c2ba38966204f983eaa5e54a8e84a7d7159ed36ade2b6c335aae64"
 dependencies = [
+ "core_maths",
  "skrifa 0.40.0",
  "yazi",
  "zeno",
@@ -3615,6 +3620,9 @@ name = "zeno"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "zerocopy"
