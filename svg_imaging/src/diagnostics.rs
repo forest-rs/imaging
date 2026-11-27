@@ -12,7 +12,7 @@ pub enum UnsupportedFeatureKind {
     ClipPath,
     /// A mask feature could not be lowered.
     Mask,
-    /// A filter chain uses a primitive, input, or color space that cannot be lowered.
+    /// A filter chain could not be lowered, for example because `feImage` uses unsupported content.
     Filter,
     /// Raster image nodes that failed to decode.
     Image,

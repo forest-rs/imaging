@@ -38,11 +38,13 @@ definitions, text lowered through `usvg`'s flattened vector output, nested SVG
 `<image>` nodes, and raster PNG/JPEG/GIF/WebP `<image>` nodes. Pattern paints are reported
 as unsupported.
 
-Filters support ordered chains of `feFlood`, `feOffset`, and sRGB `feGaussianBlur` and
-`feDropShadow`, with filter and primitive regions resolved by `usvg`. Each stage that takes
-an input must use the preceding result, or `SourceGraphic` at the start of each filter.
-If a group uses any unsupported filter primitive, input, or color space, lowering reports
-the chain and draws the group unfiltered. Filter execution depends on the Imaging backend.
+Filter lowering preserves the normalized SVG primitives, named inputs, color spaces, and
+regions from `usvg`, including retained `feImage` content. Ordered chains of `feFlood`,
+`feOffset`, and sRGB `feGaussianBlur` and `feDropShadow` can use Imaging's linear filter API
+when each input is the preceding result or the source at the start of a filter. Other chains
+use Imaging's filter graph API. If a chain cannot be lowered, the report identifies the
+affected group, which is drawn with its original content. Filter execution depends on the
+Imaging backend.
 
 Text rendering depends on the parse options' font database. `usvg::Options::default()` starts
 with an empty font database, so callers that need text should load fonts into

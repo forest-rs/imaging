@@ -15,6 +15,8 @@ The latest published `svg_imaging` release is [0.0.1](#001-2026-05-21), which wa
 
 ### Added
 
+- Lower SVG filter graphs with named inputs, per-primitive color spaces and regions, and
+  retained `feImage` scenes.
 - Lower ordered SVG filter chains of `feFlood`, `feOffset`, and sRGB `feGaussianBlur` and
   `feDropShadow`, preserving filter regions and applying group clips, masks, and opacity
   after filtering.

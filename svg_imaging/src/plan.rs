@@ -5,7 +5,7 @@
 
 use alloc::vec::Vec;
 
-use imaging::{Composite, Filter, MaskMode};
+use imaging::{Composite, Filter, MaskMode, filter::FilterGraph};
 use kurbo::{Affine, BezPath, Rect, Stroke};
 use peniko::{Brush, Fill, ImageBrush};
 
@@ -41,12 +41,17 @@ pub(crate) enum PlanNode {
     Stroke(PlanStroke),
 }
 
-/// Ordered filters with clips between them in filter user space.
+/// Ordered filters in filter user space.
 #[derive(Clone, Debug)]
-pub(crate) struct PlanFilterChain {
-    /// Crop applied to the incoming `SourceGraphic`.
-    pub(crate) source_region: Rect,
-    pub(crate) steps: Vec<PlanFilterStep>,
+pub(crate) enum PlanFilterChain {
+    /// Effects expressible as a linear chain with a crop between stages.
+    Linear {
+        /// Crop applied to the incoming `SourceGraphic`.
+        source_region: Rect,
+        steps: Vec<PlanFilterStep>,
+    },
+    /// One graph per SVG filter definition.
+    Graphs(Vec<FilterGraph>),
 }
 
 #[derive(Clone, Debug)]

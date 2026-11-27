@@ -8,7 +8,8 @@ use alloc::{vec, vec::Vec};
 use imaging::{ClipRef, GroupRef, PaintSink, Painter, record};
 
 use crate::plan::{
-    PlanClip, PlanFill, PlanGroup, PlanImage, PlanMask, PlanMaskId, PlanNode, PlanStroke,
+    PlanClip, PlanFill, PlanFilterChain, PlanGroup, PlanImage, PlanMask, PlanMaskId, PlanNode,
+    PlanStroke,
 };
 
 /// Emit a lowered render plan into a painter.
@@ -52,29 +53,58 @@ impl<'a> EmitCx<'a> {
                 chain,
                 transform,
                 children,
+            } => self.emit_filtered(chain, *transform, children, painter),
+            PlanNode::Fill(fill) => emit_fill(fill, painter),
+            PlanNode::Image(image) => emit_image(image, painter),
+            PlanNode::Stroke(stroke) => emit_stroke(stroke, painter),
+        }
+    }
+
+    fn emit_filtered<S>(
+        &mut self,
+        chain: &PlanFilterChain,
+        transform: kurbo::Affine,
+        children: &[PlanNode],
+        painter: &mut Painter<'_, S>,
+    ) where
+        S: PaintSink + ?Sized,
+    {
+        // Nested groups close inside out, so push each chain in reverse order.
+        let groups = match chain {
+            PlanFilterChain::Linear {
+                source_region,
+                steps,
             } => {
-                // Nested groups close inside out, so push the stages in reverse order.
-                // Each group clips its filter output before the next stage uses it.
-                for step in chain.steps.iter().rev() {
+                for step in steps.iter().rev() {
                     painter.push_group(
                         GroupRef::new()
-                            .with_clip(ClipRef::fill(step.output_region).with_transform(*transform))
+                            .with_clip(ClipRef::fill(step.output_region).with_transform(transform))
                             .with_filters(core::slice::from_ref(&step.effect))
-                            .with_filter_transform(*transform),
+                            .with_filter_transform(transform),
                     );
                 }
                 painter.with_group(
                     GroupRef::new()
-                        .with_clip(ClipRef::fill(chain.source_region).with_transform(*transform)),
+                        .with_clip(ClipRef::fill(*source_region).with_transform(transform)),
                     |painter| self.emit_nodes(children, painter),
                 );
-                for _ in &chain.steps {
-                    painter.pop_group();
-                }
+                steps.len()
             }
-            PlanNode::Fill(fill) => emit_fill(fill, painter),
-            PlanNode::Image(image) => emit_image(image, painter),
-            PlanNode::Stroke(stroke) => emit_stroke(stroke, painter),
+            PlanFilterChain::Graphs(graphs) => {
+                // Each filter sees the previous filter's output as its source and owns its region.
+                for graph in graphs.iter().rev() {
+                    painter.push_group(
+                        GroupRef::new()
+                            .with_filter_graph(graph)
+                            .with_filter_transform(transform),
+                    );
+                }
+                self.emit_nodes(children, painter);
+                graphs.len()
+            }
+        };
+        for _ in 0..groups {
+            painter.pop_group();
         }
     }
 
