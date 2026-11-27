@@ -6,13 +6,13 @@ backend or record them in a `record::Scene` for validation, replay, and tests.
 
 ## Get started
 
-From a workspace checkout, build and validate a small scene:
+Run these examples from a workspace checkout. `hello_scene` builds and validates a small scene.
 
 ```sh
 cargo run -p imaging_examples --example hello_scene
 ```
 
-Render a scene to a PNG with the Vello CPU backend:
+`render_png_vello_cpu` renders a scene with the Vello CPU backend and writes `out.png`.
 
 ```sh
 cargo run -p imaging_examples --example render_png_vello_cpu -- out.png

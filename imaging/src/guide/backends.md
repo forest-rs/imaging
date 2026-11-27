@@ -1,7 +1,6 @@
 # Backend map
 
-Use `imaging_vello_cpu` to try a renderer without setting up a GPU device. Run the PNG example
-from the workspace root:
+The PNG example uses `imaging_vello_cpu` to render on the CPU. Run it from the workspace root.
 
 ```sh
 cargo run -p imaging_examples --example render_png_vello_cpu -- out.png
