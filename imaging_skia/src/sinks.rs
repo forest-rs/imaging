@@ -3,13 +3,13 @@
 
 use super::{
     Error, ImageCache, SkiaFontCache, affine_to_matrix, apply_stroke_style, bez_to_sk_path,
-    brush_to_paint, build_filter_chain, f64_to_f32, geometry_to_bez_path, geometry_to_sk_path,
-    map_blend_mode, path_with_fill_rule, skia_font_from_glyph_run,
+    brush_to_paint, build_filter_chain, f64_to_f32, filter_graph, geometry_to_bez_path,
+    geometry_to_sk_path, map_blend_mode, path_with_fill_rule, skia_font_from_glyph_run,
 };
 use imaging::{
     BlurredRoundedRect, ClipRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode, PaintSink,
     StrokeRef,
-    filter::FilterEffectsRef,
+    filter::{FilterEffects, FilterEffectsRef},
     record::{self, replay_transformed},
 };
 use kurbo::{Affine, Rect, Shape as _};
@@ -36,7 +36,7 @@ enum GroupFrame {
 #[derive(Debug)]
 struct MaskedGroupFrame {
     clip: Option<record::Clip>,
-    filters: Vec<imaging::Filter>,
+    filters: FilterEffects,
     filter_transform: Affine,
     composite: imaging::Composite,
     mode: MaskMode,
@@ -118,25 +118,7 @@ fn clip_path(canvas: &sk::Canvas, state: &mut StreamState, clip: ClipRef<'_>) ->
     }
 }
 
-fn push_group_impl(
-    canvas: &sk::Canvas,
-    state: &mut StreamState,
-    group: GroupRef<'_>,
-    filters: &[imaging::Filter],
-) -> u8 {
-    if group
-        .mask
-        .as_ref()
-        .is_some_and(|mask| mask.mask.scene.has_external_images())
-    {
-        state.set_error_once(Error::UnsupportedExternalImage);
-    }
-    let (filter, filter_transform) =
-        build_transformed_filter_chain(filters, group.filter_transform);
-    if !filters.is_empty() && filter.is_none() {
-        state.set_error_once(Error::UnsupportedFilter);
-    }
-
+fn push_group_impl(canvas: &sk::Canvas, group: GroupRef<'_>, filter: Option<GroupFilter>) -> u8 {
     let mut paint = sk::Paint::default();
     paint.set_blend_mode(map_blend_mode(&group.composite.blend));
     paint.set_alpha_f(group.composite.alpha.clamp(0.0, 1.0));
@@ -144,15 +126,76 @@ fn push_group_impl(
     canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&paint));
     let mut restores = 1_u8;
     if let Some(filter) = filter {
-        set_matrix(canvas, filter_transform);
-        let mut filter_paint = sk::Paint::default();
-        filter_paint.set_image_filter(filter);
-        canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&filter_paint));
-        set_matrix(canvas, Affine::IDENTITY);
+        save_filter_layer(canvas, &filter);
         restores += 1;
     }
 
     restores
+}
+
+struct GroupFilter {
+    filter: sk::ImageFilter,
+    transform: Affine,
+    graph: bool,
+}
+
+fn build_group_filter(
+    effects: FilterEffectsRef<'_>,
+    transform: Affine,
+    tolerance: f64,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
+    font_cache: Option<&SkiaFontCache>,
+) -> Result<Option<GroupFilter>, Error> {
+    let filter = match effects {
+        FilterEffectsRef::Chain([]) => return Ok(None),
+        FilterEffectsRef::Chain(filters) => {
+            let (filter, transform) = build_transformed_filter_chain(filters, transform);
+            GroupFilter {
+                filter: filter.ok_or(Error::UnsupportedFilter)?,
+                transform,
+                graph: false,
+            }
+        }
+        FilterEffectsRef::Graph(graph) => {
+            let matrix = affine_to_matrix(transform);
+            if !matrix.is_finite() || matrix.invert().is_none() {
+                return Err(Error::UnsupportedFilter);
+            }
+
+            let filter = filter_graph::build(graph, &mut |scene, bounds| {
+                let mut recorder = SkPictureRecorderSink::new_with_options(
+                    bounds,
+                    false,
+                    image_cache.cloned(),
+                    font_cache.cloned(),
+                );
+                recorder.set_tolerance(tolerance);
+                record::replay(scene, &mut recorder);
+                recorder.finish_picture()
+            })?;
+            GroupFilter {
+                filter,
+                transform,
+                graph: true,
+            }
+        }
+    };
+    Ok(Some(filter))
+}
+
+fn save_filter_layer(canvas: &sk::Canvas, filter: &GroupFilter) {
+    set_matrix(canvas, filter.transform);
+    let mut paint = sk::Paint::default();
+    paint.set_image_filter(filter.filter.clone());
+    let color_space = filter.graph.then(sk::ColorSpace::new_srgb);
+    let mut layer = sk::canvas::SaveLayerRec::default().paint(&paint);
+    if let Some(color_space) = color_space.as_ref() {
+        layer = layer
+            .color_space(color_space)
+            .flags(sk::canvas::SaveLayerFlags::F16_COLOR_TYPE);
+    }
+    canvas.save_layer(&layer);
+    set_matrix(canvas, Affine::IDENTITY);
 }
 
 fn build_transformed_filter_chain(
@@ -471,12 +514,19 @@ fn draw_masked_group(
     paint.set_anti_alias(true);
     paint.set_blend_mode(map_blend_mode(&masked.composite.blend));
     paint.set_alpha_f(masked.composite.alpha.clamp(0.0, 1.0));
-    let (filter, filter_transform) =
-        build_transformed_filter_chain(&masked.filters, masked.filter_transform);
-    if !masked.filters.is_empty() && filter.is_none() {
-        state.set_error_once(Error::UnsupportedFilter);
-        return;
-    }
+    let filter = match build_group_filter(
+        masked.filters.as_ref(),
+        masked.filter_transform,
+        state.tolerance,
+        image_cache,
+        font_cache,
+    ) {
+        Ok(filter) => filter,
+        Err(err) => {
+            state.set_error_once(err);
+            return;
+        }
+    };
 
     set_matrix(canvas, Affine::IDENTITY);
     let bounds = canvas.local_clip_bounds();
@@ -489,12 +539,7 @@ fn draw_masked_group(
 
     // Filter the content before it is modulated by the fully rendered mask.
     if let Some(filter) = filter.as_ref() {
-        set_matrix(canvas, filter_transform);
-        let mut filter_paint = sk::Paint::default();
-        filter_paint.set_image_filter(filter.clone());
-        let rec = sk::canvas::SaveLayerRec::default().paint(&filter_paint);
-        canvas.save_layer(&rec);
-        set_matrix(canvas, Affine::IDENTITY);
+        save_filter_layer(canvas, filter);
     }
 
     if !replay_scene_into_canvas(
@@ -581,14 +626,16 @@ fn paint_sink_pop_clip(canvas: &sk::Canvas, state: &mut StreamState) {
     state.clip_depth -= 1;
 }
 
-fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: GroupRef<'_>) {
+fn paint_sink_push_group(
+    canvas: &sk::Canvas,
+    state: &mut StreamState,
+    image_cache: Option<&Rc<RefCell<ImageCache>>>,
+    font_cache: Option<&SkiaFontCache>,
+    group: GroupRef<'_>,
+) {
     if state.error.is_some() {
         return;
     }
-    let FilterEffectsRef::Chain(filters) = group.filters else {
-        state.set_error_once(Error::UnsupportedFilter);
-        return;
-    };
     if let Some(frame) = active_masked_group_mut(state) {
         PaintSink::push_group(&mut frame.content, group);
         frame.nested_group_depth += 1;
@@ -599,7 +646,7 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
             .group_stack
             .push(GroupFrame::Masked(Box::new(MaskedGroupFrame {
                 clip: group.clip.map(ClipRef::to_owned),
-                filters: filters.to_vec(),
+                filters: group.filters.to_owned(),
                 filter_transform: group.filter_transform,
                 composite: group.composite,
                 mode: mask.mask.mode,
@@ -610,8 +657,21 @@ fn paint_sink_push_group(canvas: &sk::Canvas, state: &mut StreamState, group: Gr
             })));
         return;
     }
+    let filter = match build_group_filter(
+        group.filters,
+        group.filter_transform,
+        state.tolerance,
+        image_cache,
+        font_cache,
+    ) {
+        Ok(filter) => filter,
+        Err(err) => {
+            state.set_error_once(err);
+            return;
+        }
+    };
     let clip = group.clip.as_ref().map(|clip| clip.clone().to_owned());
-    let restores = push_group_impl(canvas, state, group, filters);
+    let restores = push_group_impl(canvas, group, filter);
     state
         .group_stack
         .push(GroupFrame::Direct { restores, clip });
@@ -833,7 +893,13 @@ impl PaintSink for SkCanvasSink<'_> {
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
-        paint_sink_push_group(self.canvas, &mut self.state, group);
+        paint_sink_push_group(
+            self.canvas,
+            &mut self.state,
+            self.image_cache.as_ref(),
+            self.font_cache.as_ref(),
+            group,
+        );
     }
 
     fn pop_group(&mut self) {
@@ -1000,7 +1066,13 @@ impl PaintSink for SkPictureRecorderSink {
             state.set_error_once(Error::Internal("picture recorder not recording"));
             return;
         };
-        paint_sink_push_group(canvas, state, group);
+        paint_sink_push_group(
+            canvas,
+            state,
+            self.image_cache.as_ref(),
+            self.font_cache.as_ref(),
+            group,
+        );
     }
 
     fn pop_group(&mut self) {

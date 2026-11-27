@@ -13,6 +13,9 @@
 //!
 //! Masks use native Skia layers on raster canvases, GPU canvases, and recorded pictures.
 //! The rendered mask's alpha or luminance modulates the filtered content before compositing.
+//! Filter graphs use native Skia image filters. The group transform places the filter region
+//! and primitives, and the graph output is applied before the group mask and isolated clip.
+//! Configurations Skia cannot represent return [`Error::UnsupportedFilter`].
 //!
 //! # Render A Recorded Scene
 //!
@@ -158,6 +161,7 @@
 
 #[cfg(all(feature = "gpu", windows))]
 mod d3d;
+mod filter_graph;
 #[cfg(feature = "gpu")]
 mod ganesh;
 #[cfg(feature = "gpu")]
@@ -2625,7 +2629,7 @@ mod tests {
     }
 
     #[cfg(feature = "gpu")]
-    fn try_init_gpu_renderer() -> Option<SkiaRenderer> {
+    pub(super) fn try_init_gpu_renderer() -> Option<SkiaRenderer> {
         try_init_gpu_renderer_with_device().map(|(renderer, _)| renderer)
     }
 

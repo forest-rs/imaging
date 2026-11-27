@@ -583,7 +583,6 @@ fn skia_alpha_masks() {
     let mut renderer = imaging_skia::SkiaCpuRenderer::new();
     check_alpha_mask_contract(&mut renderer);
     check_filter_contract(&mut renderer);
-    check_filter_graph_rejection(&mut renderer);
 }
 
 #[cfg(any(feature = "vello", feature = "vello_hybrid"))]

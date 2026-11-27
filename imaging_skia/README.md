@@ -28,6 +28,9 @@ Skia draw targets and produces an RGBA8 image buffer using Skia.
 
 Masks use native Skia layers on raster canvases, GPU canvases, and recorded pictures.
 The rendered mask's alpha or luminance modulates the filtered content before compositing.
+Filter graphs use native Skia image filters. The group transform places the filter region
+and primitives, and the graph output is applied before the group mask and isolated clip.
+Configurations Skia cannot represent return [`Error::UnsupportedFilter`].
 
 # Render A Recorded Scene
 
@@ -161,6 +164,8 @@ renderer.render_picture_to_texture(&picture, &texture)?;
 ```
 
 <!-- cargo-rdme end -->
+
+[`Error::UnsupportedFilter`]: https://docs.rs/imaging_skia/latest/imaging_skia/enum.Error.html#variant.UnsupportedFilter
 
 [`imaging::record::Scene`]: https://docs.rs/imaging/latest/imaging/record/struct.Scene.html
 [`SkCanvasSink`]: https://docs.rs/imaging_skia/latest/imaging_skia/struct.SkCanvasSink.html
