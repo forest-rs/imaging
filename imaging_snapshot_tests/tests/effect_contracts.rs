@@ -528,36 +528,12 @@ fn skia_alpha_masks() {
 }
 
 #[cfg(any(feature = "vello", feature = "vello_hybrid"))]
-fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    if std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() == Ok("no") {
-        return None;
-    }
-    let result = pollster::block_on(async {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
-        adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .ok()
-    });
-    if std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() == Ok("yes") {
-        assert!(result.is_some(), "GPU tests require a device");
-    }
-    result
-}
-
-#[cfg(feature = "vello")]
-use imaging_vello::wgpu;
-#[cfg(all(not(feature = "vello"), feature = "vello_hybrid"))]
-use imaging_vello_hybrid::wgpu;
+mod gpu;
 
 #[test]
 #[cfg(feature = "vello")]
 fn vello_alpha_masks() {
-    let Some((device, queue)) = device() else {
+    let Some((device, queue)) = gpu::device() else {
         return;
     };
     check_alpha_mask_contract(&mut imaging_vello::VelloRenderer::new(device, queue).unwrap());
@@ -566,7 +542,7 @@ fn vello_alpha_masks() {
 #[test]
 #[cfg(feature = "vello_hybrid")]
 fn hybrid_alpha_masks() {
-    let Some((device, queue)) = device() else {
+    let Some((device, queue)) = gpu::device() else {
         return;
     };
     let mut renderer = imaging_vello_hybrid::VelloHybridRenderer::new(device, queue);

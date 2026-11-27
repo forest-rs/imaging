@@ -405,37 +405,13 @@ backend_tests!(
 #[cfg(feature = "skia")]
 backend_tests!(skia, Some(Box::new(imaging_skia::SkiaCpuRenderer::new())));
 
-#[cfg(feature = "vello")]
-use imaging_vello::wgpu;
-#[cfg(all(not(feature = "vello"), feature = "vello_hybrid"))]
-use imaging_vello_hybrid::wgpu;
-
 #[cfg(any(feature = "vello", feature = "vello_hybrid"))]
-fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    if std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() == Ok("no") {
-        return None;
-    }
-    let result = pollster::block_on(async {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
-        adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .ok()
-    });
-    if std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() == Ok("yes") {
-        assert!(result.is_some(), "GPU tests require a device");
-    }
-    result
-}
+mod gpu;
 
 #[cfg(feature = "vello")]
 backend_tests!(
     vello,
-    device().map(|(device, queue)| {
+    gpu::device().map(|(device, queue)| {
         Box::new(imaging_vello::VelloRenderer::new(device, queue).unwrap())
             as Box<dyn ImageRenderer>
     })
@@ -443,7 +419,7 @@ backend_tests!(
 #[cfg(feature = "vello_hybrid")]
 backend_tests!(
     vello_hybrid,
-    device().map(|(device, queue)| {
+    gpu::device().map(|(device, queue)| {
         Box::new(imaging_vello_hybrid::VelloHybridRenderer::new(
             device, queue,
         )) as Box<dyn ImageRenderer>
