@@ -65,6 +65,8 @@ where
 pub enum RenderContentError {
     /// The source failed shared retained-scene validation before rendering.
     InvalidScene(record::ValidateError),
+    /// An external image has no binding on the active renderer.
+    UnboundImage(crate::ExternalImage),
     /// The backend could not decode or use the supplied font data.
     InvalidFontData,
     /// A glyph identifier could not be represented by the backend.
@@ -75,6 +77,9 @@ impl core::fmt::Display for RenderContentError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::InvalidScene(error) => core::fmt::Display::fmt(error, f),
+            Self::UnboundImage(image) => {
+                write!(f, "external image has no renderer binding: {image:?}")
+            }
             Self::InvalidFontData => f.write_str("backend could not decode font data"),
             Self::InvalidGlyphId => f.write_str("backend could not represent a glyph identifier"),
         }
@@ -85,7 +90,7 @@ impl core::error::Error for RenderContentError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::InvalidScene(error) => Some(error),
-            Self::InvalidFontData | Self::InvalidGlyphId => None,
+            Self::InvalidFontData | Self::InvalidGlyphId | Self::UnboundImage(_) => None,
         }
     }
 }
@@ -95,6 +100,8 @@ impl core::error::Error for RenderContentError {
 pub enum RenderUnsupportedError {
     /// An image brush was encountered on a backend that cannot render it.
     ImageBrush,
+    /// The backend cannot sample renderer-bound external images.
+    ExternalImage,
     /// A filter configuration could not be translated for the active backend.
     Filter,
     /// A mask mode or masking primitive is unsupported by the active backend.
@@ -110,6 +117,7 @@ pub enum RenderUnsupportedError {
 impl core::fmt::Display for RenderUnsupportedError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::ExternalImage => f.write_str("backend does not support external images"),
             Self::ImageBrush => f.write_str("backend does not support image brushes"),
             Self::Filter => f.write_str("backend does not support this filter"),
             Self::Mask => f.write_str("backend does not support this mask"),

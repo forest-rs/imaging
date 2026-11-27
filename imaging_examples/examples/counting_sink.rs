@@ -5,18 +5,13 @@
 
 use imaging::{
     BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, StrokeRef,
+    kurbo::Rect, peniko::Color, record::Glyph,
 };
-use kurbo::Rect;
-use peniko::Color;
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct CountingSink {
     clips: usize,
     fills: usize,
-    groups: usize,
-    glyph_runs: usize,
-    strokes: usize,
-    blurred_rounded_rects: usize,
 }
 
 impl PaintSink for CountingSink {
@@ -26,9 +21,7 @@ impl PaintSink for CountingSink {
 
     fn pop_clip(&mut self) {}
 
-    fn push_group(&mut self, _group: GroupRef<'_>) {
-        self.groups += 1;
-    }
+    fn push_group(&mut self, _group: GroupRef<'_>) {}
 
     fn pop_group(&mut self) {}
 
@@ -36,21 +29,11 @@ impl PaintSink for CountingSink {
         self.fills += 1;
     }
 
-    fn stroke(&mut self, _draw: StrokeRef<'_>) {
-        self.strokes += 1;
-    }
+    fn stroke(&mut self, _draw: StrokeRef<'_>) {}
 
-    fn glyph_run(
-        &mut self,
-        _draw: GlyphRunRef<'_>,
-        _glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
-    ) {
-        self.glyph_runs += 1;
-    }
+    fn glyph_run(&mut self, _draw: GlyphRunRef<'_>, _glyphs: &mut dyn Iterator<Item = Glyph>) {}
 
-    fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {
-        self.blurred_rounded_rects += 1;
-    }
+    fn blurred_rounded_rect(&mut self, _draw: BlurredRoundedRect) {}
 }
 
 fn main() {
@@ -67,5 +50,7 @@ fn main() {
         });
     }
 
-    println!("{sink:#?}");
+    assert_eq!(sink.fills, 2, "each rectangle should emit one fill");
+    assert_eq!(sink.clips, 1, "the scoped clip should emit one clip");
+    println!("counted {} fills and {} clip", sink.fills, sink.clips);
 }

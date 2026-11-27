@@ -1,71 +1,27 @@
-# Mental Model
+# Mental model
 
-`imaging` is a command stream for 2D drawing. The core crate gives names to the commands and defines
-how they move through the system; backend crates decide how those commands become pixels or renderer
-state.
-
-```text
-Application code
-      |
-      v
-   Painter
-      |
-      v
-  PaintSink trait
-      |
-      +--> record::Scene
-      +--> Vello CPU backend
-      +--> Vello backend
-      +--> validation / diagnostics
-```
-
-[`crate::Painter`] is the authoring helper. It is the API most drawing code should use.
-
-[`crate::PaintSink`] is the receiving side. It accepts borrowed drawing commands.
-
-[`crate::record::Scene`] is an owned sink. It stores commands so they can be kept, checked,
-replayed, or rendered later.
-
-Backends either receive commands as sinks or consume scenes through rendering traits. The exact
-shape depends on the backend crate.
-
-## Streaming And Retained Paths
-
-The streaming path is:
+`imaging` defines a common vocabulary for 2D drawing. A [`crate::Painter`] emits borrowed
+commands into a [`crate::PaintSink`]. The sink can be a renderer, a backend-native recorder,
+a retained scene, or a tool that inspects commands.
 
 ```text
-Painter -> PaintSink
+Painter → PaintSink → renderer or other streaming consumer
+                    → record::Scene → validate, diagnose, or replay
 ```
 
-Use this when the caller can draw directly into the target. A sink might count commands, build a
-backend-native scene, validate the stream, or render.
+## Stream commands
 
-The retained path is:
+Give a sink to [`crate::Painter::new`] to draw directly into that target. A
+[`crate::validation::ValidatingSink`] can check commands while forwarding them to another sink.
+A [`crate::diagnostics::DiagnosingSink`] can report advisory findings as commands pass through.
 
-```text
-Painter -> record::Scene -> validate / diagnose / replay / render
-```
+## Keep a recording
 
-Use this when the caller needs owned drawing data. That is useful for caching, tests, snapshots,
-debugging, and backend-independent storage.
+Use a [`crate::record::Scene`] as the sink to keep an owned recording for caching, tests,
+inspection, or rendering later. [`crate::record::Scene::validate`] checks the scene's structure
+and payloads, including balanced scopes and valid resource references.
+[`crate::record::Scene::diagnose`] reports suspicious patterns, such as an empty clip or a fully
+transparent draw. [`crate::record::replay`] sends the recording to another sink.
 
-## Terms
-
-- [`crate::Painter`]: helper for emitting drawing commands.
-- [`crate::PaintSink`]: trait that receives borrowed drawing commands.
-- [`crate::record::Scene`]: owned retained command stream.
-- Validation: structural checks for balanced clips, groups, contexts, and referenced data.
-- Diagnostics: warnings about suspicious but valid drawing.
-- Replay: sending a retained scene into another sink.
-
-## A Few Edges To Know
-
-Backend support is uneven. A scene can be valid and still use a feature a particular backend does
-not support yet.
-
-[`crate::record::Scene::validate`] checks structure, not whether the result is visually what you
-intended.
-
-Diagnostics are advisory. They are meant to catch likely mistakes without rejecting valid scenes.
-
-The core crate is pre-1.0 and intentionally small, so names and boundaries may still change.
+A valid scene can still use a drawing feature that its renderer does not support. Consult the
+renderer crate's documentation for capabilities and resource requirements.

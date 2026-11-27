@@ -1,13 +1,16 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Build the smallest useful retained scene.
+//! Record and validate a simple scene.
 
-use imaging::{Painter, record::Scene};
-use kurbo::{Rect, RoundedRect};
-use peniko::Color;
+use imaging::{
+    Painter,
+    kurbo::{Rect, RoundedRect},
+    peniko::Color,
+    record::{Scene, ValidateError},
+};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), ValidateError> {
     let mut scene = Scene::new();
 
     {

@@ -41,6 +41,12 @@ impl SnapshotCase for GmBlendGrid {
         32
     }
 
+    fn vello_hybrid_max_diff_pixels(&self) -> u64 {
+        // Color dodge is discontinuous at backdrop 0/source 1. Metal implementations
+        // differ at two pixels where the gradients meet that boundary.
+        2
+    }
+
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
         background(sink, width, height, Color::from_rgb8(12, 12, 14));
         let mut painter = Painter::new(sink);

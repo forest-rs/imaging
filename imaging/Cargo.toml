@@ -18,7 +18,7 @@ peniko.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["std"]
 std = ["kurbo/std", "peniko/std"]
 libm = ["kurbo/libm", "peniko/libm"]
 

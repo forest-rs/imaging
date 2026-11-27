@@ -8,12 +8,10 @@ repository.workspace = true
 description = "Small learning examples for the imaging command stream."
 publish = false
 
-[dependencies]
+[dev-dependencies]
 image = { features = ["png"], workspace = true }
 imaging = { features = ["std"], workspace = true }
-imaging_vello_cpu = { features = ["std"], workspace = true }
-kurbo = { default-features = true, workspace = true }
-peniko = { default-features = true, workspace = true }
+imaging_vello_cpu.workspace = true
 
 [lints]
 workspace = true

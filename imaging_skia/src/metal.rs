@@ -3,7 +3,6 @@
 
 #![allow(unsafe_code, reason = "Metal interop requires raw handle bridging")]
 
-use foreign_types_shared::ForeignType;
 use skia_safe as sk;
 
 use crate::{Error, color_space_for_wgpu_texture_format, color_type_for_wgpu_texture_format};
@@ -28,8 +27,10 @@ impl MetalBackend {
 
         let backend = unsafe {
             sk::gpu::mtl::BackendContext::new(
-                device.raw_device().as_ptr() as sk::gpu::mtl::Handle,
-                queue.as_raw().lock().as_ptr() as sk::gpu::mtl::Handle,
+                core::ptr::from_ref(&**device.raw_device())
+                    .cast_mut()
+                    .cast(),
+                core::ptr::from_ref(queue.as_raw()).cast_mut().cast(),
             )
         };
         let context = sk::gpu::direct_contexts::make_metal(&backend, None).ok_or(
@@ -53,8 +54,13 @@ impl MetalBackend {
                 .as_hal::<wgpu::hal::api::Metal>()
                 .ok_or(Error::CreateGpuSurface)?
         };
-        let texture_info =
-            unsafe { sk::gpu::mtl::TextureInfo::new(hal_texture.raw_handle().as_ptr() as _) };
+        let texture_info = unsafe {
+            sk::gpu::mtl::TextureInfo::new(
+                core::ptr::from_ref(hal_texture.raw_handle())
+                    .cast_mut()
+                    .cast(),
+            )
+        };
         let backend_texture = unsafe {
             sk::gpu::backend_textures::make_mtl(
                 (width, height),

@@ -70,13 +70,13 @@
 //! assert_eq!(scene.commands().len(), 1);
 //! ```
 
+use crate::BrushRef;
 use crate::{
     AppliedMaskRef, BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef,
     PaintSink, StrokeRef,
     record::{self, Geometry, Glyph},
 };
-use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
-use peniko::BrushRef;
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke, Vec2};
 
 /// Decision returned by a [`ValidatingSink`] violation hook.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -146,6 +146,40 @@ pub enum ValidationError {
         /// Remaining group depth.
         depth: u32,
     },
+}
+
+// Shared filter validity rules for retained preflight and streaming validation.
+pub(crate) fn filter_is_valid(filter: &Filter, transform: Affine) -> bool {
+    let [a, b, c, d, ..] = transform.as_coeffs();
+    let offset_is_valid = |dx: f64, dy: f64| {
+        dx.is_finite()
+            && dy.is_finite()
+            && (a * dx + c * dy).is_finite()
+            && (b * dx + d * dy).is_finite()
+    };
+    let blur_is_valid = |sx: f64, sy: f64| {
+        sx.is_finite()
+            && sy.is_finite()
+            && sx >= 0.0
+            && sy >= 0.0
+            && Vec2::new(a * sx, c * sy).hypot().is_finite()
+            && Vec2::new(b * sx, d * sy).hypot().is_finite()
+    };
+    match *filter {
+        Filter::Flood { .. } => true,
+        Filter::Blur {
+            std_deviation_x,
+            std_deviation_y,
+        } => blur_is_valid(std_deviation_x, std_deviation_y),
+        Filter::DropShadow {
+            dx,
+            dy,
+            std_deviation_x,
+            std_deviation_y,
+            ..
+        } => offset_is_valid(dx, dy) && blur_is_valid(std_deviation_x, std_deviation_y),
+        Filter::Offset { dx, dy } => offset_is_valid(dx, dy),
+    }
 }
 
 /// Default violation hook for [`ValidatingSink`].
@@ -337,34 +371,8 @@ where
         }
     }
 
-    fn validate_filter(&mut self, filter: &Filter) -> bool {
-        let ok = match *filter {
-            Filter::Flood { .. } => true,
-            Filter::Blur {
-                std_deviation_x,
-                std_deviation_y,
-            } => {
-                std_deviation_x.is_finite()
-                    && std_deviation_y.is_finite()
-                    && std_deviation_x >= 0.0
-                    && std_deviation_y >= 0.0
-            }
-            Filter::DropShadow {
-                dx,
-                dy,
-                std_deviation_x,
-                std_deviation_y,
-                ..
-            } => {
-                dx.is_finite()
-                    && dy.is_finite()
-                    && std_deviation_x.is_finite()
-                    && std_deviation_y.is_finite()
-                    && std_deviation_x >= 0.0
-                    && std_deviation_y >= 0.0
-            }
-            Filter::Offset { dx, dy } => dx.is_finite() && dy.is_finite(),
-        };
+    fn validate_filter(&mut self, filter: &Filter, transform: Affine) -> bool {
+        let ok = filter_is_valid(filter, transform);
         if ok {
             true
         } else {
@@ -447,17 +455,19 @@ where
         }
     }
 
-    fn validate_image_brush(
-        &mut self,
-        image_brush: peniko::ImageBrush<&peniko::ImageData>,
-    ) -> bool {
+    fn validate_image_brush(&mut self, image_brush: crate::ImageBrushRef<'_>) -> bool {
         if !(image_brush.sampler.alpha.is_finite() && image_brush.sampler.alpha >= 0.0) {
             return !self.violate(ValidationError::InvalidBrush {
                 what: "Brush::Image::alpha",
             });
         }
 
-        let image = image_brush.image;
+        let crate::ImageRef::Raster(image) = image_brush.image else {
+            return (image_brush.image.width() != 0 && image_brush.image.height() != 0)
+                || !self.violate(ValidationError::InvalidBrush {
+                    what: "Brush::Image::dimensions",
+                });
+        };
         if image
             .format
             .size_in_bytes(image.width, image.height)
@@ -476,11 +486,18 @@ where
             .iter()
             .all(|glyph| glyph.x.is_finite() && glyph.y.is_finite());
         let font_size_ok = glyph_run.font_size.is_finite() && glyph_run.font_size >= 0.0;
+        let embolden_ok = glyph_run.font_embolden.is_finite()
+            && glyph_run.font_embolden.x >= 0.0
+            && glyph_run.font_embolden.y >= 0.0;
         let ok = self.validate_affine("GlyphRun::transform", &glyph_run.transform)
             && glyph_run.glyph_transform.as_ref().is_none_or(|transform| {
                 self.validate_affine("GlyphRun::glyph_transform", transform)
             })
+            && glyph_run.brush_transform.as_ref().is_none_or(|transform| {
+                self.validate_affine("GlyphRun::brush_transform", transform)
+            })
             && font_size_ok
+            && embolden_ok
             && glyphs_ok
             && self.validate_brush(glyph_run.brush)
             && match glyph_run.style {
@@ -493,6 +510,10 @@ where
         } else if !font_size_ok {
             !self.violate(ValidationError::InvalidGlyphRun {
                 what: "GlyphRun::font_size",
+            })
+        } else if !embolden_ok {
+            !self.violate(ValidationError::InvalidGlyphRun {
+                what: "GlyphRun::font_embolden",
             })
         } else if !glyphs_ok {
             !self.violate(ValidationError::InvalidGlyphRun {
@@ -599,6 +620,7 @@ where
         }
 
         let mut ok = self.validate_composite(&group.composite);
+        ok &= self.validate_affine("Group::filter_transform", &group.filter_transform);
         if let Some(clip) = group.clip.clone() {
             ok &= self.validate_clip(clip, "Group::clip::transform");
         }
@@ -606,7 +628,7 @@ where
             ok &= self.validate_group_mask(mask);
         }
         for filter in group.filters {
-            ok &= self.validate_filter(filter);
+            ok &= self.validate_filter(filter, group.filter_transform);
         }
         if !ok {
             return;
@@ -707,6 +729,73 @@ mod tests {
     };
 
     #[test]
+    fn group_filter_transform_must_be_finite() {
+        let mut sink = ValidatingSink::new(Scene::new());
+        sink.push_group(GroupRef::new().with_filter_transform(Affine::scale(f64::NAN)));
+        assert!(matches!(
+            sink.first_error(),
+            Some(ValidationError::NonFinite { .. })
+        ));
+        assert!(sink.inner().commands().is_empty());
+    }
+
+    #[test]
+    fn invalid_filters_are_rejected_before_forwarding() {
+        for (filter, transform) in [
+            (Filter::blur(-1.0), Affine::IDENTITY),
+            (Filter::blur(f64::NAN), Affine::IDENTITY),
+            (Filter::offset(f64::INFINITY, 0.0), Affine::IDENTITY),
+            (Filter::blur(f64::MAX), Affine::scale(2.0)),
+            (Filter::offset(f64::MAX, 0.0), Affine::scale(2.0)),
+            // Check numeric validity even when the kernel is not axis-aligned.
+            (
+                Filter::blur(2.0),
+                Affine::new([f64::MAX, 1.0, 1.0, 1.0, 0.0, 0.0]),
+            ),
+        ] {
+            let mut sink = ValidatingSink::new(Scene::new());
+            sink.push_group(
+                GroupRef::new()
+                    .with_filters(&[filter])
+                    .with_filter_transform(transform),
+            );
+            assert_eq!(sink.first_error(), Some(&ValidationError::InvalidFilter));
+            assert!(sink.inner().commands().is_empty());
+
+            let mut scene = Scene::new();
+            PaintSink::push_group(
+                &mut scene,
+                GroupRef::new()
+                    .with_filters(&[filter])
+                    .with_filter_transform(transform),
+            );
+            PaintSink::pop_group(&mut scene);
+            assert_eq!(
+                scene.validate(),
+                Err(record::ValidateError::InvalidFilter { contexts: vec![] })
+            );
+        }
+    }
+
+    #[test]
+    fn filter_validation_does_not_impose_backend_limits() {
+        let filters = [
+            Filter::blur(f64::from(f32::MAX)),
+            Filter::offset(f64::from(f32::MAX), 0.0),
+        ];
+        let mut sink = ValidatingSink::new(Scene::new());
+        sink.push_group(
+            GroupRef::new()
+                .with_filters(&filters)
+                .with_filter_transform(Affine::scale(2.0)),
+        );
+        sink.pop_group();
+        assert_eq!(sink.finish(), Ok(()));
+        assert_eq!(sink.inner().commands().len(), 2);
+        assert_eq!(sink.inner().validate(), Ok(()));
+    }
+
+    #[test]
     fn validating_sink_records_nan_and_aborts_by_default() {
         let inner = Scene::new();
         let mut sink = ValidatingSink::new(inner);
@@ -791,8 +880,9 @@ mod tests {
                 font: &font,
                 transform: Affine::IDENTITY,
                 glyph_transform: None,
+                brush_transform: None,
                 font_size: -1.0,
-                font_embolden: kurbo::Vec2::ZERO,
+                font_embolden: Vec2::ZERO,
                 hint: false,
                 normalized_coords: &[],
                 style: &style,
@@ -805,6 +895,55 @@ mod tests {
             sink.first_error(),
             Some(&ValidationError::InvalidGlyphRun {
                 what: "GlyphRun::font_size",
+            })
+        );
+    }
+
+    #[test]
+    fn glyph_runs_validate_embolden() {
+        let font = FontData::new(Blob::new(Arc::new([0_u8; 4])), 0);
+        let style = peniko::Style::Fill(Fill::NonZero);
+        for amount in [
+            Vec2::new(-1.0, 0.0),
+            Vec2::new(0.0, -1.0),
+            Vec2::new(f64::NAN, 0.0),
+            Vec2::new(0.0, f64::INFINITY),
+        ] {
+            let mut sink = ValidatingSink::new(Scene::new());
+            let mut run = GlyphRunRef::new(&font, &style, Color::BLACK);
+            run.font_embolden = amount;
+            sink.glyph_run(run, &mut core::iter::empty());
+            assert_eq!(
+                sink.first_error(),
+                Some(&ValidationError::InvalidGlyphRun {
+                    what: "GlyphRun::font_embolden",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_runs_validate_brush_transform() {
+        let inner = Scene::new();
+        let mut sink = ValidatingSink::new(inner);
+        let font = FontData::new(Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
+        let style = peniko::Style::Fill(Fill::NonZero);
+        let glyphs = vec![Glyph {
+            id: 1,
+            x: 0.0,
+            y: 0.0,
+        }];
+        let paint = Brush::Solid(Color::BLACK);
+        sink.glyph_run(
+            GlyphRunRef::new(&font, &style, &paint)
+                .brush_transform(Some(Affine::translate((f64::NAN, 0.0)))),
+            &mut glyphs.into_iter(),
+        );
+
+        assert_eq!(
+            sink.first_error(),
+            Some(&ValidationError::NonFinite {
+                what: "GlyphRun::brush_transform"
             })
         );
     }

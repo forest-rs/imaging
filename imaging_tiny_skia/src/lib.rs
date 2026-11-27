@@ -11,10 +11,29 @@
 //!
 //! The implementation was integrated from Floem's tiny-skia renderer and adapted to match the
 //! public renderer shape used by the other `imaging_*` backends.
+//!
+//! Group filters are evaluated in destination coordinates. Transforms that require a rotated
+//! anisotropic or sheared blur kernel return [`Error::UnsupportedFilter`].
 
 #![deny(unsafe_code)]
+#![no_std]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
+
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use core::{
+    borrow::Borrow,
+    mem::{Discriminant, discriminant},
+};
+#[cfg(feature = "libm")]
+#[allow(unused_imports, reason = "std provides inherent float methods")]
+use core_maths::CoreFloat as _;
+// Keep the standard-library cache implementation when both features are enabled.
+#[cfg(all(feature = "std", feature = "libm"))]
+use hashbrown as _;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, RgbaImage, StrokeRef,
@@ -31,14 +50,10 @@ use peniko::{
     color::{self, ColorSpaceTag, DynamicColor, HueDirection, Srgb},
     kurbo::{PathEl, Size},
 };
+#[cfg(feature = "std")]
 use rustc_hash::FxHashMap;
-use std::{
-    borrow::Borrow,
-    collections::VecDeque,
-    mem::Discriminant,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+#[cfg(feature = "std")]
+use std::time::{Duration, Instant};
 use swash::{
     FontRef,
     scale::{Render, ScaleContext, Source, StrikeWith, image::Content},
@@ -51,6 +66,8 @@ use tiny_skia::{
     SweepGradient, Transform,
 };
 
+#[cfg(not(feature = "std"))]
+type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
 type Result<T, E = Error> = core::result::Result<T, E>;
 
 /// Errors that can occur when rendering via tiny-skia.
@@ -62,6 +79,10 @@ pub enum Error {
     UnsupportedTargetFormat,
     /// The caller-provided buffer shape is not large enough for the target dimensions.
     InvalidTargetBuffer,
+    /// This renderer cannot sample externally bound images.
+    UnsupportedExternalImage,
+    /// The transformed filter kernel cannot be represented by this renderer.
+    UnsupportedFilter,
     /// An internal invariant was violated.
     Internal(&'static str),
 }
@@ -154,7 +175,8 @@ struct GlyphCacheKey {
     x_bin: u8,
     y_bin: u8,
     hint: bool,
-    embolden_strength_bits: u32,
+    embolden_x_bits: u64,
+    embolden_y_bits: u64,
     skew_bits: u32,
 }
 
@@ -166,7 +188,7 @@ struct GlyphKeyInput {
     x: f32,
     y: f32,
     hint: bool,
-    embolden_strength: f32,
+    embolden: Vec2,
     skew: Option<f32>,
 }
 
@@ -207,7 +229,8 @@ impl GlyphCacheKey {
                 x_bin,
                 y_bin,
                 hint: input.hint,
-                embolden_strength_bits: input.embolden_strength.to_bits(),
+                embolden_x_bits: input.embolden.x.to_bits(),
+                embolden_y_bits: input.embolden.y.to_bits(),
                 skew_bits,
             },
             x_floor,
@@ -216,7 +239,7 @@ impl GlyphCacheKey {
     }
 }
 
-type ImageCacheMap = FxHashMap<u64, (CacheColor, Arc<Pixmap>)>;
+type ImageCacheMap = FxHashMap<ImageCacheKey, (CacheColor, Arc<Pixmap>)>;
 type ScaledImageCacheMap = FxHashMap<ScaledImageCacheKey, (CacheColor, Arc<Pixmap>)>;
 type BlurredRRectCacheMap = FxHashMap<BlurredRRectCacheKey, (CacheColor, Arc<Pixmap>)>;
 type GlyphCacheMap = FxHashMap<(GlyphCacheKey, u32), GlyphCacheEntry>;
@@ -252,7 +275,7 @@ struct GlyphRasterRequest<'a> {
     font_size: f32,
     hint: bool,
     normalized_coords: &'a [i16],
-    embolden_strength: f32,
+    embolden: Vec2,
     skew: Option<f32>,
     offset_x: f32,
     offset_y: f32,
@@ -260,16 +283,88 @@ struct GlyphRasterRequest<'a> {
 
 fn cache_glyph(caches: &mut RendererCaches, request: GlyphRasterRequest<'_>) -> Option<Arc<Glyph>> {
     let c = request.color.to_rgba8();
+    #[cfg(feature = "std")]
     let now = Instant::now();
 
     if let Some(entry) = caches.glyph_cache.get_mut(&(request.cache_key, c.to_u32())) {
         entry.cache_color = request.cache_color;
-        entry.last_touched = now;
+        #[cfg(feature = "std")]
+        {
+            entry.last_touched = now;
+        }
         let opt_glyph = entry.glyph.clone();
         return opt_glyph;
     }
 
-    cache_glyph_miss(caches, request, c.to_u32(), now)
+    cache_glyph_miss(
+        caches,
+        request,
+        c.to_u32(),
+        #[cfg(feature = "std")]
+        now,
+    )
+}
+
+// Swash's faux bold shifts contours and uses a different strength convention.
+// Expand with Kurbo instead, matching the Vello adapters before rasterization.
+fn raster_emboldened_outline(
+    outline: &swash::scale::outline::Outline,
+    request: &GlyphRasterRequest<'_>,
+) -> swash::scale::image::Image {
+    use swash::zeno::{Command, Origin, PathData as _};
+    let point = |p: swash::zeno::Point| Point::new(f64::from(p.x), f64::from(p.y));
+    let path: BezPath = outline
+        .path()
+        .commands()
+        .map(|command| match command {
+            Command::MoveTo(p) => PathEl::MoveTo(point(p)),
+            Command::LineTo(p) => PathEl::LineTo(point(p)),
+            Command::QuadTo(a, b) => PathEl::QuadTo(point(a), point(b)),
+            Command::CurveTo(a, b, c) => PathEl::CurveTo(point(a), point(b), point(c)),
+            Command::Close => PathEl::ClosePath,
+        })
+        .collect();
+    let expanded = kurbo::expand_path(
+        &path,
+        kurbo::Diagonal2::new(request.embolden.x, request.embolden.y),
+        Join::Miter,
+        4.0,
+        0.1,
+    );
+    let point = |p: Point| swash::zeno::Point::new(f64_to_f32(p.x), f64_to_f32(p.y));
+    let commands: Vec<_> = expanded
+        .elements()
+        .iter()
+        .map(|element| match *element {
+            PathEl::MoveTo(p) => Command::MoveTo(point(p)),
+            PathEl::LineTo(p) => Command::LineTo(point(p)),
+            PathEl::QuadTo(a, b) => Command::QuadTo(point(a), point(b)),
+            PathEl::CurveTo(a, b, c) => Command::CurveTo(point(a), point(b), point(c)),
+            PathEl::ClosePath => Command::Close,
+        })
+        .collect();
+    let transform = request.skew.map(|angle| {
+        swash::zeno::Transform::skew(
+            swash::zeno::Angle::from_degrees(angle),
+            swash::zeno::Angle::ZERO,
+        )
+    });
+    let offset = swash::zeno::Vector::new(request.offset_x.fract(), request.offset_y.fract());
+    let mut data = Vec::new();
+    let placement = swash::zeno::Mask::new(&commands)
+        .format(Format::Alpha)
+        .origin(Origin::BottomLeft)
+        .transform(transform)
+        .offset(offset)
+        .render_offset(offset)
+        .inspect(|format, width, height| data.resize(format.buffer_size(width, height), 0))
+        .render_into(&mut data, None);
+    swash::scale::image::Image {
+        source: Source::Outline,
+        content: Content::Mask,
+        placement,
+        data,
+    }
 }
 
 #[cold]
@@ -278,7 +373,7 @@ fn cache_glyph_miss(
     caches: &mut RendererCaches,
     request: GlyphRasterRequest<'_>,
     color_key: u32,
-    now: Instant,
+    #[cfg(feature = "std")] now: Instant,
 ) -> Option<Arc<Glyph>> {
     let c = request.color.to_rgba8();
     let mut scaler = caches
@@ -289,25 +384,38 @@ fn cache_glyph_miss(
         .normalized_coords(request.normalized_coords)
         .build();
 
-    let mut render = Render::new(&[
-        Source::ColorOutline(0),
-        Source::ColorBitmap(StrikeWith::BestFit),
-        Source::Outline,
-    ]);
+    let sources: &[Source] = if request.embolden == Vec2::ZERO {
+        &[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::Outline,
+        ]
+    } else {
+        // Synthetic weight affects monochrome outlines only.
+        &[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+        ]
+    };
+    let mut render = Render::new(sources);
     render
         .format(Format::Alpha)
         .offset(swash::zeno::Vector::new(
             request.offset_x.fract(),
             request.offset_y.fract(),
-        ))
-        .embolden(request.embolden_strength);
+        ));
     if let Some(angle) = request.skew {
         render.transform(Some(swash::zeno::Transform::skew(
             swash::zeno::Angle::from_degrees(angle),
             swash::zeno::Angle::ZERO,
         )));
     }
-    let image = render.render(&mut scaler, request.cache_key.glyph_id)?;
+    let image = render
+        .render(&mut scaler, request.cache_key.glyph_id)
+        .or_else(|| {
+            let outline = scaler.scale_outline(request.cache_key.glyph_id)?;
+            Some(raster_emboldened_outline(&outline, &request))
+        })?;
 
     let result = if image.placement.width == 0 || image.placement.height == 0 {
         // We can't create an empty `Pixmap`
@@ -339,11 +447,11 @@ fn cache_glyph_miss(
                 let pixels = pixmap.pixels_mut();
                 for (row_idx, row) in image.data.chunks_exact(width * 4).enumerate() {
                     let dst_row = (row_idx + pad_usize) * padded_width + pad_usize;
-                    for (col_idx, b) in row.chunks_exact(4).enumerate() {
-                        pixels[dst_row + col_idx] =
-                            tiny_skia::Color::from_rgba8(b[0], b[1], b[2], b[3])
-                                .premultiply()
-                                .to_color_u8();
+                    let (src_pixels, _) = row.as_chunks::<4>();
+                    for (col_idx, &[r, g, b, a]) in src_pixels.iter().enumerate() {
+                        pixels[dst_row + col_idx] = tiny_skia::Color::from_rgba8(r, g, b, a)
+                            .premultiply()
+                            .to_color_u8();
                     }
                 }
             }
@@ -362,6 +470,7 @@ fn cache_glyph_miss(
         GlyphCacheEntry {
             cache_color: request.cache_color,
             glyph: result.clone(),
+            #[cfg(feature = "std")]
             last_touched: now,
         },
     );
@@ -388,6 +497,7 @@ struct Glyph {
 #[derive(Clone)]
 pub(crate) struct ClipPath {
     path: Path,
+    fill_rule: FillRule,
     rect: Rect,
     simple_rect: Option<Rect>,
     stroke_source: Option<(Path, TinyStroke)>,
@@ -396,25 +506,57 @@ pub(crate) struct ClipPath {
 #[derive(PartialEq, Clone, Copy)]
 struct CacheColor(bool);
 
+#[cfg(feature = "std")]
 const GLYPH_CACHE_MIN_TTL: Duration = Duration::from_millis(100);
 
 struct GlyphCacheEntry {
     cache_color: CacheColor,
     glyph: Option<Arc<Glyph>>,
+    #[cfg(feature = "std")]
     last_touched: Instant,
 }
 
 fn should_retain_glyph_entry(
     entry: &GlyphCacheEntry,
     cache_color: CacheColor,
-    now: Instant,
+    #[cfg(feature = "std")] now: Instant,
 ) -> bool {
-    entry.cache_color == cache_color || now.duration_since(entry.last_touched) < GLYPH_CACHE_MIN_TTL
+    if entry.cache_color == cache_color {
+        return true;
+    }
+
+    #[cfg(feature = "std")]
+    {
+        now.duration_since(entry.last_touched) < GLYPH_CACHE_MIN_TTL
+    }
+
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ImageCacheKey {
+    blob: u64,
+    width: u32,
+    height: u32,
+    format: Discriminant<peniko::ImageFormat>,
+    alpha_type: Discriminant<peniko::ImageAlphaType>,
+}
+impl ImageCacheKey {
+    fn new(image: &ImageData) -> Self {
+        Self {
+            blob: image.data.id(),
+            width: image.width,
+            height: image.height,
+            format: discriminant(&image.format),
+            alpha_type: discriminant(&image.alpha_type),
+        }
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
 struct ScaledImageCacheKey {
-    image_id: u64,
+    image: ImageCacheKey,
     width: u32,
     height: u32,
     quality: Discriminant<ImageQuality>,
@@ -568,6 +710,7 @@ struct Layer<'a> {
     group_mask: Option<PendingGroupMask>,
     filters: Vec<Filter>,
     clip_applied_in_content: bool,
+    deferred_group_clip: Option<ClipPath>,
 }
 
 struct PendingGroupMask {
@@ -618,6 +761,7 @@ impl Layer<'static> {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         })
     }
 
@@ -647,6 +791,7 @@ impl Layer<'static> {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         };
         layer.rebuild_clip_mask();
         Ok(layer)
@@ -688,6 +833,7 @@ impl<'a> Layer<'a> {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         })
     }
 
@@ -779,7 +925,7 @@ impl<'a> Layer<'a> {
         if clip.simple_rect.is_some() {
             Self::write_mask_rect_to(mask, clip.rect);
         } else {
-            mask.fill_path(&clip.path, FillRule::Winding, true, Transform::identity());
+            mask.fill_path(&clip.path, clip.fill_rule, true, Transform::identity());
         }
     }
 
@@ -798,7 +944,7 @@ impl<'a> Layer<'a> {
             }
             return;
         }
-        mask.intersect_path(&clip.path, FillRule::Winding, true, Transform::identity());
+        mask.intersect_path(&clip.path, clip.fill_rule, true, Transform::identity());
     }
 
     fn intersect_clip_path(&mut self, clip: &ClipPath) {
@@ -1070,7 +1216,7 @@ impl<'a> Layer<'a> {
     }
 
     fn mark_drawn_rect_inflated(&mut self, rect: Rect, transform: Affine, pad: f64) {
-        let mut root_rect = transform.transform_rect_bbox(rect).inset(-pad);
+        let mut root_rect = transform.transform_rect_bbox(rect).inflate(pad, pad);
         if let Some(clip) = self.clip_in_root() {
             root_rect = root_rect.intersect(clip);
         }
@@ -1091,7 +1237,11 @@ impl<'a> Layer<'a> {
         }
 
         let stroke_pad = stroke.width + stroke.miter_limit.max(1.0) + 4.0;
-        self.mark_drawn_rect_inflated(shape.bounding_box().inset(-stroke_pad), self.transform, 4.0);
+        self.mark_drawn_rect_inflated(
+            shape.bounding_box().inflate(stroke_pad, stroke_pad),
+            self.transform,
+            4.0,
+        );
     }
 
     fn try_draw_pixmap_translate_only(
@@ -1218,12 +1368,7 @@ impl<'a> Layer<'a> {
         (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
     }
 
-    fn try_fill_rect_with_paint_fast(
-        &mut self,
-        rect: Rect,
-        paint: &Paint<'_>,
-        brush_transform: Option<Affine>,
-    ) -> bool {
+    fn try_fill_rect_with_paint_fast(&mut self, rect: Rect, paint: &Paint<'_>) -> bool {
         if !is_axis_aligned(self.device_transform()) {
             return false;
         }
@@ -1234,9 +1379,10 @@ impl<'a> Layer<'a> {
         };
 
         let mut paint = paint.clone();
-        paint.shader.transform(affine_to_skia(
-            self.device_transform() * brush_transform.unwrap_or(Affine::IDENTITY),
-        ));
+        // The shader already contains the brush transform; only move it into device space.
+        paint
+            .shader
+            .transform(affine_to_skia(self.device_transform()));
         self.materialize_simple_clip_mask();
         let clip_mask = self.clip.is_some().then_some(&self.mask);
         self.pixmap
@@ -1254,7 +1400,14 @@ impl<'a> Layer<'a> {
         transform: Affine,
         quality: FilterQuality,
     ) {
-        if self.try_draw_pixmap_translate_only(img_pixmap, x as f64, y as f64, transform, quality) {
+        let device_transform = Affine::translate((-self.origin.x, -self.origin.y)) * transform;
+        if self.try_draw_pixmap_translate_only(
+            img_pixmap,
+            x as f64,
+            y as f64,
+            device_transform,
+            quality,
+        ) {
             return;
         }
 
@@ -1262,7 +1415,7 @@ impl<'a> Layer<'a> {
             (x, y),
             (img_pixmap.width() as f64, img_pixmap.height() as f64),
         );
-        if !self.intersects_clip(img_rect, transform) {
+        if !self.intersects_clip(img_rect, device_transform) {
             return;
         }
         self.mark_drawn_rect_inflated(img_rect, transform, 2.0);
@@ -1271,7 +1424,7 @@ impl<'a> Layer<'a> {
             blend_mode: tiny_skia::BlendMode::SourceOver,
             quality,
         };
-        let transform = affine_to_skia(transform * Affine::translate((x as f64, y as f64)));
+        let transform = affine_to_skia(device_transform * Affine::translate((x as f64, y as f64)));
         self.materialize_simple_clip_mask();
         let clip_mask = self.clip.is_some().then_some(&self.mask);
         self.pixmap
@@ -1341,6 +1494,7 @@ impl<'a> Layer<'a> {
     fn try_fill_image_fallback<T>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         image_pixmap: &Pixmap,
         image: &peniko::ImageBrush<T>,
         brush_transform: Option<Affine>,
@@ -1384,7 +1538,7 @@ impl<'a> Layer<'a> {
         };
         coverage.fill_path(
             &path,
-            FillRule::Winding,
+            fill_rule,
             true,
             self.skia_transform()
                 .post_translate(-(x0 as f32), -(y0 as f32)),
@@ -1586,6 +1740,7 @@ impl<'a> Layer<'a> {
     fn fill_image_with_pixmap_and_mode<T>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         image_pixmap: &Pixmap,
         image: &peniko::ImageBrush<T>,
         brush_transform: Option<Affine>,
@@ -1596,6 +1751,7 @@ impl<'a> Layer<'a> {
     {
         if self.try_fill_image_fallback(
             shape,
+            fill_rule,
             image_pixmap,
             image,
             brush_transform,
@@ -1618,7 +1774,7 @@ impl<'a> Layer<'a> {
         };
         self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
         if let Some(rect) = shape.as_rect() {
-            if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
+            if !self.try_fill_rect_with_paint_fast(rect, &paint) {
                 let rect = try_ret!(to_skia_rect(rect));
                 self.materialize_simple_clip_mask();
                 let clip_mask = self.clip.is_some().then_some(&self.mask);
@@ -1629,13 +1785,8 @@ impl<'a> Layer<'a> {
             let path = try_ret!(shape_to_path(shape));
             self.materialize_simple_clip_mask();
             let clip_mask = self.clip.is_some().then_some(&self.mask);
-            self.pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                self.skia_transform(),
-                clip_mask,
-            );
+            self.pixmap
+                .fill_path(&path, &paint, fill_rule, self.skia_transform(), clip_mask);
         }
     }
 
@@ -1686,6 +1837,7 @@ impl Layer<'_> {
             try_ret!(shape_to_path(shape).and_then(|path| path.transform(self.skia_transform())));
         self.set_base_clip(Some(ClipPath {
             path,
+            fill_rule: FillRule::Winding,
             rect: self
                 .device_transform()
                 .transform_rect_bbox(shape.bounding_box()),
@@ -1745,17 +1897,19 @@ impl Layer<'_> {
     }
 
     fn fill<'b>(&mut self, shape: &impl Shape, brush: impl Into<BrushRef<'b>>) {
-        self.fill_with_brush_transform(shape, brush, None);
+        self.fill_with_brush_transform(shape, FillRule::Winding, brush, None);
     }
 
     fn fill_with_brush_transform<'b>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
     ) {
         self.fill_with_brush_transform_and_mode(
             shape,
+            fill_rule,
             brush,
             brush_transform,
             1.0,
@@ -1766,6 +1920,7 @@ impl Layer<'_> {
     fn fill_with_brush_transform_and_mode<'b>(
         &mut self,
         shape: &impl Shape,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
         opacity: f32,
@@ -1776,6 +1931,7 @@ impl Layer<'_> {
             let image_pixmap = try_ret!(image_brush_pixmap(&image));
             self.fill_image_with_pixmap_and_mode(
                 shape,
+                fill_rule,
                 &image_pixmap,
                 &image,
                 brush_transform,
@@ -1797,7 +1953,7 @@ impl Layer<'_> {
         let paint = try_ret!(brush_to_paint(brush, brush_transform, opacity, blend_mode));
         self.mark_drawn_rect_inflated(shape.bounding_box(), self.transform, 2.0);
         if let Some(rect) = shape.as_rect() {
-            if !self.try_fill_rect_with_paint_fast(rect, &paint, brush_transform) {
+            if !self.try_fill_rect_with_paint_fast(rect, &paint) {
                 let rect = try_ret!(to_skia_rect(rect));
                 self.materialize_simple_clip_mask();
                 let clip_mask = self.clip.is_some().then_some(&self.mask);
@@ -1808,13 +1964,8 @@ impl Layer<'_> {
             let path = try_ret!(shape_to_path(shape));
             self.materialize_simple_clip_mask();
             let clip_mask = self.clip.is_some().then_some(&self.mask);
-            self.pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                self.skia_transform(),
-                clip_mask,
-            );
+            self.pixmap
+                .fill_path(&path, &paint, fill_rule, self.skia_transform(), clip_mask);
         }
     }
 }
@@ -1831,6 +1982,7 @@ pub struct TinySkiaRender<'renderer, 'target> {
     cache_color: CacheColor,
     cache_color_out: &'renderer mut CacheColor,
     transform: Affine,
+    error: Option<Error>,
     mask_cache: VecDeque<CachedMask>,
     layers: Vec<Layer<'target>>,
     group_frames: Vec<GroupFrame>,
@@ -1838,7 +1990,7 @@ pub struct TinySkiaRender<'renderer, 'target> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GroupFrame {
-    Direct { pushed_clip: bool },
+    Empty,
     Isolated,
 }
 
@@ -1866,6 +2018,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             cache_color: cache_color_value,
             cache_color_out: cache_color,
             transform: Affine::IDENTITY,
+            error: None,
             mask_cache: VecDeque::new(),
             layers: vec![root],
             group_frames: Vec::new(),
@@ -1892,6 +2045,13 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     }
 }
 
+fn to_fill_rule(rule: peniko::Fill) -> FillRule {
+    match rule {
+        peniko::Fill::NonZero => FillRule::Winding,
+        peniko::Fill::EvenOdd => FillRule::EvenOdd,
+    }
+}
+
 fn translate_clip_path(clip: &ClipPath, dx: f64, dy: f64) -> ClipPath {
     let path = clip
         .path
@@ -1908,6 +2068,7 @@ fn translate_clip_path(clip: &ClipPath, dx: f64, dy: f64) -> ClipPath {
     });
     ClipPath {
         path,
+        fill_rule: clip.fill_rule,
         rect: translate_rect(clip.rect, dx, dy),
         simple_rect: clip.simple_rect.map(|rect| translate_rect(rect, dx, dy)),
         stroke_source,
@@ -1933,13 +2094,17 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             .collect()
     }
 
-    fn group_requires_isolation(group: &GroupRef<'_>) -> bool {
-        group.composite != Composite::default() || !group.filters.is_empty() || group.mask.is_some()
+    fn discarding_group(&self) -> bool {
+        self.group_frames.last() == Some(&GroupFrame::Empty)
     }
 
     fn default_group_clip(&self) -> Option<ClipPath> {
         let rect = self.canvas_size().to_rect();
-        self.clip_path_for_geometry(imaging::GeometryRef::Rect(rect), Affine::IDENTITY)
+        self.clip_path_for_geometry(
+            imaging::GeometryRef::Rect(rect),
+            Affine::IDENTITY,
+            FillRule::Winding,
+        )
     }
 
     fn group_clip_path(&self, clip: Option<ClipRef<'_>>) -> Option<ClipPath> {
@@ -1969,6 +2134,21 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     ) -> Option<Layer<'static>> {
         let parent_origin = self.current_layer().origin;
         let clip = translate_clip_path(&clip, parent_origin.x, parent_origin.y);
+        if !filters.is_empty() {
+            // Filters can move source pixels into the isolated clip. Keep their input unclipped;
+            // the group's clip and the parent's clip constrain the result at composition time.
+            let mut child = Layer::new_root(
+                self.layers[0].pixmap.width(),
+                self.layers[0].pixmap.height(),
+            )
+            .ok()?;
+            child.blend_mode = composite.blend;
+            child.alpha = composite.alpha;
+            child.group_mask = group_mask;
+            child.filters = filters.to_vec();
+            child.deferred_group_clip = Some(clip);
+            return Some(child);
+        }
         let inherited_clips = self.current_layer().effective_clips_in_root();
         let mut group_bounds = clip.rect;
         for inherited in &inherited_clips {
@@ -2002,6 +2182,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     }
 
     fn finish_popped_group(&mut self, mut child: Layer<'_>) {
+        apply_group_filters(&mut child);
         let mask_bounds = child
             .group_mask
             .as_ref()
@@ -2012,7 +2193,17 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         }
 
         self.apply_deferred_group_mask(&mut child, mask_bounds);
-        apply_group_filters(&mut child);
+        if let Some(clip) = child.deferred_group_clip.take() {
+            if clip.rect.is_zero_area() {
+                return;
+            }
+            child.base_clip = Some(clip);
+            child.rebuild_clip_mask();
+            child.materialize_simple_clip_mask();
+            if let LayerPixmap::Owned(pixmap) = &mut child.pixmap {
+                pixmap.apply_mask(&child.mask);
+            }
+        }
         let parent = self.current_layer_mut();
         apply_layer(&child, parent);
     }
@@ -2072,8 +2263,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         let parent = self.current_layer_mut();
         draw_layer_pixmap(
             &localized_child,
-            bounds.x(),
-            bounds.y(),
+            bounds.x() - round_to_i32(parent.origin.x),
+            bounds.y() - round_to_i32(parent.origin.y),
             parent,
             blend_mode,
             child.alpha,
@@ -2166,8 +2357,10 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn clip_path_for_clip(&self, clip: ClipRef<'_>) -> Option<ClipPath> {
         match clip {
             ClipRef::Fill {
-                transform, shape, ..
-            } => self.clip_path_for_geometry(shape, transform),
+                transform,
+                shape,
+                fill_rule,
+            } => self.clip_path_for_geometry(shape, transform, to_fill_rule(fill_rule)),
             ClipRef::Stroke {
                 transform,
                 shape,
@@ -2195,6 +2388,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
                 let path = stroked.transform(affine_to_skia(transform))?;
                 Some(ClipPath {
                     path,
+                    fill_rule: FillRule::Winding,
                     rect: transform.transform_rect_bbox(rect),
                     simple_rect: None,
                     stroke_source: Some((
@@ -2210,6 +2404,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         &self,
         shape: imaging::GeometryRef<'_>,
         transform: Affine,
+        fill_rule: FillRule,
     ) -> Option<ClipPath> {
         let origin = self.current_layer().origin;
         let transform = Affine::translate((-origin.x, -origin.y)) * transform;
@@ -2236,6 +2431,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
 
         Some(ClipPath {
             path,
+            fill_rule,
             rect: transform.transform_rect_bbox(bounds),
             simple_rect,
             stroke_source: None,
@@ -2255,14 +2451,15 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         first_layer.mask_valid = false;
         first_layer.group_mask = None;
         first_layer.filters.clear();
+        first_layer.deferred_group_clip = None;
     }
 
-    fn brush_to_owned<'b>(&self, brush: impl Into<BrushRef<'b>>) -> Option<peniko::Brush> {
-        match brush.into() {
-            BrushRef::Solid(color) => Some(peniko::Brush::Solid(color)),
-            BrushRef::Gradient(gradient) => Some(peniko::Brush::Gradient(gradient.clone())),
-            BrushRef::Image(image) => Some(peniko::Brush::Image(image.to_owned())),
-        }
+    fn brush_to_owned(&mut self, brush: imaging::BrushRef<'_>) -> Option<peniko::Brush> {
+        let Some(brush) = brush.as_raster() else {
+            self.error = Some(Error::UnsupportedExternalImage);
+            return None;
+        };
+        Some(brush.to_owned())
     }
 
     fn current_layer_mut(&mut self) -> &mut Layer<'target> {
@@ -2357,21 +2554,22 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn fill_geometry<'b>(
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
     ) {
         match shape {
             imaging::GeometryRef::Rect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, brush_transform);
+                layer.fill_with_brush_transform(rect, fill_rule, brush, brush_transform);
             }
             imaging::GeometryRef::RoundedRect(rect) => {
-                layer.fill_with_brush_transform(rect, brush, brush_transform);
+                layer.fill_with_brush_transform(rect, fill_rule, brush, brush_transform);
             }
             imaging::GeometryRef::Path(path) => {
-                layer.fill_with_brush_transform(path, brush, brush_transform);
+                layer.fill_with_brush_transform(path, fill_rule, brush, brush_transform);
             }
             imaging::GeometryRef::OwnedPath(path) => {
-                layer.fill_with_brush_transform(path, brush, brush_transform);
+                layer.fill_with_brush_transform(path, fill_rule, brush, brush_transform);
             }
         }
     }
@@ -2379,6 +2577,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn fill_geometry_with_mode<'b>(
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
+        fill_rule: FillRule,
         brush: impl Into<BrushRef<'b>>,
         brush_transform: Option<Affine>,
         opacity: f32,
@@ -2387,6 +2586,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         match shape {
             imaging::GeometryRef::Rect(rect) => layer.fill_with_brush_transform_and_mode(
                 rect,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2394,6 +2594,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::RoundedRect(rect) => layer.fill_with_brush_transform_and_mode(
                 rect,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2401,6 +2602,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::Path(path) => layer.fill_with_brush_transform_and_mode(
                 path,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2408,6 +2610,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::OwnedPath(path) => layer.fill_with_brush_transform_and_mode(
                 path,
+                fill_rule,
                 brush,
                 brush_transform,
                 opacity,
@@ -2419,6 +2622,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
     fn fill_image_geometry_with_mode(
         layer: &mut Layer<'_>,
         shape: &imaging::GeometryRef<'_>,
+        fill_rule: FillRule,
         image_pixmap: &Pixmap,
         image: &peniko::ImageBrush,
         brush_transform: Option<Affine>,
@@ -2428,6 +2632,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         match shape {
             imaging::GeometryRef::Rect(rect) => layer.fill_image_with_pixmap_and_mode(
                 rect,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2436,6 +2641,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::RoundedRect(rect) => layer.fill_image_with_pixmap_and_mode(
                 rect,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2444,6 +2650,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::Path(path) => layer.fill_image_with_pixmap_and_mode(
                 path,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2452,6 +2659,7 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             ),
             imaging::GeometryRef::OwnedPath(path) => layer.fill_image_with_pixmap_and_mode(
                 path,
+                fill_rule,
                 image_pixmap,
                 image,
                 brush_transform,
@@ -2643,6 +2851,9 @@ fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Op
 
 impl PaintSink for TinySkiaRender<'_, '_> {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
+        if self.discarding_group() {
+            return;
+        }
         let clip_path = self.clip_path_for_clip(clip);
         if let Some(clip_path) = clip_path {
             let layer = self.current_layer_mut();
@@ -2652,6 +2863,9 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn pop_clip(&mut self) {
+        if self.discarding_group() {
+            return;
+        }
         let layer = self.current_layer_mut();
         if layer.clip_stack.pop().is_some() {
             layer.rebuild_clip_mask();
@@ -2659,27 +2873,72 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
-        if !Self::group_requires_isolation(&group) {
-            let pushed_clip = if let Some(clip) = group.clip {
-                self.push_clip(clip);
-                true
-            } else {
-                false
-            };
-            self.group_frames.push(GroupFrame::Direct { pushed_clip });
+        if group
+            .mask
+            .as_ref()
+            .is_some_and(|mask| mask.mask.scene.has_external_images())
+        {
+            self.error = Some(Error::UnsupportedExternalImage);
+        }
+        if self.discarding_group() {
+            self.group_frames.push(GroupFrame::Empty);
             return;
         }
 
+        let supports_blur = |sx, sy| {
+            // The box blur's window widths must fit in i32.
+            let max_sigma = f64::from(i32::MAX - 2) / 2.0;
+            [sx, sy].into_iter().all(|sigma| {
+                (0.0..=max_sigma).contains(&sigma)
+                    && (sigma == 0.0 || gaussian_box_radii(f64_to_f32(sigma)).is_some())
+            })
+        };
+        let supports_offset = |dx: f64, dy: f64| {
+            [dx.round(), dy.round()]
+                .into_iter()
+                .all(|value| (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&value))
+        };
+        let filters = group
+            .filters
+            .iter()
+            .copied()
+            .map(|filter| {
+                let filter = filter.in_device_space(group.filter_transform)?;
+                let supported = match filter {
+                    Filter::Blur {
+                        std_deviation_x,
+                        std_deviation_y,
+                    } => supports_blur(std_deviation_x, std_deviation_y),
+                    Filter::DropShadow {
+                        dx,
+                        dy,
+                        std_deviation_x,
+                        std_deviation_y,
+                        ..
+                    } => supports_blur(std_deviation_x, std_deviation_y) && supports_offset(dx, dy),
+                    Filter::Offset { dx, dy } => supports_offset(dx, dy),
+                    Filter::Flood { .. } => true,
+                };
+                supported.then_some(filter)
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(filters) = filters else {
+            self.error = Some(Error::UnsupportedFilter);
+            self.group_frames.push(GroupFrame::Empty);
+            return;
+        };
         if let Some(clip) = self.group_clip_path(group.clip)
             && let Some(child) = self.build_group_child_layer(
                 group.composite,
-                group.filters,
+                &filters,
                 self.pending_group_mask(group.mask),
                 clip,
             )
         {
             self.layers.push(child);
             self.group_frames.push(GroupFrame::Isolated);
+        } else {
+            self.group_frames.push(GroupFrame::Empty);
         }
     }
 
@@ -2688,11 +2947,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             return;
         };
         match frame {
-            GroupFrame::Direct { pushed_clip } => {
-                if pushed_clip {
-                    self.pop_clip();
-                }
-            }
+            GroupFrame::Empty => {}
             GroupFrame::Isolated => {
                 if self.layers.len() <= 1 {
                     return;
@@ -2704,6 +2959,10 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
+        let fill_rule = to_fill_rule(draw.fill_rule);
+        if self.discarding_group() {
+            return;
+        }
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
@@ -2726,6 +2985,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
                 Self::fill_image_geometry_with_mode(
                     layer,
                     &draw.shape,
+                    fill_rule,
                     &image_pixmap,
                     image,
                     draw.brush_transform,
@@ -2742,6 +3002,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             Self::fill_image_geometry_with_mode(
                 &mut child,
                 &draw.shape,
+                fill_rule,
                 &image_pixmap,
                 image,
                 draw.brush_transform,
@@ -2761,6 +3022,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
             Self::fill_geometry_with_mode(
                 layer,
                 &draw.shape,
+                fill_rule,
                 &brush,
                 draw.brush_transform,
                 draw.composite.alpha,
@@ -2773,11 +3035,14 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         let brush_transform = draw.brush_transform;
         self.draw_with_composite(draw.composite, |layer| {
             layer.transform = transform;
-            Self::fill_geometry(layer, &draw.shape, &brush, brush_transform);
+            Self::fill_geometry(layer, &draw.shape, fill_rule, &brush, brush_transform);
         });
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
+        if self.discarding_group() {
+            return;
+        }
         let Some(brush) = self.brush_to_owned(draw.brush) else {
             return;
         };
@@ -2853,6 +3118,13 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         draw: GlyphRunRef<'_>,
         glyphs: &mut dyn Iterator<Item = imaging::record::Glyph>,
     ) {
+        if self.discarding_group() {
+            return;
+        }
+        if draw.brush.as_raster().is_none() {
+            self.error = Some(Error::UnsupportedExternalImage);
+            return;
+        }
         let cache_color = self.cache_color;
         if draw.composite == Composite::default() {
             let transform = self.transform;
@@ -2882,6 +3154,9 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
+        if self.discarding_group() {
+            return;
+        }
         if let BlendStrategy::SinglePass(blend_mode) =
             determine_blend_strategy(&draw.composite.blend)
         {
@@ -2901,8 +3176,8 @@ impl PaintSink for TinySkiaRender<'_, '_> {
         let shape = draw.rect.to_rounded_rect(draw.radius);
         child.fill(&shape, draw.color);
         child.filters.push(Filter::Blur {
-            std_deviation_x: f64_to_f32(draw.std_dev),
-            std_deviation_y: f64_to_f32(draw.std_dev),
+            std_deviation_x: draw.std_dev,
+            std_deviation_y: draw.std_dev,
         });
         apply_group_filters(&mut child);
 
@@ -2923,6 +3198,9 @@ impl TinySkiaRenderer {
         source.validate().map_err(Error::InvalidScene)?;
         let mut render = self.begin(width, height)?;
         source.paint_into(&mut render);
+        if let Some(error) = render.error.take() {
+            return Err(error);
+        }
         image.resize(width, height);
         render
             .finish_into_rgba8(image.data.as_mut_slice(), usize_from_u32(width) * 4)
@@ -3000,6 +3278,9 @@ impl ImageRenderer for TinySkiaRenderer {
             .begin(target.width, target.height)
             .map_err(map_image_renderer_error)?;
         source.paint_into(&mut render);
+        if let Some(error) = render.error.take() {
+            return Err(map_image_renderer_error(error));
+        }
         render
             .finish_into_rgba8(target.data, target.bytes_per_row)
             .ok_or(ImageRendererError::Target(ImageTargetError::InvalidTarget(
@@ -3018,6 +3299,12 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         }
         Error::InvalidTargetBuffer => {
             ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        }
+        Error::UnsupportedExternalImage => {
+            ImageRendererError::Unsupported(imaging::render::RenderUnsupportedError::ExternalImage)
+        }
+        Error::UnsupportedFilter => {
+            ImageRendererError::Unsupported(imaging::render::RenderUnsupportedError::Filter)
         }
         other => ImageRendererError::backend(other),
     }
@@ -3043,6 +3330,9 @@ impl TinySkiaRenderer {
         source.validate().map_err(Error::InvalidScene)?;
         let mut render = self.begin_target(target)?;
         source.paint_into(&mut render);
+        if let Some(error) = render.error.take() {
+            return Err(error);
+        }
         render.finish_direct_rgba8_opaque().ok_or(Error::Internal(
             "tiny-skia bound target renderer did not produce a frame",
         ))
@@ -3477,11 +3767,10 @@ fn draw_solid_color_glyphs_into_layer<'a>(
     };
     let font_blob_id = font.data.id();
     let skew = glyph_transform.map(|transform| transform.skew_x_degrees);
-    // swash exposes isotropic emboldening, so preserve the strongest requested axis.
-    let embolden_strength = f64_to_f32(run.font_embolden.x.max(run.font_embolden.y).max(0.0));
     let glyph_font_size_scale = glyph_transform.map_or(1.0, |transform| transform.font_size_scale);
-    let scaled_font_size =
-        run.font_size * f64_to_f32(effective_raster_scale * glyph_font_size_scale);
+    let outline_scale = effective_raster_scale * glyph_font_size_scale;
+    let scaled_font_size = run.font_size * f64_to_f32(outline_scale);
+    let embolden = run.font_embolden * outline_scale;
 
     for glyph in glyphs {
         let glyph_x = f64_to_f32(raster_origin.x + glyph.x as f64 * effective_raster_scale);
@@ -3498,7 +3787,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
             x: glyph_x,
             y: glyph_y,
             hint: run.hint,
-            embolden_strength,
+            embolden,
             skew,
         });
 
@@ -3512,7 +3801,7 @@ fn draw_solid_color_glyphs_into_layer<'a>(
                 font_size: scaled_font_size,
                 hint: run.hint,
                 normalized_coords: run.normalized_coords,
-                embolden_strength,
+                embolden,
                 skew,
                 offset_x: new_x + f32::from(cache_key.x_bin) / 8.0,
                 offset_y: new_y + f32::from(cache_key.y_bin) / 8.0,
@@ -3563,8 +3852,9 @@ fn draw_brushed_glyphs_into_layer<'a>(
         Ok(layer) => layer,
         Err(_) => return,
     };
+    mask_layer.origin = layer.origin;
     let mask_run = GlyphRunRef {
-        brush: BrushRef::Solid(Color::WHITE),
+        brush: imaging::BrushRef::Solid(Color::WHITE),
         ..run
     };
     draw_solid_color_glyphs_into_layer(
@@ -3576,13 +3866,21 @@ fn draw_brushed_glyphs_into_layer<'a>(
         glyphs,
         Color::WHITE,
     );
-    let Some(mask_bounds) = mask_layer.draw_bounds else {
+    let Some(mask_bounds) = mask_layer.draw_bounds.map(|bounds| {
+        bounds.intersect(Rect::from_origin_size(
+            layer.origin,
+            Size::new(f64::from(width), f64::from(height)),
+        ))
+    }) else {
         return;
     };
     let Some(mask_bounds) = rect_to_int_rect(mask_bounds) else {
         return;
     };
-    let Some(local_mask) = clone_pixmap_region(mask_layer.pixmap.as_ref(), mask_bounds) else {
+    let Some(local_bounds) = root_rect_to_local_int_rect(&mask_layer, mask_bounds) else {
+        return;
+    };
+    let Some(local_mask) = clone_pixmap_region(mask_layer.pixmap.as_ref(), local_bounds) else {
         return;
     };
     let mut content_layer = match Layer::new_root(mask_bounds.width(), mask_bounds.height()) {
@@ -3596,13 +3894,17 @@ fn draw_brushed_glyphs_into_layer<'a>(
             f64::from(mask_bounds.height()),
         ),
     );
+    let brush_transform =
+        Affine::translate((-f64::from(mask_bounds.x()), -f64::from(mask_bounds.y())))
+            * run.transform
+            * run.brush_transform.unwrap_or(Affine::IDENTITY);
     content_layer.fill_with_brush_transform_and_mode(
         &canvas_rect,
-        run.brush,
-        Some(Affine::translate((
-            f64::from(mask_bounds.x()),
-            f64::from(mask_bounds.y()),
-        ))),
+        FillRule::Winding,
+        run.brush
+            .as_raster()
+            .expect("glyph brush was checked before rendering"),
+        Some(brush_transform),
         1.0,
         TinyBlendMode::SourceOver,
     );
@@ -3638,7 +3940,7 @@ fn draw_glyphs_into_layer<'a>(
         return;
     }
     match run.brush {
-        BrushRef::Solid(color) => draw_solid_color_glyphs_into_layer(
+        imaging::BrushRef::Solid(color) => draw_solid_color_glyphs_into_layer(
             caches,
             layer,
             cache_color,
@@ -3692,7 +3994,8 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
 
     fn finish_direct_rgba8_opaque(&mut self) -> Option<()> {
         self.finalize_frame();
-        for pixel in self.layers[0].pixmap.data_mut().chunks_exact_mut(4) {
+        let (pixels, _) = self.layers[0].pixmap.data_mut().as_chunks_mut::<4>();
+        for pixel in pixels {
             pixel[3] = 0xff;
         }
         Some(())
@@ -3708,10 +4011,16 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         self.caches
             .blurred_rrect_cache
             .retain(|_, (c, _)| *c == self.cache_color);
+        #[cfg(feature = "std")]
         let now = Instant::now();
-        self.caches
-            .glyph_cache
-            .retain(|_, entry| should_retain_glyph_entry(entry, self.cache_color, now));
+        self.caches.glyph_cache.retain(|_, entry| {
+            should_retain_glyph_entry(
+                entry,
+                self.cache_color,
+                #[cfg(feature = "std")]
+                now,
+            )
+        });
         self.cache_color = CacheColor(!self.cache_color.0);
         *self.cache_color_out = self.cache_color;
     }
@@ -3736,10 +4045,9 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
             .chunks_exact(width * 4)
             .zip(dst.chunks_exact_mut(bytes_per_row))
         {
-            for (src, out) in src_row
-                .chunks_exact(4)
-                .zip(dst_row[..width * 4].chunks_exact_mut(4))
-            {
+            let (src_pixels, _) = src_row.as_chunks::<4>();
+            let (dst_pixels, _) = dst_row[..width * 4].as_chunks_mut::<4>();
+            for (src, out) in src_pixels.iter().zip(dst_pixels) {
                 let alpha = src[3];
                 let red = unpremultiply_channel(src[0], alpha);
                 let green = unpremultiply_channel(src[1], alpha);
@@ -3815,16 +4123,26 @@ fn path_to_tiny_skia_path(path: &BezPath) -> Option<Path> {
     builder.finish()
 }
 
-fn realize_image_pixmap(image_data: &ImageData) -> Option<Pixmap> {
-    let mut pixmap = Pixmap::new(image_data.width, image_data.height)?;
-    for (pixel, bytes) in pixmap
-        .pixels_mut()
-        .iter_mut()
-        .zip(image_data.data.data().chunks_exact(4))
-    {
-        *pixel = tiny_skia::Color::from_rgba8(bytes[0], bytes[1], bytes[2], bytes[3])
-            .premultiply()
-            .to_color_u8();
+fn realize_image_pixmap(image: &ImageData) -> Option<Pixmap> {
+    if image.format.size_in_bytes(image.width, image.height)? != image.data.len() {
+        return None;
+    }
+    let mut pixmap = Pixmap::new(image.width, image.height)?;
+    let (src_pixels, _) = image.data.data().as_chunks::<4>();
+    for (pixel, &bytes) in pixmap.pixels_mut().iter_mut().zip(src_pixels) {
+        let [r, g, b, a] = match image.format {
+            peniko::ImageFormat::Rgba8 => bytes,
+            peniko::ImageFormat::Bgra8 => [bytes[2], bytes[1], bytes[0], bytes[3]],
+            _ => return None,
+        };
+        *pixel = match image.alpha_type {
+            peniko::ImageAlphaType::Alpha => tiny_skia::Color::from_rgba8(r, g, b, a)
+                .premultiply()
+                .to_color_u8(),
+            peniko::ImageAlphaType::AlphaPremultiplied => {
+                PremultipliedColorU8::from_rgba(r, g, b, a)?
+            }
+        };
     }
     Some(pixmap)
 }
@@ -3838,7 +4156,7 @@ where
     T: Borrow<ImageData>,
 {
     let image_data = image.image.borrow();
-    let image_id = image_data.data.id();
+    let image_id = ImageCacheKey::new(image_data);
     if let Some((entry_color, pixmap)) = caches.image_cache.get_mut(&image_id) {
         *entry_color = cache_color;
         return Some(pixmap.clone());
@@ -3881,12 +4199,12 @@ fn cache_scaled_image_pixmap<T>(
 where
     T: Borrow<ImageData>,
 {
-    let image_id = image.image.borrow().data.id();
+    let image_id = ImageCacheKey::new(image.image.borrow());
     let key = ScaledImageCacheKey {
-        image_id,
+        image: image_id,
         width,
         height,
-        quality: std::mem::discriminant(&image.sampler.quality),
+        quality: discriminant(&image.sampler.quality),
     };
     if let Some((entry_color, pixmap)) = caches.scaled_image_cache.get_mut(&key) {
         *entry_color = cache_color;
@@ -4019,11 +4337,8 @@ fn render_cached_blurred_rounded_rect(
         return false;
     };
     let translated_rect = translate_rect(draw.rect, dx, dy);
-    let Some(bounds) = rect_to_int_rect(blur_bounds(
-        translated_rect,
-        f64_to_f32(draw.std_dev),
-        f64_to_f32(draw.std_dev),
-    )) else {
+    let Some(bounds) = rect_to_int_rect(blur_bounds(translated_rect, draw.std_dev, draw.std_dev))
+    else {
         return false;
     };
     let local_rect = translate_rect(
@@ -4551,6 +4866,18 @@ fn layer_composite_rect(layer: &Layer<'_>, parent: &Layer<'_>) -> Option<IntRect
         rect = rect.intersect(parent_clip);
     }
 
+    // Cropping the source must also advance the destination. Constrain the root-space
+    // rectangle here so converting it to local coordinates cannot silently crop it later.
+    for surface in [layer, parent] {
+        rect = rect.intersect(Rect::from_origin_size(
+            surface.origin,
+            Size::new(
+                f64::from(surface.pixmap.width()),
+                f64::from(surface.pixmap.height()),
+            ),
+        ));
+    }
+
     if rect.is_zero_area() {
         return None;
     }
@@ -4683,16 +5010,11 @@ fn apply_alpha_mask_from_pixmap(target: &mut Pixmap, mask_source: PixmapRef<'_>)
 }
 
 fn coverage_from_mask_pixmap(pixmap: &Pixmap, mode: MaskMode) -> Arc<[u8]> {
+    let (pixels, _) = pixmap.data().as_chunks::<4>();
     match mode {
-        MaskMode::Alpha => pixmap
-            .data()
-            .chunks_exact(4)
-            .map(|px| px[3])
-            .collect::<Vec<_>>()
-            .into(),
-        MaskMode::Luminance => pixmap
-            .data()
-            .chunks_exact(4)
+        MaskMode::Alpha => pixels.iter().map(|px| px[3]).collect::<Vec<_>>().into(),
+        MaskMode::Luminance => pixels
+            .iter()
             .map(|px| {
                 let coverage =
                     (u16::from(px[0]) * 54 + u16::from(px[1]) * 183 + u16::from(px[2]) * 19 + 127)
@@ -4741,10 +5063,8 @@ fn apply_group_mask_to_pixmap(target: &mut Pixmap, group_mask: &GroupMask) {
         let mask_row = y * mask_width;
         let target_row_bytes = &mut target_bytes[target_row..target_row + width * 4];
         let mask_row_bytes = &mask_source[mask_row..mask_row + width];
-        for (pixel, &coverage) in target_row_bytes
-            .chunks_exact_mut(4)
-            .zip(mask_row_bytes.iter())
-        {
+        let (pixels, _) = target_row_bytes.as_chunks_mut::<4>();
+        for (pixel, &coverage) in pixels.iter_mut().zip(mask_row_bytes) {
             if coverage == 255 {
                 continue;
             }
@@ -4786,13 +5106,16 @@ fn gaussian_box_radii(sigma: f32) -> Option<[i32; 3]> {
     let n = 3.0_f64;
     let sigma = f64::from(sigma);
     let ideal_width = ((12.0 * sigma * sigma / n) + 1.0).sqrt();
+    if ideal_width > f64::from(i32::MAX - 2) {
+        return None;
+    }
     let mut lower_width = floor_to_i32(ideal_width);
     if lower_width % 2 == 0 {
         lower_width -= 1;
     }
     let upper_width = lower_width + 2;
     let m_ideal = (12.0 * sigma * sigma
-        - n * f64::from(lower_width * lower_width)
+        - n * f64::from(lower_width).powi(2)
         - 4.0 * n * f64::from(lower_width)
         - 3.0 * n)
         / (-4.0 * f64::from(lower_width) - 4.0);
@@ -5008,9 +5331,9 @@ fn translate_rect(rect: Rect, dx: f64, dy: f64) -> Rect {
     Rect::new(rect.x0 + dx, rect.y0 + dy, rect.x1 + dx, rect.y1 + dy)
 }
 
-fn blur_bounds(rect: Rect, sigma_x: f32, sigma_y: f32) -> Rect {
-    let pad_x = (f64::from(sigma_x) * 3.0).ceil();
-    let pad_y = (f64::from(sigma_y) * 3.0).ceil();
+fn blur_bounds(rect: Rect, sigma_x: f64, sigma_y: f64) -> Rect {
+    let pad_x = (sigma_x * 3.0).ceil();
+    let pad_y = (sigma_y * 3.0).ceil();
     Rect::new(
         rect.x0 - pad_x,
         rect.y0 - pad_y,
@@ -5036,7 +5359,10 @@ fn blur_pixmap_local(
     let Some(bounds) = bounds else {
         return blur_pixmap(pixmap, sigma_x, sigma_y);
     };
-    let region = pixmap_region_bounds(pixmap, blur_bounds(bounds, sigma_x, sigma_y))?;
+    let region = pixmap_region_bounds(
+        pixmap,
+        blur_bounds(bounds, f64::from(sigma_x), f64::from(sigma_y)),
+    )?;
     let mut local = LocalPixmapRegion::extract(pixmap.as_ref(), region)?;
     local.pixmap = blur_pixmap(&local.pixmap, sigma_x, sigma_y)?;
     local.place_into_full_size(pixmap.width(), pixmap.height())
@@ -5055,7 +5381,7 @@ fn drop_shadow_pixmap_local(
         return drop_shadow_pixmap(pixmap, dx, dy, sigma_x, sigma_y, color);
     };
 
-    let padded = blur_bounds(bounds, sigma_x, sigma_y);
+    let padded = blur_bounds(bounds, f64::from(sigma_x), f64::from(sigma_y));
     let shadow_bounds = translate_rect(padded, f64::from(dx), f64::from(dy));
     let region = pixmap_region_bounds(pixmap, bounds.union(shadow_bounds))?;
     let mut local = LocalPixmapRegion::extract(pixmap.as_ref(), region)?;
@@ -5074,8 +5400,8 @@ fn filter_output_bounds(bounds: Option<Rect>, filter: &Filter, pixmap: &Pixmap) 
             std_deviation_y,
         } => bounds.map(|rect| blur_bounds(rect, std_deviation_x, std_deviation_y)),
         Filter::Offset { dx, dy } => {
-            let dx = f64::from(round_to_i32(f64::from(dx)));
-            let dy = f64::from(round_to_i32(f64::from(dy)));
+            let dx = f64::from(round_to_i32(dx));
+            let dy = f64::from(round_to_i32(dy));
             bounds.map(|rect| translate_rect(rect, dx, dy))
         }
         Filter::DropShadow {
@@ -5085,8 +5411,8 @@ fn filter_output_bounds(bounds: Option<Rect>, filter: &Filter, pixmap: &Pixmap) 
             std_deviation_y,
             ..
         } => {
-            let dx = f64::from(round_to_i32(f64::from(dx)));
-            let dy = f64::from(round_to_i32(f64::from(dy)));
+            let dx = f64::from(round_to_i32(dx));
+            let dy = f64::from(round_to_i32(dy));
             bounds.map(|rect| {
                 let shadow =
                     translate_rect(blur_bounds(rect, std_deviation_x, std_deviation_y), dx, dy);
@@ -5106,7 +5432,12 @@ fn filter_pixmap(pixmap: &Pixmap, bounds: Option<Rect>, filter: &Filter) -> Opti
         Filter::Blur {
             std_deviation_x,
             std_deviation_y,
-        } => blur_pixmap_local(pixmap, bounds, std_deviation_x, std_deviation_y),
+        } => blur_pixmap_local(
+            pixmap,
+            bounds,
+            f64_to_f32(std_deviation_x),
+            f64_to_f32(std_deviation_y),
+        ),
         Filter::DropShadow {
             dx,
             dy,
@@ -5116,17 +5447,13 @@ fn filter_pixmap(pixmap: &Pixmap, bounds: Option<Rect>, filter: &Filter) -> Opti
         } => drop_shadow_pixmap_local(
             pixmap,
             bounds,
-            round_to_i32(f64::from(dx)),
-            round_to_i32(f64::from(dy)),
-            std_deviation_x,
-            std_deviation_y,
+            round_to_i32(dx),
+            round_to_i32(dy),
+            f64_to_f32(std_deviation_x),
+            f64_to_f32(std_deviation_y),
             color,
         ),
-        Filter::Offset { dx, dy } => offset_pixmap(
-            pixmap,
-            round_to_i32(f64::from(dx)),
-            round_to_i32(f64::from(dy)),
-        ),
+        Filter::Offset { dx, dy } => offset_pixmap(pixmap, round_to_i32(dx), round_to_i32(dy)),
     }
 }
 
@@ -5275,6 +5602,148 @@ mod tests {
     use peniko::color::{ColorSpaceTag, HueDirection, palette::css};
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 
+    fn ring_path() -> BezPath {
+        let mut path = Rect::new(2.0, 2.0, 14.0, 14.0).to_path(0.1);
+        path.extend(Rect::new(4.0, 4.0, 12.0, 12.0).to_path(0.1));
+        path
+    }
+
+    #[test]
+    fn even_odd_fills_preserve_holes_across_brushes_and_composites() {
+        let data = ImageData {
+            data: Blob::from(vec![255; 4]),
+            width: 1,
+            height: 1,
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+        };
+        let brushes = [
+            imaging::Brush::Solid(Color::WHITE),
+            imaging::Brush::Gradient(
+                Gradient::new_linear((0.0, 0.0), (16.0, 0.0))
+                    .with_stops([Color::WHITE, Color::WHITE].as_slice()),
+            ),
+            imaging::Brush::Image(imaging::ImageBrush::new(data.clone())),
+            imaging::Brush::Image(
+                imaging::ImageBrush::new(data).with_sampler(
+                    peniko::ImageSampler::default()
+                        .with_x_extend(Extend::Repeat)
+                        .with_y_extend(Extend::Pad),
+                ),
+            ),
+        ];
+        let mut renderer = TinySkiaRenderer::new();
+        for brush in brushes {
+            for blend in [
+                BlendMode::default(),
+                Compose::Copy.into(),
+                BlendMode::new(Mix::Multiply, Compose::Copy),
+            ] {
+                for rule in [peniko::Fill::NonZero, peniko::Fill::EvenOdd] {
+                    let mut scene = Scene::new();
+                    Painter::new(&mut scene)
+                        .fill(ring_path(), &brush)
+                        .fill_rule(rule)
+                        .composite(Composite::new(blend, 1.0))
+                        .draw();
+                    let image = renderer.render_source(&mut &scene, 16, 16).unwrap();
+                    assert_eq!(
+                        image.data[(3 * 16 + 3) * 4 + 3],
+                        255,
+                        "ring must be painted"
+                    );
+                    let expected = if rule == peniko::Fill::EvenOdd {
+                        0
+                    } else {
+                        255
+                    };
+                    assert_eq!(
+                        image.data[(8 * 16 + 8) * 4 + 3],
+                        expected,
+                        "hole for {rule:?}, {blend:?}, {brush:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn even_odd_clips_preserve_holes_in_nested_and_offset_groups() {
+        let mut renderer = TinySkiaRenderer::new();
+        for isolated in [false, true] {
+            let mut scene = Scene::new();
+            let path = ring_path();
+            let mut painter = Painter::new(&mut scene);
+            painter.with_group(
+                GroupRef::new().with_clip(ClipRef::fill(Rect::new(1.0, 1.0, 15.0, 15.0))),
+                |p| {
+                    let clip = ClipRef::fill_with_rule(&path, peniko::Fill::EvenOdd);
+                    if isolated {
+                        p.with_group(GroupRef::new().with_clip(clip), |p| {
+                            p.fill_rect(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE);
+                        });
+                    } else {
+                        p.with_clip(clip, |p| {
+                            p.fill_rect(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE);
+                        });
+                    }
+                },
+            );
+            let image = renderer.render_source(&mut &scene, 16, 16).unwrap();
+            assert_eq!(image.data[(3 * 16 + 3) * 4 + 3], 255);
+            assert_eq!(image.data[(8 * 16 + 8) * 4 + 3], 0, "isolated={isolated}");
+        }
+    }
+
+    #[test]
+    fn groups_clipped_beyond_the_surface_keep_their_destination_origin() {
+        let mut renderer = TinySkiaRenderer::new();
+        for blend in [BlendMode::default(), Mix::Multiply.into()] {
+            let mut scene = Scene::new();
+            let mut painter = Painter::new(&mut scene);
+            painter.fill_rect(Rect::new(0.0, 0.0, 16.0, 16.0), Color::WHITE);
+            painter.with_group(
+                GroupRef::new()
+                    .with_clip(ClipRef::fill(Rect::new(-2.0, -2.0, 18.0, 18.0)))
+                    .with_composite(Composite::new(blend, 1.0)),
+                |p| p.fill_rect(Rect::new(-4.0, -4.0, 20.0, 20.0), Color::BLACK),
+            );
+            let image = renderer.render_source(&mut &scene, 16, 16).unwrap();
+            let expected = [0, 0, 0, 255];
+            assert!(
+                image
+                    .data
+                    .chunks_exact(expected.len())
+                    .all(|pixel| pixel == expected),
+                "cropping must preserve source placement for {blend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrepresentable_filter_transform_returns_unsupported_and_recovers() {
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(
+            GroupRef::new()
+                .with_filters(&[Filter::blur(1.0)])
+                .with_filter_transform(Affine::skew(0.5, 0.0)),
+            |p| p.fill_rect(Rect::new(0.0, 0.0, 8.0, 8.0), Color::WHITE),
+        );
+        let mut renderer = TinySkiaRenderer::new();
+        assert!(matches!(
+            renderer.render_scene(&scene, 8, 8),
+            Err(Error::UnsupportedFilter)
+        ));
+        assert!(renderer.render_scene(&Scene::new(), 8, 8).is_ok());
+    }
+
+    #[test]
+    fn large_box_blur_kernel_does_not_overflow_integer_arithmetic() {
+        let pixmap = Pixmap::new(8, 8).unwrap();
+        assert!(blur_pixmap(&pixmap, 100_000.0, 100_000.0).is_some());
+        assert!(gaussian_box_radii(f32::MAX).is_none());
+    }
+
     /// Creates a `Layer` directly without a window, for offscreen rendering.
     fn make_layer(width: u32, height: u32) -> Layer<'static> {
         Layer {
@@ -5295,6 +5764,7 @@ mod tests {
             group_mask: None,
             filters: Vec::new(),
             clip_applied_in_content: false,
+            deferred_group_clip: None,
         }
     }
 
@@ -5616,6 +6086,7 @@ mod tests {
         let clip_path = builder.finish().expect("failed to create clip path");
         child.set_base_clip(Some(ClipPath {
             path: clip_path,
+            fill_rule: FillRule::Winding,
             rect: Rect::new(0.0, 0.0, 6.0, 6.0),
             simple_rect: None,
             stroke_source: None,
@@ -5626,7 +6097,9 @@ mod tests {
         apply_layer(&child, &mut parent);
 
         assert_ne!(pixel_rgba(&parent, 3, 3), (0, 0, 255, 255));
-        assert_eq!(pixel_rgba(&parent, 1, 1), (0, 0, 255, 255));
+        // (1, 1) straddles the diamond's antialiased boundary; (0, 0) is fully outside.
+        assert_ne!(pixel_rgba(&parent, 1, 1), (0, 0, 255, 255));
+        assert_eq!(pixel_rgba(&parent, 0, 0), (0, 0, 255, 255));
         assert_eq!(pixel_rgba(&parent, 6, 6), (0, 0, 255, 255));
     }
 
@@ -5674,6 +6147,7 @@ mod tests {
         let mut transformed = make_layer(8, 2);
         transformed.fill_with_brush_transform(
             &Rect::new(0.0, 0.0, 8.0, 2.0),
+            FillRule::Winding,
             &gradient,
             Some(Affine::translate((2.0, 0.0))),
         );
@@ -5700,7 +6174,7 @@ mod tests {
     #[test]
     fn normalized_text_transform_keeps_translation_and_rotation_separate() {
         let transform = Affine::translate((30.0, 20.0))
-            * Affine::rotate(std::f64::consts::FRAC_PI_2)
+            * Affine::rotate(core::f64::consts::FRAC_PI_2)
             * Affine::scale(2.0);
 
         let normalized = normalize_affine(transform, true);
@@ -5731,7 +6205,7 @@ mod tests {
             x: 12.2,
             y: 19.8,
             hint: true,
-            embolden_strength: 0.0,
+            embolden: Vec2::ZERO,
             skew: None,
         });
         assert_eq!(cache_key.x_bin, 2);
@@ -5740,6 +6214,7 @@ mod tests {
         assert_eq!(y, 20.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn glyph_cache_entries_get_a_minimum_ttl() {
         let now = Instant::now();
@@ -5769,6 +6244,17 @@ mod tests {
             CacheColor(true),
             now
         ));
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn glyph_cache_retains_entries_used_in_the_current_frame() {
+        let entry = GlyphCacheEntry {
+            cache_color: CacheColor(true),
+            glyph: None,
+        };
+        assert!(should_retain_glyph_entry(&entry, CacheColor(true)));
+        assert!(!should_retain_glyph_entry(&entry, CacheColor(false)));
     }
 
     #[test]
@@ -5824,28 +6310,6 @@ mod tests {
 
         assert!(rgba_distance(rendered, expected_longer) <= 10);
         assert!(rgba_distance(rendered, expected_shorter) >= 40);
-    }
-
-    #[test]
-    fn default_group_with_clip_does_not_isolate() {
-        let mut renderer = TinySkiaRenderer::new_with_size(16, 16).expect("renderer");
-        let mut render = renderer.begin(16, 16).expect("render");
-        let clip = ClipRef::fill(imaging::GeometryRef::Rect(Rect::new(2.0, 2.0, 14.0, 14.0)));
-
-        render.push_group(GroupRef::new().with_clip(clip));
-
-        assert_eq!(render.layers.len(), 1);
-        assert_eq!(
-            render.group_frames,
-            vec![GroupFrame::Direct { pushed_clip: true }]
-        );
-        assert_eq!(render.current_layer().clip_stack.len(), 1);
-
-        render.pop_group();
-
-        assert!(render.group_frames.is_empty());
-        assert_eq!(render.layers.len(), 1);
-        assert!(render.current_layer().clip_stack.is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use imaging::{
     Painter,
-    record::{Command, Scene},
+    record::{Command, ContextKind, ContextValue, Scene},
 };
 use imaging_conformance::assert_validate_ok;
 use kurbo::Affine;
@@ -34,6 +34,11 @@ fn append_transformed_preserves_context_annotations() {
         Command::PushContext(id) => *id,
         other => panic!("expected leading PushContext, got {other:?}"),
     };
-    assert_eq!(dest.label(dest.context(context_id).label), "source/button");
+    let context = dest.context(context_id);
+    assert_eq!(context.kind, ContextKind::Label);
+    match &context.value {
+        ContextValue::Str(label) => assert_eq!(dest.label(*label), "source/button"),
+        other => panic!("expected string label context value, got {other:?}"),
+    }
     assert!(matches!(dest.commands()[1], Command::PopContext));
 }

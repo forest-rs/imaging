@@ -28,9 +28,8 @@ pub(crate) fn lower_tree(tree: &usvg::Tree, options: &RenderOptions) -> crate::p
         masks: Vec::new(),
         lowered_masks: HashMap::new(),
         report: RenderReport::default(),
-        root_transform: options.transform,
     };
-    let nodes = cx.lower_group(tree.root());
+    let nodes = cx.lower_group(tree.root(), options.transform);
     crate::plan::RenderPlan {
         masks: cx.masks,
         nodes,
@@ -42,26 +41,26 @@ struct LowerCx {
     masks: Vec<PlanMask>,
     lowered_masks: HashMap<usize, PlanMaskId>,
     report: RenderReport,
-    root_transform: Affine,
 }
 
 impl LowerCx {
-    fn lower_group(&mut self, group: &usvg::Group) -> Vec<PlanNode> {
+    fn lower_group(&mut self, group: &usvg::Group, root_transform: Affine) -> Vec<PlanNode> {
         if !group.filters().is_empty() {
             self.unsupported(UnsupportedFeatureKind::Filter, group.id());
         }
-        let mut clips = group
+        let transform = root_transform * convert_transform(group.abs_transform());
+        let clips = group
             .clip_path()
-            .and_then(|clip_path| self.lower_clip_path_chain(clip_path, group.id()))
+            .and_then(|clip_path| self.lower_clip_path_chain(clip_path, transform, group.id()))
             .unwrap_or_default();
-        let mask = group.mask().and_then(|mask| {
-            clips.push(self.lower_mask_region(mask));
-            self.lower_mask(mask)
+        let mask = group.mask().map(|mask| PlanAppliedMask {
+            mask: self.lower_mask(mask),
+            transform,
         });
 
         let mut children = Vec::new();
         for child in group.children() {
-            children.extend(self.lower_node(child));
+            children.extend(self.lower_node(child, root_transform));
         }
 
         let composite =
@@ -82,22 +81,22 @@ impl LowerCx {
         }
     }
 
-    fn lower_node(&mut self, node: &Node) -> Vec<PlanNode> {
+    fn lower_node(&mut self, node: &Node, root_transform: Affine) -> Vec<PlanNode> {
         match node {
-            Node::Group(group) => self.lower_group(group),
-            Node::Path(path) => self.lower_path(path),
-            Node::Image(image) => self.lower_image(image),
-            Node::Text(text) => self.lower_group(text.flattened()),
+            Node::Group(group) => self.lower_group(group, root_transform),
+            Node::Path(path) => self.lower_path(path, root_transform),
+            Node::Image(image) => self.lower_image(image, root_transform),
+            Node::Text(text) => self.lower_group(text.flattened(), root_transform),
         }
     }
 
-    fn lower_path(&mut self, path: &usvg::Path) -> Vec<PlanNode> {
+    fn lower_path(&mut self, path: &usvg::Path, root_transform: Affine) -> Vec<PlanNode> {
         if !path.is_visible() {
             return Vec::new();
         }
 
         let geometry = convert_path(path.data());
-        let transform = self.root_transform * convert_transform(path.abs_transform());
+        let transform = root_transform * convert_transform(path.abs_transform());
         let mut nodes = Vec::new();
 
         let push_fill =
@@ -195,48 +194,40 @@ impl LowerCx {
         }
     }
 
-    fn lower_image(&mut self, image: &usvg::Image) -> Vec<PlanNode> {
+    fn lower_image(&mut self, image: &usvg::Image, root_transform: Affine) -> Vec<PlanNode> {
         if !image.is_visible() {
             return Vec::new();
         }
         match image.kind() {
-            usvg::ImageKind::SVG(tree) => {
-                let nested = lower_tree(
-                    tree,
-                    &RenderOptions {
-                        transform: self.root_transform * convert_transform(image.abs_transform()),
-                    },
-                );
-                self.report
-                    .unsupported_features
-                    .extend(nested.report.unsupported_features);
-                nested.nodes
-            }
+            usvg::ImageKind::SVG(tree) => self.lower_group(
+                tree.root(),
+                root_transform * convert_transform(image.abs_transform()),
+            ),
             usvg::ImageKind::PNG(data) => self.lower_raster_image(
                 data.as_slice(),
                 image.rendering_mode(),
-                image.abs_transform(),
+                root_transform * convert_transform(image.abs_transform()),
                 image.id(),
                 decode_png,
             ),
             usvg::ImageKind::JPEG(data) => self.lower_raster_image(
                 data.as_slice(),
                 image.rendering_mode(),
-                image.abs_transform(),
+                root_transform * convert_transform(image.abs_transform()),
                 image.id(),
                 decode_jpeg,
             ),
             usvg::ImageKind::GIF(data) => self.lower_raster_image(
                 data.as_slice(),
                 image.rendering_mode(),
-                image.abs_transform(),
+                root_transform * convert_transform(image.abs_transform()),
                 image.id(),
                 decode_gif,
             ),
             usvg::ImageKind::WEBP(data) => self.lower_raster_image(
                 data.as_slice(),
                 image.rendering_mode(),
-                image.abs_transform(),
+                root_transform * convert_transform(image.abs_transform()),
                 image.id(),
                 decode_webp,
             ),
@@ -247,7 +238,7 @@ impl LowerCx {
         &mut self,
         data: &[u8],
         rendering_mode: usvg::ImageRendering,
-        abs_transform: usvg::Transform,
+        transform: Affine,
         node_id: &str,
         decode: fn(&[u8]) -> Option<ImageData>,
     ) -> Vec<PlanNode> {
@@ -257,7 +248,7 @@ impl LowerCx {
         };
         let image = PlanImage {
             image: with_rendering_quality(ImageBrush::new(image), rendering_mode),
-            transform: self.root_transform * convert_transform(abs_transform),
+            transform,
         };
         vec![PlanNode::Image(image)]
     }
@@ -265,40 +256,48 @@ impl LowerCx {
     fn lower_clip_path_chain(
         &mut self,
         clip_path: &usvg::ClipPath,
+        transform: Affine,
         node_id: &str,
     ) -> Option<Vec<PlanClip>> {
         let mut clips = if let Some(parent) = clip_path.clip_path() {
-            self.lower_clip_path_chain(parent, node_id)?
+            self.lower_clip_path_chain(parent, transform, node_id)?
         } else {
             Vec::new()
         };
-        clips.push(self.lower_single_clip_path(clip_path, node_id)?);
+        clips.push(self.lower_single_clip_path(clip_path, transform, node_id)?);
         Some(clips)
     }
 
     fn lower_single_clip_path(
         &mut self,
         clip_path: &usvg::ClipPath,
+        transform: Affine,
         node_id: &str,
     ) -> Option<PlanClip> {
-        let mut path = BezPath::new();
-        let mut fill_rule = None;
-        let transform = convert_transform(clip_path.transform());
-
-        if !self.collect_clip_group(clip_path.root(), transform, &mut path, &mut fill_rule)
-            || path.is_empty()
+        let nodes = self.lower_clip_group(
+            clip_path.root(),
+            convert_transform(clip_path.transform()),
+            node_id,
+        )?;
+        // Keep the ordinary single-path case as a geometric clip. Multiple children must
+        // be filled independently: concatenating their paths can cancel overlapping coverage.
+        if nodes.len() == 1
+            && let PlanNode::Fill(fill) = &nodes[0]
         {
-            self.unsupported(UnsupportedFeatureKind::ClipPath, node_id);
-            return None;
+            let mut path = fill.path.clone();
+            path.apply_affine(transform * fill.transform);
+            return Some(PlanClip::Path {
+                path,
+                fill_rule: fill.fill_rule,
+            });
         }
-
-        Some(PlanClip {
-            path,
-            fill_rule: fill_rule.unwrap_or(Fill::NonZero),
-        })
+        Some(PlanClip::Mask(PlanAppliedMask {
+            mask: self.store_mask(MaskMode::Alpha, nodes),
+            transform,
+        }))
     }
 
-    fn lower_mask_region(&self, mask: &usvg::Mask) -> PlanClip {
+    fn lower_mask_region(mask: &usvg::Mask) -> PlanClip {
         let rect = mask.rect().to_rect();
         let rect = kurbo::Rect::new(
             f64::from(rect.left()),
@@ -306,61 +305,80 @@ impl LowerCx {
             f64::from(rect.right()),
             f64::from(rect.bottom()),
         );
-        let mut path = rect.to_path(0.1);
-        path.apply_affine(self.root_transform);
-        PlanClip {
-            path,
+        PlanClip::Path {
+            path: rect.to_path(0.1),
             fill_rule: Fill::NonZero,
         }
     }
 
-    fn lower_mask(&mut self, mask: &usvg::Mask) -> Option<PlanAppliedMask> {
+    fn lower_mask(&mut self, mask: &usvg::Mask) -> PlanMaskId {
         let key = (mask as *const usvg::Mask) as usize;
         if let Some(mask_id) = self.lowered_masks.get(&key).copied() {
-            return Some(PlanAppliedMask { mask: mask_id });
+            return mask_id;
         }
 
-        let mask_id = PlanMaskId(self.masks.len());
-        self.lowered_masks.insert(key, mask_id);
-        let nodes = self.lower_group(mask.root());
-        self.masks.push(PlanMask {
-            mode: lower_mask_mode(mask.kind()),
-            nodes,
+        // Definitions stay in mask-local coordinates and can be placed by multiple groups.
+        // Finish dependencies before assigning an ID so nested definitions cannot share a slot.
+        let children = self.lower_group(mask.root(), Affine::IDENTITY);
+        let linked = mask.mask().map(|linked| PlanAppliedMask {
+            mask: self.lower_mask(linked),
+            transform: Affine::IDENTITY,
         });
-        Some(PlanAppliedMask { mask: mask_id })
+        let nodes = vec![PlanNode::Group(PlanGroup {
+            clips: vec![Self::lower_mask_region(mask)],
+            mask: linked,
+            composite: imaging::Composite::default(),
+            children,
+        })];
+        let mask_id = self.store_mask(lower_mask_mode(mask.kind()), nodes);
+        self.lowered_masks.insert(key, mask_id);
+        mask_id
     }
 
-    fn collect_clip_group(
+    fn store_mask(&mut self, mode: MaskMode, nodes: Vec<PlanNode>) -> PlanMaskId {
+        let id = PlanMaskId(self.masks.len());
+        self.masks.push(PlanMask { mode, nodes });
+        id
+    }
+
+    fn lower_clip_group(
         &mut self,
         group: &usvg::Group,
         transform: Affine,
-        out: &mut BezPath,
-        fill_rule: &mut Option<Fill>,
-    ) -> bool {
-        if group.clip_path().is_some() || group.mask().is_some() || !group.filters().is_empty() {
-            return false;
+        node_id: &str,
+    ) -> Option<Vec<PlanNode>> {
+        if group.mask().is_some() || !group.filters().is_empty() {
+            self.unsupported(UnsupportedFeatureKind::ClipPath, node_id);
+            return None;
         }
 
         let transform = transform * convert_transform(group.transform());
+        let mut children = Vec::new();
         for child in group.children() {
-            if !self.collect_clip_node(child, transform, out, fill_rule) {
-                return false;
-            }
+            children.extend(self.lower_clip_node(child, transform, node_id)?);
         }
-        true
+        if let Some(clip) = group.clip_path() {
+            Some(vec![PlanNode::Group(PlanGroup {
+                clips: self.lower_clip_path_chain(clip, transform, node_id)?,
+                mask: None,
+                composite: imaging::Composite::default(),
+                children,
+            })])
+        } else {
+            Some(children)
+        }
     }
 
-    fn collect_clip_node(
+    fn lower_clip_node(
         &mut self,
         node: &Node,
         transform: Affine,
-        out: &mut BezPath,
-        fill_rule: &mut Option<Fill>,
-    ) -> bool {
+        node_id: &str,
+    ) -> Option<Vec<PlanNode>> {
         match node {
             Node::Path(path) => {
                 if !path.is_visible() {
-                    return true;
+                    return Some(Vec::new());
                 }
                 let node_fill_rule = path
                     .fill()
@@ -369,23 +387,20 @@ impl LowerCx {
                         usvg::FillRule::EvenOdd => Fill::EvenOdd,
                     })
                     .unwrap_or(Fill::NonZero);
-                if let Some(existing) = fill_rule {
-                    if *existing != node_fill_rule {
-                        return false;
-                    }
-                } else {
-                    *fill_rule = Some(node_fill_rule);
-                }
-                let mut clip_path = convert_path(path.data());
-                clip_path.apply_affine(transform);
-                out.extend(clip_path.elements().iter().copied());
-                true
+                Some(vec![PlanNode::Fill(PlanFill {
+                    path: convert_path(path.data()),
+                    transform,
+                    fill_rule: node_fill_rule,
+                    brush: Brush::Solid(peniko::Color::WHITE),
+                    brush_transform: None,
+                })])
             }
-            Node::Text(text) => {
-                self.collect_clip_group(text.flattened(), transform, out, fill_rule)
+            Node::Text(text) => self.lower_clip_group(text.flattened(), transform, node_id),
+            Node::Group(group) => self.lower_clip_group(group, transform, node_id),
+            Node::Image(_) => {
+                self.unsupported(UnsupportedFeatureKind::ClipPath, node_id);
+                None
             }
-            Node::Group(group) => self.collect_clip_group(group, transform, out, fill_rule),
-            Node::Image(_) => false,
         }
     }
 

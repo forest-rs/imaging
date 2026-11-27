@@ -6,6 +6,14 @@
 //! This crate provides a CPU renderer that consumes `imaging::record::Scene` (or accepts commands
 //! directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 //!
+//! Filter chains use nested single-primitive layers. Gaussian blurs support independent
+//! X/Y standard deviations in destination coordinates. Drop shadows require equal
+//! deviations. Filters that require a non-axis-aligned blur kernel return
+//! [`Error::UnsupportedFilter`].
+//!
+//! Synthetic emboldening expands the outline by the requested amount in font-size
+//! pixels before the glyph and run transforms are applied.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then render them with [`VelloCpuRenderer`].
@@ -64,7 +72,6 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use imaging::{
@@ -76,21 +83,20 @@ use imaging::{
         RenderContentError, RenderSource, RenderUnsupportedError,
     },
 };
-use kurbo::{Affine, Rect, Shape as _};
-use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
-use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
-use vello_common::glyph::Glyph as VelloGlyph;
+use kurbo::{Affine, Shape as _};
+use peniko::{BlendMode, Brush, Fill, Style};
+use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterPrimitive};
 use vello_common::paint::{Image as VelloImage, ImageSource};
 use vello_cpu::kurbo::{BezPath, StrokeOpts, stroke};
-use vello_cpu::{Pixmap, RenderContext, RenderMode, RenderSettings};
+use vello_cpu::{Glyph as VelloGlyph, Pixmap, PixmapMut, RenderContext, RenderSettings, Resources};
 
 /// Errors that can occur when rendering via Vello CPU.
 #[derive(Debug)]
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
+    /// This renderer cannot sample externally bound images.
+    UnsupportedExternalImage,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
     /// An internal invariant was violated.
@@ -109,12 +115,13 @@ impl core::error::Error for Error {}
 #[derive(Debug)]
 pub struct VelloCpuRenderer {
     ctx: RenderContext,
+    resources: Resources,
     width: u16,
     height: u16,
     tolerance: f64,
     error: Option<Error>,
     clip_depth: u32,
-    group_depth: u32,
+    group_layers: Vec<usize>,
     mask_cache: VecDeque<CachedMask>,
 }
 
@@ -134,27 +141,21 @@ impl VelloCpuRenderer {
         Ok((width, height))
     }
 
-    fn render_settings() -> RenderSettings {
-        RenderSettings {
-            render_mode: RenderMode::OptimizeSpeed,
-            ..RenderSettings::default()
-        }
-    }
-
     /// Create a renderer with an initial target size.
     ///
     /// Scene rendering methods resize this target on demand. The renderer uses Vello CPU's
     /// `OptimizeSpeed` mode by default to keep snapshots stable.
     pub fn new(width: u16, height: u16) -> Self {
-        let ctx = RenderContext::new_with(width, height, Self::render_settings());
+        let ctx = RenderContext::new_with(width, height, RenderSettings::default());
         Self {
             ctx,
+            resources: Resources::new(),
             width,
             height,
             tolerance: 0.1,
             error: None,
             clip_depth: 0,
-            group_depth: 0,
+            group_layers: Vec::new(),
             mask_cache: VecDeque::new(),
         }
     }
@@ -172,7 +173,7 @@ impl VelloCpuRenderer {
         self.ctx.reset();
         self.error = None;
         self.clip_depth = 0;
-        self.group_depth = 0;
+        self.group_layers.clear();
     }
 
     /// Drop any realized mask artifacts cached by the renderer.
@@ -189,13 +190,14 @@ impl VelloCpuRenderer {
             return;
         }
 
-        self.ctx = RenderContext::new_with(width, height, Self::render_settings());
+        self.ctx = RenderContext::new_with(width, height, RenderSettings::default());
+        self.resources = Resources::new();
         self.width = width;
         self.height = height;
         self.clear_cached_masks();
         self.error = None;
         self.clip_depth = 0;
-        self.group_depth = 0;
+        self.group_layers.clear();
     }
 
     /// Render a recorded scene into an RGBA8 image (unpremultiplied).
@@ -233,17 +235,16 @@ impl VelloCpuRenderer {
         if self.clip_depth != 0 {
             return Err(Error::Internal("unbalanced clip stack"));
         }
-        if self.group_depth != 0 {
+        if !self.group_layers.is_empty() {
             return Err(Error::Internal("unbalanced group stack"));
         }
 
         image.resize(u32::from(self.width), u32::from(self.height));
         self.ctx.flush();
-        self.ctx.render_to_buffer(
-            image.data.as_mut_slice(),
-            self.width,
-            self.height,
-            Self::render_settings().render_mode,
+        self.ctx.render(
+            PixmapMut::new(self.width, self.height, image.data.as_mut_slice())
+                .expect("image buffer matches render dimensions"),
+            &mut self.resources,
         );
         unpremultiply_rgba8_in_place(image.data.as_mut_slice());
         Ok(())
@@ -256,7 +257,7 @@ impl VelloCpuRenderer {
         if self.clip_depth != 0 {
             return Err(Error::Internal("unbalanced clip stack"));
         }
-        if self.group_depth != 0 {
+        if !self.group_layers.is_empty() {
             return Err(Error::Internal("unbalanced group stack"));
         }
         if target.width != u32::from(self.width) || target.height != u32::from(self.height) {
@@ -279,11 +280,10 @@ impl VelloCpuRenderer {
         }
 
         self.ctx.flush();
-        self.ctx.render_to_buffer(
-            &mut target.data[..required_len],
-            self.width,
-            self.height,
-            Self::render_settings().render_mode,
+        self.ctx.render(
+            PixmapMut::new(self.width, self.height, &mut target.data[..required_len])
+                .expect("validated target matches render dimensions"),
+            &mut self.resources,
         );
         unpremultiply_rgba8_in_place(&mut target.data[..required_len]);
         Ok(())
@@ -302,19 +302,15 @@ impl VelloCpuRenderer {
         }
     }
 
-    fn rect_fits_viewport_fast_path(&self, rect: &Rect, transform: Affine) -> bool {
-        let transformed = transform.transform_rect_bbox(*rect);
-        transformed.x0 >= 0.0
-            && transformed.y0 >= 0.0
-            && transformed.x1 <= f64::from(self.width)
-            && transformed.y1 <= f64::from(self.height)
-    }
-
     fn brush_to_paint(
         &mut self,
-        brush: BrushRef<'_>,
+        brush: imaging::BrushRef<'_>,
         composite: Composite,
     ) -> Option<vello_cpu::PaintType> {
+        let Some(brush) = brush.as_raster() else {
+            self.set_error_once(Error::UnsupportedExternalImage);
+            return None;
+        };
         let brush = brush.to_owned().multiply_alpha(composite.alpha);
         let paint: vello_cpu::PaintType = match brush {
             Brush::Solid(c) => Brush::Solid(c),
@@ -355,51 +351,6 @@ impl VelloCpuRenderer {
         }
     }
 
-    fn filters_to_vello(&mut self, filters: &[Filter]) -> Option<VelloFilter> {
-        if filters.is_empty() {
-            return None;
-        }
-
-        let mut graph = FilterGraph::new();
-        let mut last = None;
-        for f in filters {
-            let primitive = match *f {
-                Filter::Flood { color } => FilterPrimitive::Flood { color },
-                Filter::Blur {
-                    std_deviation_x,
-                    std_deviation_y,
-                } => FilterPrimitive::GaussianBlur {
-                    std_deviation: std_deviation_x.max(std_deviation_y),
-                    edge_mode: EdgeMode::None,
-                },
-                Filter::DropShadow {
-                    dx,
-                    dy,
-                    std_deviation_x,
-                    std_deviation_y,
-                    color,
-                } => FilterPrimitive::DropShadow {
-                    dx,
-                    dy,
-                    std_deviation: std_deviation_x.max(std_deviation_y),
-                    color,
-                    edge_mode: EdgeMode::None,
-                },
-                Filter::Offset { dx, dy } => FilterPrimitive::Offset { dx, dy },
-            };
-            last = Some(graph.add(primitive, None));
-        }
-        if let Some(out) = last {
-            graph.set_output(out);
-        } else {
-            self.set_error_once(Error::UnsupportedFilter);
-            return None;
-        }
-        Some(VelloFilter {
-            graph: Arc::new(graph),
-        })
-    }
-
     fn draw_glyph_run(
         &mut self,
         glyph_run: GlyphRunRef<'_>,
@@ -409,16 +360,32 @@ impl VelloCpuRenderer {
             return;
         };
         self.ctx.set_transform(glyph_run.transform);
+        self.ctx
+            .set_paint_transform(glyph_run.brush_transform.unwrap_or(Affine::IDENTITY));
         self.ctx.set_paint(paint);
         self.ctx.set_blend_mode(glyph_run.composite.blend);
+        // TODO: Revisit this allocation. `PaintSink` currently gives us a
+        // one-shot iterator, while glifo's glyph builders need a cloneable
+        // glyph source.
+        let glyphs = glyphs
+            .map(|glyph| VelloGlyph {
+                id: glyph.id,
+                x: glyph.x,
+                y: glyph.y,
+            })
+            .collect::<Vec<_>>();
 
-        match glyph_run.style {
+        let result = match glyph_run.style {
             Style::Fill(fill_rule) => {
                 self.ctx.set_fill_rule(*fill_rule);
                 let builder = self
                     .ctx
-                    .glyph_run(glyph_run.font)
+                    .glyph_run(&mut self.resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
+                    .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(
+                        glyph_run.font_embolden.x,
+                        glyph_run.font_embolden.y,
+                    )))
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
@@ -426,19 +393,18 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                let glyphs = glyphs.map(|glyph| VelloGlyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
-                builder.fill_glyphs(glyphs);
+                builder.fill_glyphs(glyphs.into_iter())
             }
             Style::Stroke(stroke) => {
                 self.ctx.set_stroke(stroke.clone());
                 let builder = self
                     .ctx
-                    .glyph_run(glyph_run.font)
+                    .glyph_run(&mut self.resources, glyph_run.font)
                     .font_size(glyph_run.font_size)
+                    .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(
+                        glyph_run.font_embolden.x,
+                        glyph_run.font_embolden.y,
+                    )))
                     .hint(glyph_run.hint)
                     .normalized_coords(glyph_run.normalized_coords);
                 let builder = if let Some(transform) = glyph_run.glyph_transform {
@@ -446,13 +412,11 @@ impl VelloCpuRenderer {
                 } else {
                     builder
                 };
-                let glyphs = glyphs.map(|glyph| VelloGlyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
-                builder.stroke_glyphs(glyphs);
+                builder.stroke_glyphs(glyphs.into_iter())
             }
+        };
+        if result.is_err() {
+            self.set_error_once(Error::Internal("glyph rendering failed"));
         }
     }
 
@@ -489,14 +453,14 @@ impl VelloCpuRenderer {
             self.set_error_once(Error::Internal("unbalanced clip stack in mask scene"));
             return None;
         }
-        if renderer.group_depth != 0 {
+        if !renderer.group_layers.is_empty() {
             self.set_error_once(Error::Internal("unbalanced group stack in mask scene"));
             return None;
         }
 
         let mut pixmap = Pixmap::new(self.width, self.height);
         renderer.ctx.flush();
-        renderer.ctx.render_to_pixmap(&mut pixmap);
+        renderer.ctx.render(&mut pixmap, &mut renderer.resources);
         let mask = match mode {
             MaskMode::Alpha => vello_cpu::Mask::new_alpha(&pixmap),
             MaskMode::Luminance => vello_cpu::Mask::new_luminance(&pixmap),
@@ -571,8 +535,8 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         Error::InvalidScene(error) => {
             ImageRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        Error::UnsupportedExternalImage => {
+            ImageRendererError::Unsupported(RenderUnsupportedError::ExternalImage)
         }
         Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
         Error::Internal("image target dimensions do not match renderer output") => {
@@ -605,7 +569,8 @@ fn f64_to_f32(v: f64) -> f32 {
 }
 
 fn unpremultiply_rgba8_in_place(bytes: &mut [u8]) {
-    for rgba in bytes.chunks_exact_mut(4) {
+    let (pixels, _) = bytes.as_chunks_mut::<4>();
+    for rgba in pixels {
         let alpha = rgba[3];
         if alpha == 0 || alpha == u8::MAX {
             continue;
@@ -628,6 +593,63 @@ fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     u8::try_from(value.min(u32::from(u8::MAX))).expect("unpremultiplied channel must fit in u8")
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "native filter parameters use f32"
+)]
+fn filter_to_vello(filter: Filter) -> Result<VelloFilter, Error> {
+    let primitive = match filter {
+        Filter::Flood { color } => FilterPrimitive::Flood { color },
+        Filter::Blur {
+            std_deviation_x,
+            std_deviation_y,
+        } => {
+            let (sigma_x, sigma_y) = (std_deviation_x as f32, std_deviation_y as f32);
+            // Native blur planning computes its variance in f32.
+            if !(sigma_x * sigma_x).is_finite() || !(sigma_y * sigma_y).is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::GaussianBlur {
+                std_deviation_x: sigma_x,
+                std_deviation_y: sigma_y,
+                edge_mode: EdgeMode::None,
+            }
+        }
+        Filter::DropShadow {
+            dx,
+            dy,
+            std_deviation_x,
+            std_deviation_y,
+            color,
+        } => {
+            let (sigma_x, sigma_y) = (std_deviation_x as f32, std_deviation_y as f32);
+            // Native blur planning computes its variance in f32.
+            if sigma_x != sigma_y || !(sigma_x * sigma_x).is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            let (dx, dy) = (dx as f32, dy as f32);
+            if !dx.is_finite() || !dy.is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::DropShadow {
+                dx,
+                dy,
+                std_deviation: sigma_x,
+                color,
+                edge_mode: EdgeMode::None,
+            }
+        }
+        Filter::Offset { dx, dy } => {
+            let (dx, dy) = (dx as f32, dy as f32);
+            if !dx.is_finite() || !dy.is_finite() {
+                return Err(Error::UnsupportedFilter);
+            }
+            FilterPrimitive::Offset { dx, dy }
+        }
+    };
+    Ok(VelloFilter::from_primitive(primitive))
+}
+
 impl PaintSink for VelloCpuRenderer {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         if self.error.is_some() {
@@ -648,7 +670,7 @@ impl PaintSink for VelloCpuRenderer {
             self.set_error_once(Error::Internal("pop_clip underflow"));
             return;
         }
-        self.ctx.pop_clip_path();
+        self.ctx.pop_clip();
         self.clip_depth -= 1;
     }
 
@@ -656,6 +678,24 @@ impl PaintSink for VelloCpuRenderer {
         if self.error.is_some() {
             return;
         }
+        let filters = match group
+            .filters
+            .iter()
+            .copied()
+            .map(|filter| {
+                filter
+                    .in_device_space(group.filter_transform)
+                    .ok_or(Error::UnsupportedFilter)
+                    .and_then(filter_to_vello)
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(filters) => filters,
+            Err(error) => {
+                self.set_error_once(error);
+                return;
+            }
+        };
         let (clip_path, clip_transform) = match group.clip {
             None => (None, Affine::IDENTITY),
             Some(clip) => {
@@ -672,22 +712,43 @@ impl PaintSink for VelloCpuRenderer {
         let mask = group
             .mask
             .and_then(|mask| self.render_mask(mask.mask.scene, mask.mask.mode, mask.transform));
-        let filter = self.filters_to_vello(group.filters);
         self.ctx
-            .push_layer(clip_path.as_ref(), blend, opacity, mask, filter);
-        self.group_depth += 1;
+            .push_layer(clip_path.as_ref(), blend, opacity, mask, None);
+        self.ctx.set_transform(Affine::IDENTITY);
+        let filter_layers = filters.len();
+        // Each native filter supports one primitive. Nest in reverse so the first filter runs first.
+        for filter in filters.into_iter().rev() {
+            let flood = matches!(filter.graph.primitives[0], FilterPrimitive::Flood { .. });
+            self.ctx.push_filter_layer(filter);
+            if flood {
+                // Flood has no source dependency. Seed full-surface bounds even for empty content.
+                self.ctx.set_fill_rule(Fill::NonZero);
+                self.ctx.set_blend_mode(BlendMode::default());
+                self.ctx.set_paint_transform(Affine::IDENTITY);
+                self.ctx.set_paint(Brush::Solid(peniko::Color::WHITE));
+                self.ctx.fill_rect(&kurbo::Rect::new(
+                    0.0,
+                    0.0,
+                    f64::from(self.width),
+                    f64::from(self.height),
+                ));
+            }
+        }
+        self.group_layers.push(filter_layers);
     }
 
     fn pop_group(&mut self) {
         if self.error.is_some() {
             return;
         }
-        if self.group_depth == 0 {
+        let Some(filter_layers) = self.group_layers.pop() else {
             self.set_error_once(Error::Internal("pop_group underflow"));
             return;
+        };
+        for _ in 0..filter_layers {
+            self.ctx.pop_layer();
         }
         self.ctx.pop_layer();
-        self.group_depth -= 1;
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -706,16 +767,7 @@ impl PaintSink for VelloCpuRenderer {
         self.ctx.set_paint(paint);
 
         match draw.shape {
-            GeometryRef::Rect(r) => {
-                if self.rect_fits_viewport_fast_path(&r, draw.transform) {
-                    self.ctx.fill_rect(&r);
-                } else {
-                    // Work around a vello_cpu 0.0.7 rect fast-path panic for strips that land
-                    // outside the viewport. Fall back to path filling until the upstream fix lands.
-                    let path = r.to_path(self.tolerance);
-                    self.ctx.fill_path(&path);
-                }
-            }
+            GeometryRef::Rect(r) => self.ctx.fill_rect(&r),
             GeometryRef::RoundedRect(rr) => {
                 let path = rr.to_path(self.tolerance);
                 self.ctx.fill_path(&path);
@@ -773,6 +825,7 @@ impl PaintSink for VelloCpuRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
     use imaging::{
         Painter,
         render::{ImageBufferTarget, ImageTargetError},
@@ -892,6 +945,31 @@ mod tests {
     }
 
     #[test]
+    fn render_reports_unrenderable_glyphs() {
+        let font = peniko::FontData::new(
+            peniko::Blob::new(Arc::new(include_bytes!(
+                "../../test_assets/fonts/NotoSans-Regular.ttf"
+            ))),
+            0,
+        );
+        let mut renderer = VelloCpuRenderer::new(32, 32);
+        Painter::new(&mut renderer)
+            .glyphs(&font, Color::BLACK)
+            .draw(
+                &Style::Fill(Fill::NonZero),
+                [imaging::record::Glyph {
+                    id: u32::MAX,
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            );
+        assert!(matches!(
+            renderer.finish(),
+            Err(Error::Internal("glyph rendering failed"))
+        ));
+    }
+
+    #[test]
     fn render_source_renders_image() {
         let mut renderer = VelloCpuRenderer::new(48, 48);
         let mut scene = Scene::new();
@@ -981,5 +1059,70 @@ mod tests {
             error,
             ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
         ));
+    }
+    #[test]
+    fn one_axis_gaussian_blur_renders_in_device_space() {
+        let mut renderer = VelloCpuRenderer::new(64, 64);
+        for (filter_transform, blurred, sharp) in [
+            (Affine::IDENTITY, (21, 32), (32, 21)),
+            (
+                Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+                (32, 21),
+                (21, 32),
+            ),
+        ] {
+            let mut scene = Scene::new();
+            Painter::new(&mut scene).with_group(
+                GroupRef::new()
+                    .with_filters(&[Filter::blur_xy(4.0, 0.0)])
+                    .with_filter_transform(filter_transform),
+                |p| p.fill_rect(Rect::new(24.0, 24.0, 40.0, 40.0), Color::WHITE),
+            );
+            let image = renderer.render_scene(&scene, 64, 64).unwrap();
+            let alpha = |(x, y): (usize, usize)| image.data[(y * 64 + x) * 4 + 3];
+            assert!(
+                alpha(blurred) > 0,
+                "the blurred axis must extend past the source"
+            );
+            assert_eq!(alpha(sharp), 0, "the other axis must remain sharp");
+        }
+    }
+
+    #[test]
+    fn unsupported_group_filters_do_not_poison_the_next_frame() {
+        let mut renderer = VelloCpuRenderer::new(32, 32);
+        for (filter, filter_transform) in [
+            (Filter::blur(1.0), Affine::skew(0.5, 0.0)),
+            (Filter::blur_xy(1.0, f64::from(f32::MAX)), Affine::IDENTITY),
+            (
+                Filter::DropShadow {
+                    dx: 0.0,
+                    dy: 0.0,
+                    std_deviation_x: 2.0,
+                    std_deviation_y: 1.0,
+                    color: Color::BLACK,
+                },
+                Affine::IDENTITY,
+            ),
+            (Filter::offset(f64::from(f32::MAX), 0.0), Affine::scale(2.0)),
+        ] {
+            let mut scene = Scene::new();
+            scene.push_group(imaging::record::Group {
+                filters: vec![Filter::blur(1.0), filter],
+                filter_transform,
+                ..Default::default()
+            });
+            Painter::new(&mut scene).fill_rect(Rect::new(8.0, 8.0, 24.0, 24.0), Color::WHITE);
+            scene.pop_group();
+            scene.validate().unwrap();
+            assert!(matches!(
+                renderer.render_scene(&scene, 32, 32),
+                Err(Error::UnsupportedFilter)
+            ));
+        }
+        assert!(
+            renderer.render_scene(&Scene::new(), 32, 32).is_ok(),
+            "renderer must recover on the next frame"
+        );
     }
 }

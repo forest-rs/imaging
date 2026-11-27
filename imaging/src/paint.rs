@@ -7,8 +7,10 @@
 //! first constructing owned recording payloads. [`crate::record::Scene`] remains the owned
 //! semantic recording format.
 
+use crate::BrushRef;
+use alloc::string::{String, ToString};
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
-use peniko::{BrushRef, Fill, Style};
+use peniko::{Fill, Style};
 
 use crate::{
     BlurredRoundedRect, Composite, Filter, MaskMode, NormalizedCoord,
@@ -229,14 +231,22 @@ impl<'a> ClipRef<'a> {
 }
 
 /// Borrowed isolated group payload.
+///
+/// The group renders its content in isolation, applies filters in slice order, then applies
+/// the mask and isolated clip. Group opacity and blending apply once to that result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupRef<'a> {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<ClipRef<'a>>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMaskRef<'a>>,
-    /// Optional filter chain applied to the group result before compositing.
+    /// Filter chain applied in slice order before the mask, isolated clip, and compositing.
     pub filters: &'a [Filter],
+    /// Maps filter user-space coordinates to the destination coordinate system.
+    ///
+    /// This transforms filter offsets and blur kernels, independently of content, clips, and masks.
+    /// Defaults to identity. Transformed replay prefixes this transform along with the content.
+    pub filter_transform: Affine,
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,
 }
@@ -249,6 +259,7 @@ impl<'a> GroupRef<'a> {
             clip: None,
             mask: None,
             filters: &[],
+            filter_transform: Affine::IDENTITY,
             composite: Composite::default(),
         }
     }
@@ -285,6 +296,13 @@ impl<'a> GroupRef<'a> {
         self
     }
 
+    /// Set the transform from filter user space to destination coordinates.
+    #[must_use]
+    pub fn with_filter_transform(mut self, transform: Affine) -> Self {
+        self.filter_transform = transform;
+        self
+    }
+
     /// Set the compositing parameters used when merging the group into its parent.
     #[must_use]
     pub fn with_composite(mut self, composite: Composite) -> Self {
@@ -300,6 +318,7 @@ impl<'a> GroupRef<'a> {
             clip: self.clip.map(ClipRef::to_owned),
             mask: self.mask.map(|mask| mask.into_owned_with(define_mask)),
             filters: self.filters.to_vec(),
+            filter_transform: self.filter_transform,
             composite: self.composite,
         }
     }
@@ -309,6 +328,7 @@ impl<'a> GroupRef<'a> {
         Self {
             clip: self.clip.map(|clip| clip.prepend_transform(prefix)),
             mask: self.mask.map(|mask| mask.prepend_transform(prefix)),
+            filter_transform: prefix * self.filter_transform,
             ..self
         }
     }
@@ -570,9 +590,16 @@ pub struct GlyphRunRef<'a> {
     pub transform: Affine,
     /// Optional per-glyph transform applied before the glyph offset translation.
     pub glyph_transform: Option<Affine>,
+    /// Optional brush-space transform applied after the global run transform.
+    ///
+    /// This affects transformed brushes such as gradients and images; solid colors ignore it.
+    pub brush_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
-    /// Synthetic embolden amount applied to glyph outlines in X/Y device units.
+    /// Outward expansion of glyph outlines along each glyph-local axis, in font-size pixels.
+    ///
+    /// Components must be finite and nonnegative. Expansion precedes the glyph and run
+    /// transforms; zero leaves that axis unchanged. Bitmap and color glyphs are unaffected.
     pub font_embolden: Vec2,
     /// Whether glyph hinting is enabled.
     pub hint: bool,
@@ -592,6 +619,7 @@ impl<'a> GlyphRunRef<'a> {
     /// Defaults:
     /// - run transform: [`Affine::IDENTITY`]
     /// - per-glyph transform: `None`
+    /// - brush transform: `None`
     /// - font size: `16.0`
     /// - hinting: `false`
     /// - normalized variation coordinates: `&[]`
@@ -606,6 +634,7 @@ impl<'a> GlyphRunRef<'a> {
             font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
+            brush_transform: None,
             font_size: 16.0,
             font_embolden: Vec2::ZERO,
             hint: false,
@@ -616,6 +645,13 @@ impl<'a> GlyphRunRef<'a> {
         }
     }
 
+    /// Set the optional brush-space transform.
+    #[must_use]
+    pub fn brush_transform(mut self, brush_transform: Option<Affine>) -> Self {
+        self.brush_transform = brush_transform;
+        self
+    }
+
     /// Convert a borrowed glyph run into an owned [`GlyphRun`].
     #[must_use]
     pub fn to_owned(self, glyphs: impl IntoIterator<Item = Glyph>) -> GlyphRun {
@@ -623,6 +659,7 @@ impl<'a> GlyphRunRef<'a> {
             font: self.font.clone(),
             transform: self.transform,
             glyph_transform: self.glyph_transform,
+            brush_transform: self.brush_transform,
             font_size: self.font_size,
             font_embolden: self.font_embolden,
             hint: self.hint,
@@ -675,11 +712,43 @@ impl<'a> SourceLocationRef<'a> {
     }
 }
 
+/// Borrowed semantic kind for a context annotation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContextKindRef<'a> {
+    /// Human-oriented freeform label.
+    Label,
+    /// Numeric widget identifier.
+    Widget,
+    /// Child index within a parent/container.
+    ChildIndex,
+    /// Named slot.
+    Slot,
+    /// User-defined named context kind.
+    Named(&'a str),
+}
+
+/// Borrowed structured value for a context annotation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContextValueRef<'a> {
+    /// String payload.
+    Str(&'a str),
+    /// Unsigned 64-bit payload.
+    U64(u64),
+    /// Signed 64-bit payload.
+    I64(i64),
+    /// Machine-word-sized unsigned payload.
+    Usize(usize),
+    /// Boolean payload.
+    Bool(bool),
+}
+
 /// Borrowed context annotation emitted through [`PaintSink`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ContextRef<'a> {
-    /// Human-readable label for the current scope.
-    pub label: &'a str,
+    /// Semantic kind of this context entry.
+    pub kind: ContextKindRef<'a>,
+    /// Structured value of this context entry.
+    pub value: ContextValueRef<'a>,
     /// Optional source location associated with the scope.
     pub source: Option<SourceLocationRef<'a>>,
 }
@@ -687,8 +756,151 @@ pub struct ContextRef<'a> {
 impl<'a> ContextRef<'a> {
     /// Create a context annotation with an optional source location.
     #[must_use]
-    pub const fn new(label: &'a str, source: Option<SourceLocationRef<'a>>) -> Self {
-        Self { label, source }
+    pub const fn new(
+        kind: ContextKindRef<'a>,
+        value: ContextValueRef<'a>,
+        source: Option<SourceLocationRef<'a>>,
+    ) -> Self {
+        Self {
+            kind,
+            value,
+            source,
+        }
+    }
+
+    /// Create a freeform label context entry.
+    #[must_use]
+    pub const fn label(label: &'a str, source: Option<SourceLocationRef<'a>>) -> Self {
+        Self::new(ContextKindRef::Label, ContextValueRef::Str(label), source)
+    }
+
+    /// Create a widget-ID context entry.
+    #[must_use]
+    pub const fn widget(id: u64, source: Option<SourceLocationRef<'a>>) -> Self {
+        Self::new(ContextKindRef::Widget, ContextValueRef::U64(id), source)
+    }
+
+    /// Create a child-index context entry.
+    #[must_use]
+    pub const fn child_index(index: usize, source: Option<SourceLocationRef<'a>>) -> Self {
+        Self::new(
+            ContextKindRef::ChildIndex,
+            ContextValueRef::Usize(index),
+            source,
+        )
+    }
+
+    /// Create a slot-name context entry.
+    #[must_use]
+    pub const fn slot(name: &'a str, source: Option<SourceLocationRef<'a>>) -> Self {
+        Self::new(ContextKindRef::Slot, ContextValueRef::Str(name), source)
+    }
+
+    /// Create a user-defined string-valued context entry.
+    #[must_use]
+    pub const fn named_str(
+        kind: &'a str,
+        value: &'a str,
+        source: Option<SourceLocationRef<'a>>,
+    ) -> Self {
+        Self::new(
+            ContextKindRef::Named(kind),
+            ContextValueRef::Str(value),
+            source,
+        )
+    }
+
+    /// Create a user-defined `u64`-valued context entry.
+    #[must_use]
+    pub const fn named_u64(
+        kind: &'a str,
+        value: u64,
+        source: Option<SourceLocationRef<'a>>,
+    ) -> Self {
+        Self::new(
+            ContextKindRef::Named(kind),
+            ContextValueRef::U64(value),
+            source,
+        )
+    }
+
+    /// Create a user-defined `i64`-valued context entry.
+    #[must_use]
+    pub const fn named_i64(
+        kind: &'a str,
+        value: i64,
+        source: Option<SourceLocationRef<'a>>,
+    ) -> Self {
+        Self::new(
+            ContextKindRef::Named(kind),
+            ContextValueRef::I64(value),
+            source,
+        )
+    }
+
+    /// Create a user-defined `usize`-valued context entry.
+    #[must_use]
+    pub const fn named_usize(
+        kind: &'a str,
+        value: usize,
+        source: Option<SourceLocationRef<'a>>,
+    ) -> Self {
+        Self::new(
+            ContextKindRef::Named(kind),
+            ContextValueRef::Usize(value),
+            source,
+        )
+    }
+
+    /// Create a user-defined boolean context entry.
+    #[must_use]
+    pub const fn named_bool(
+        kind: &'a str,
+        value: bool,
+        source: Option<SourceLocationRef<'a>>,
+    ) -> Self {
+        Self::new(
+            ContextKindRef::Named(kind),
+            ContextValueRef::Bool(value),
+            source,
+        )
+    }
+
+    /// Format this context annotation for human-facing diagnostics.
+    #[must_use]
+    pub fn format(self) -> String {
+        let value = match self.value {
+            ContextValueRef::Str(value) => value.into(),
+            ContextValueRef::U64(value) => value.to_string(),
+            ContextValueRef::I64(value) => value.to_string(),
+            ContextValueRef::Usize(value) => value.to_string(),
+            ContextValueRef::Bool(value) => value.to_string(),
+        };
+
+        match self.kind {
+            ContextKindRef::Label => value,
+            ContextKindRef::Widget => {
+                let mut text = String::from("widget=");
+                text.push_str(&value);
+                text
+            }
+            ContextKindRef::ChildIndex => {
+                let mut text = String::from("child_index=");
+                text.push_str(&value);
+                text
+            }
+            ContextKindRef::Slot => {
+                let mut text = String::from("slot=");
+                text.push_str(&value);
+                text
+            }
+            ContextKindRef::Named(kind) => {
+                let mut text = String::from(kind);
+                text.push('=');
+                text.push_str(&value);
+                text
+            }
+        }
     }
 }
 
@@ -786,6 +998,7 @@ impl Group {
                 .as_ref()
                 .map(|mask| mask.as_ref(scene.mask(mask.mask))),
             filters: &self.filters,
+            filter_transform: self.filter_transform,
             composite: self.composite,
         }
     }
@@ -821,6 +1034,7 @@ impl GlyphRun {
             font: &self.font,
             transform: self.transform,
             glyph_transform: self.glyph_transform,
+            brush_transform: self.brush_transform,
             font_size: self.font_size,
             font_embolden: self.font_embolden,
             hint: self.hint,
@@ -996,8 +1210,34 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+    use crate::Brush;
     use crate::{Composite, record::Geometry};
-    use peniko::{Brush, FontData};
+    use peniko::FontData;
+
+    #[test]
+    fn context_ref_format_covers_builtin_and_named_values() {
+        assert_eq!(ContextRef::label("toolbar", None).format(), "toolbar");
+        assert_eq!(ContextRef::widget(42, None).format(), "widget=42");
+        assert_eq!(ContextRef::child_index(7, None).format(), "child_index=7");
+        assert_eq!(ContextRef::slot("leading", None).format(), "slot=leading");
+        assert_eq!(
+            ContextRef::named_str("row", "header", None).format(),
+            "row=header"
+        );
+        assert_eq!(ContextRef::named_u64("id", 99, None).format(), "id=99");
+        assert_eq!(
+            ContextRef::named_i64("offset", -4, None).format(),
+            "offset=-4"
+        );
+        assert_eq!(
+            ContextRef::named_usize("index", 3, None).format(),
+            "index=3"
+        );
+        assert_eq!(
+            ContextRef::named_bool("selected", true, None).format(),
+            "selected=true"
+        );
+    }
 
     #[test]
     fn clip_ref_prepend_transform_prefixes_clip_transform() {
@@ -1032,6 +1272,7 @@ mod tests {
                 }),
                 mask: None,
                 filters: &[],
+                filter_transform: Affine::translate((5.0, 6.0)),
                 composite: Composite::default(),
             }
         );
@@ -1053,12 +1294,9 @@ mod tests {
 
     #[test]
     fn fill_ref_prepend_transform_prefixes_draw_transform_only() {
-        let draw = FillRef::new(
-            Rect::new(0.0, 0.0, 3.0, 4.0),
-            Brush::Solid(peniko::Color::WHITE),
-        )
-        .transform(Affine::translate((1.0, 2.0)))
-        .brush_transform(Some(Affine::translate((3.0, 4.0))));
+        let draw = FillRef::new(Rect::new(0.0, 0.0, 3.0, 4.0), peniko::Color::WHITE)
+            .transform(Affine::translate((1.0, 2.0)))
+            .brush_transform(Some(Affine::translate((3.0, 4.0))));
 
         assert_eq!(
             draw.prepend_transform(Affine::translate((5.0, 6.0))),
@@ -1075,10 +1313,7 @@ mod tests {
 
     #[test]
     fn fill_ref_prepend_transform_preserves_missing_brush_transform() {
-        let draw = FillRef::new(
-            Rect::new(0.0, 0.0, 3.0, 4.0),
-            Brush::Solid(peniko::Color::WHITE),
-        );
+        let draw = FillRef::new(Rect::new(0.0, 0.0, 3.0, 4.0), peniko::Color::WHITE);
 
         assert_eq!(
             draw.prepend_transform(Affine::translate((5.0, 6.0)))
@@ -1091,10 +1326,11 @@ mod tests {
     fn glyph_run_ref_prepend_transform_only_prefixes_run_transform() {
         let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
         let style = Style::Fill(Fill::NonZero);
-        let draw = GlyphRunRef::new(&font, &style, Brush::Solid(peniko::Color::BLACK));
+        let draw = GlyphRunRef::new(&font, &style, peniko::Color::BLACK);
         let draw = GlyphRunRef {
             transform: Affine::translate((1.0, 2.0)),
             glyph_transform: Some(Affine::translate((3.0, 4.0))),
+            brush_transform: Some(Affine::translate((7.0, 8.0))),
             font_size: 12.0,
             font_embolden: Vec2::new(0.5, 1.5),
             ..draw
@@ -1105,6 +1341,10 @@ mod tests {
         assert_eq!(
             transformed.glyph_transform,
             Some(Affine::translate((3.0, 4.0)))
+        );
+        assert_eq!(
+            transformed.brush_transform,
+            Some(Affine::translate((7.0, 8.0)))
         );
     }
 
@@ -1123,7 +1363,8 @@ mod tests {
                 stroke: Stroke::new(2.0),
             }),
             mask: None,
-            filters: vec![],
+            filters: vec![Filter::offset(2.0, 3.0)],
+            filter_transform: Affine::scale(2.0),
             composite: Composite::default(),
         });
         let fill_id = source.draw(Draw::Fill {
@@ -1147,6 +1388,7 @@ mod tests {
             font,
             transform: Affine::translate((19.0, 20.0)),
             glyph_transform: Some(Affine::translate((21.0, 22.0))),
+            brush_transform: Some(Affine::translate((11.0, 12.0))),
             font_size: 12.0,
             font_embolden: Vec2::new(1.0, 2.0),
             hint: false,
@@ -1193,7 +1435,8 @@ mod tests {
                     stroke: Stroke::new(2.0),
                 }),
                 mask: None,
-                filters: vec![],
+                filters: vec![Filter::offset(2.0, 3.0)],
+                filter_transform: transform * Affine::scale(2.0),
                 composite: Composite::default(),
             }
         );
@@ -1228,6 +1471,10 @@ mod tests {
                 assert_eq!(
                     glyph_run.glyph_transform,
                     Some(Affine::translate((21.0, 22.0)))
+                );
+                assert_eq!(
+                    glyph_run.brush_transform,
+                    Some(Affine::translate((11.0, 12.0)))
                 );
                 assert_eq!(glyph_run.brush, Brush::Solid(peniko::Color::BLACK));
             }

@@ -1,28 +1,34 @@
 [package]
 name = "imaging_vello_hybrid"
-version.workspace = true
+version = "0.0.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Vello hybrid (CPU/GPU via wgpu) backend for the imaging command stream."
 readme = "README.md"
-publish = false
+keywords = ["gpu", "graphics", "imaging", "rendering", "vello"]
+categories = ["graphics", "rendering"]
 
 [dependencies]
+glifo.workspace = true
 imaging = { features = ["std"], workspace = true }
-imaging_wgpu = { default-features = false, features = ["wgpu-28"], workspace = true }
+imaging_wgpu = { default-features = false, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
-vello_common = { default-features = true, version = "0.0.7" }
-vello_hybrid = { default-features = true, version = "0.0.7" }
-wgpu = { default-features = false, features = [
+vello_common = { default-features = true, workspace = true }
+vello_gpu.workspace = true
+wgpu = { features = [
     "std",
     "wgsl",
-], version = "28.0.0" }
+], workspace = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 pollster = "0.4.0"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = []

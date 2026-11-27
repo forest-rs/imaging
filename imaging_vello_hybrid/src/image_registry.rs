@@ -2,16 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::Error;
-use peniko::{ImageBrush, ImageData};
+use peniko::ImageData;
 use std::collections::VecDeque;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use vello_common::paint::{Image as VelloImage, ImageId, ImageSource};
+use std::sync::Arc;
+use vello_common::paint::ImageSource;
+use vello_common::pixmap::Pixmap;
+
+#[derive(Debug)]
+pub(crate) struct ImageTexture {
+    pub(crate) view: wgpu::TextureView,
+    pub(crate) may_have_transparency: bool,
+}
 
 #[derive(Debug)]
 pub(crate) struct HybridImageRegistry {
     live: VecDeque<RegisteredImage>,
-    bytes_used: usize,
-    max_bytes: usize,
+    bytes_used: u64,
+    max_bytes: u64,
 }
 
 impl Default for HybridImageRegistry {
@@ -21,7 +28,7 @@ impl Default for HybridImageRegistry {
 }
 
 impl HybridImageRegistry {
-    pub(crate) fn new(max_bytes: usize) -> Self {
+    pub(crate) fn new(max_bytes: u64) -> Self {
         Self {
             live: VecDeque::new(),
             bytes_used: 0,
@@ -31,154 +38,131 @@ impl HybridImageRegistry {
 
     pub(crate) fn begin_upload_session<'a>(
         &'a mut self,
-        renderer: &'a mut vello_hybrid::Renderer,
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
-        mut encoder: wgpu::CommandEncoder,
     ) -> HybridImageUploadSession<'a> {
-        // We evict excess images at the start of the session,
-        // as opposed to keeping a strict limit during resolving.
-        // This is because our current goal is to avoid the AtlasLimitReached crash,
-        // and the exact memory usage isn't as important. While doing it at resolve time
-        // can lead to situations where we evict something from the same session,
-        // which would mean dangling image references in draw calls.
-        self.evict_to_budget(renderer, device, queue, &mut encoder);
-
+        // Retained scenes pin their textures even when the cache exceeds its budget.
+        self.evict_unused(self.max_bytes);
         HybridImageUploadSession {
             registry: self,
-            renderer,
             device,
             queue,
-            encoder: Some(encoder),
             pending: Vec::new(),
         }
     }
 
-    /// Returns the new index of the touched entry.
-    fn touch(&mut self, index: usize) -> usize {
-        if index + 1 == self.live.len() {
-            return index;
-        }
-        if let Some(image) = self.live.remove(index) {
-            self.live.push_back(image);
-            return self.live.len() - 1;
-        }
-        index
+    fn evict_unused(&mut self, target_bytes: u64) {
+        self.live.retain(|image| {
+            if self.bytes_used > target_bytes && Arc::strong_count(&image.texture) == 1 {
+                self.bytes_used -= image.bytes;
+                false
+            } else {
+                true
+            }
+        });
     }
 
-    fn evict_to_budget(
-        &mut self,
-        renderer: &mut vello_hybrid::Renderer,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-    ) {
-        while self.bytes_used > self.max_bytes {
-            let Some(oldest) = self.live.pop_front() else {
-                break;
-            };
-            self.bytes_used = self.bytes_used.saturating_sub(oldest.bytes);
-            renderer.destroy_image(device, queue, encoder, oldest.id);
-        }
-    }
-
-    pub(crate) fn clear(
-        &mut self,
-        renderer: &mut vello_hybrid::Renderer,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-    ) {
-        for image in self.live.drain(..) {
-            renderer.destroy_image(device, queue, encoder, image.id);
-        }
-        self.bytes_used = 0;
+    pub(crate) fn clear(&mut self) {
+        self.evict_unused(0);
     }
 }
 
 pub(crate) struct HybridImageUploadSession<'a> {
     registry: &'a mut HybridImageRegistry,
-    renderer: &'a mut vello_hybrid::Renderer,
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
-    encoder: Option<wgpu::CommandEncoder>,
-    pending: Vec<RegisteredImage>,
+    pending: Vec<(RegisteredImage, Arc<Pixmap>)>,
 }
 
 impl HybridImageUploadSession<'_> {
-    pub(crate) fn resolve_image_brush(&mut self, brush: &ImageBrush) -> Result<VelloImage, Error> {
-        let key = ImageKey::derive(&brush.image);
-        let image = if let Some(image) = self.pending.iter().find(|ri| ri.key == key).copied() {
-            image
-        } else if let Some(index) = self.registry.live.iter().position(|ri| ri.key == key) {
-            let index = self.registry.touch(index);
-            self.registry.live.get(index).copied().unwrap()
-        } else {
-            let image_source = ImageSource::from_peniko_image_data(&brush.image);
-            let ImageSource::Pixmap(pixmap) = image_source else {
-                return Err(Error::Internal(
-                    "peniko image conversion did not produce a pixmap",
-                ));
-            };
-            let id = self.renderer.upload_image(
-                self.device,
-                self.queue,
-                self.encoder
-                    .as_mut()
-                    .expect("hybrid image upload session should own an encoder"),
-                &pixmap,
-            );
-            let image = RegisteredImage {
-                key,
-                id,
-                may_have_opacities: pixmap.may_have_opacities(),
-                bytes: brush
-                    .image
-                    .format
-                    .size_in_bytes(brush.image.width, brush.image.height)
-                    .unwrap_or_else(|| brush.image.data.data().len()),
-            };
-            self.pending.push(image);
-            image
-        };
+    pub(crate) fn resolve_image(&mut self, data: &ImageData) -> Result<Arc<ImageTexture>, Error> {
+        let key = ImageKey::derive(data);
+        if let Some((image, _)) = self.pending.iter().find(|(image, _)| image.key == key) {
+            return Ok(Arc::clone(&image.texture));
+        }
+        if let Some(index) = self.registry.live.iter().position(|image| image.key == key) {
+            let image = self.registry.live.remove(index).unwrap();
+            let texture = Arc::clone(&image.texture);
+            self.registry.live.push_back(image);
+            return Ok(texture);
+        }
 
-        Ok(VelloImage {
-            image: ImageSource::opaque_id_with_opacity_hint(image.id, image.may_have_opacities),
-            sampler: brush.sampler,
-        })
+        let limit = self
+            .device
+            .limits()
+            .max_texture_dimension_2d
+            .min(u32::from(u16::MAX));
+        if data.width == 0 || data.height == 0 || data.width > limit || data.height > limit {
+            return Err(Error::UnsupportedImageBrush);
+        }
+        if !matches!(
+            data.format,
+            peniko::ImageFormat::Rgba8 | peniko::ImageFormat::Bgra8
+        ) || data.format.size_in_bytes(data.width, data.height) != Some(data.data.len())
+        {
+            return Err(Error::UnsupportedImageBrush);
+        }
+        let ImageSource::Pixmap(pixmap) = ImageSource::from_peniko_image_data(data) else {
+            unreachable!("peniko image conversion always produces a pixmap");
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_vello_hybrid inline image"),
+            size: wgpu::Extent3d {
+                width: data.width,
+                height: data.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let texture = Arc::new(ImageTexture {
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            may_have_transparency: pixmap.may_have_transparency(),
+        });
+        self.pending.push((
+            RegisteredImage {
+                key,
+                texture: Arc::clone(&texture),
+                bytes: u64::from(data.width) * u64::from(data.height) * 4,
+            },
+            pixmap,
+        ));
+        Ok(texture)
     }
 
-    pub(crate) fn finish(&mut self, success: bool) {
-        if success {
-            for image in self.pending.drain(..) {
-                self.registry.live.push_back(image);
-                self.registry.bytes_used = self.registry.bytes_used.saturating_add(image.bytes);
-            }
-        } else {
-            for image in self.pending.drain(..) {
-                self.renderer.destroy_image(
-                    self.device,
-                    self.queue,
-                    self.encoder
-                        .as_mut()
-                        .expect("hybrid image upload session should own an encoder"),
-                    image.id,
-                );
-            }
+    /// Submit uploads and publish cache entries only after recording succeeds.
+    pub(crate) fn finish(self) {
+        if self.pending.is_empty() {
+            return;
         }
-
-        if let Some(encoder) = self.encoder.take() {
-            self.queue.submit([encoder.finish()]);
+        for (image, pixmap) in self.pending {
+            let texture = image.texture.view.texture();
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                pixmap.data_as_u8_slice(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(texture.width() * 4),
+                    rows_per_image: None,
+                },
+                texture.size(),
+            );
+            self.registry.bytes_used += image.bytes;
+            self.registry.live.push_back(image);
         }
+        self.queue.submit([]);
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct RegisteredImage {
     key: ImageKey,
-    id: ImageId,
-    may_have_opacities: bool,
-    bytes: usize,
+    texture: Arc<ImageTexture>,
+    bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -187,32 +171,26 @@ struct ImageKey {
     alpha_type: core::mem::Discriminant<peniko::ImageAlphaType>,
     width: u32,
     height: u32,
-    data_hash: u64,
+    blob_id: u64,
 }
 
 impl ImageKey {
     fn derive(image: &ImageData) -> Self {
-        let mut hasher = DefaultHasher::new();
-        image.data.data().hash(&mut hasher);
         Self {
             format: core::mem::discriminant(&image.format),
             alpha_type: core::mem::discriminant(&image.alpha_type),
             width: image.width,
             height: image.height,
-            data_hash: hasher.finish(),
+            blob_id: image.data.id(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::image_registry::HybridImageRegistry;
-
-    use super::{ImageKey, RegisteredImage};
+    use super::ImageKey;
     use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
-    use std::collections::VecDeque;
     use std::sync::Arc;
-    use vello_common::paint::ImageId;
 
     fn image(bytes: [u8; 16]) -> ImageData {
         ImageData {
@@ -225,10 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn image_key_dedupes_equivalent_image_contents() {
+    fn image_key_reuses_cloned_assets() {
         let a = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
         let b = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
-        assert_eq!(ImageKey::derive(&a), ImageKey::derive(&b));
+        assert_eq!(ImageKey::derive(&a), ImageKey::derive(&a.clone()));
+        assert_ne!(ImageKey::derive(&a), ImageKey::derive(&b));
     }
 
     #[test]
@@ -240,47 +219,5 @@ mod tests {
 
         a.format = ImageFormat::Bgra8;
         assert_ne!(ImageKey::derive(&a), ImageKey::derive(&b));
-    }
-
-    #[test]
-    fn image_touch() {
-        let a = image([1, 2, 3, 4, 9, 8, 7, 6, 5, 4, 3, 2, 10, 11, 12, 13]);
-        let b = image([13, 12, 11, 10, 2, 3, 4, 5, 6, 7, 8, 9, 4, 3, 2, 1]);
-
-        let bytes_used = a.data.len() + b.data.len();
-
-        let a_key = ImageKey::derive(&a);
-        let b_key = ImageKey::derive(&b);
-
-        let a_ri = RegisteredImage {
-            key: a_key,
-            id: ImageId::new(0),
-            may_have_opacities: true,
-            bytes: a.data.len(),
-        };
-        let b_ri = RegisteredImage {
-            key: b_key,
-            id: ImageId::new(1),
-            may_have_opacities: true,
-            bytes: b.data.len(),
-        };
-
-        let mut live = VecDeque::new();
-        live.push_back(a_ri);
-        live.push_back(b_ri);
-
-        let mut registry = HybridImageRegistry {
-            live,
-            max_bytes: 1000 * 1000 * 1000,
-            bytes_used,
-        };
-
-        // Touching the last entry is a no-op
-        assert_eq!(registry.touch(1), 1);
-        assert_eq!(registry.live.get(1).unwrap().id, ImageId::new(1));
-
-        // Touching the first entry moves it to the end
-        assert_eq!(registry.touch(0), 1);
-        assert_eq!(registry.live.get(1).unwrap().id, ImageId::new(0));
     }
 }

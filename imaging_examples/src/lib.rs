@@ -2,3 +2,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Small runnable examples for learning the `imaging` command stream.
+
+#![no_std]

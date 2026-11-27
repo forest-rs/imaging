@@ -149,7 +149,9 @@ pub(crate) fn read_texture_into_target(
         .map_err(|_| ReadbackError::CallbackDropped)?
         .map_err(|_| ReadbackError::BufferMap)?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|_| ReadbackError::BufferMap)?;
     for (row, out_row) in mapped
         .chunks_exact(bytes_per_row as usize)
         .zip(data.chunks_exact_mut(bytes_per_row_out))
@@ -167,7 +169,7 @@ pub(crate) fn unpremultiply_rgba8_in_place(bytes: &mut [u8]) {
         "RGBA8 buffers should have a whole number of pixels"
     );
 
-    for rgba in bytes.chunks_exact_mut(4) {
+    for rgba in bytes.as_chunks_mut::<4>().0 {
         let alpha = rgba[3];
         if alpha == 0 || alpha == 255 {
             continue;
@@ -182,12 +184,17 @@ pub(crate) fn unpremultiply_rgba8_in_place(bytes: &mut [u8]) {
     }
 }
 
-pub(crate) fn unpremultiply_rgba8_target(data: &mut [u8], width: u32, bytes_per_row: usize) {
+pub(crate) fn unpremultiply_rgba8_target(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    bytes_per_row: usize,
+) {
     let width_bytes = usize::try_from(width)
         .expect("image width should fit in usize")
         .checked_mul(4)
         .expect("image row bytes should fit in usize");
-    for row in data.chunks_exact_mut(bytes_per_row) {
+    for row in data.chunks_exact_mut(bytes_per_row).take(height as usize) {
         unpremultiply_rgba8_in_place(&mut row[..width_bytes]);
     }
 }
@@ -236,6 +243,16 @@ pub(crate) fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::{ReadbackError, validate_target_layout};
+
+    #[test]
+    fn unpremultiply_only_changes_rendered_pixels() {
+        let mut target = [16, 32, 64, 128].repeat(6);
+        let mut expected = target.clone();
+        expected[..4].copy_from_slice(&[32, 64, 128, 128]);
+        expected[8..12].copy_from_slice(&[32, 64, 128, 128]);
+        super::unpremultiply_rgba8_target(&mut target, 1, 2, 8);
+        assert_eq!(target, expected, "preserve row padding and unused rows");
+    }
 
     #[test]
     fn validate_target_layout_rejects_short_stride() {

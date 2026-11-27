@@ -24,7 +24,7 @@ use imaging_tiny_skia as _;
 use imaging_vello_hybrid as _;
 
 #[cfg(feature = "vello_hybrid")]
-use vello_hybrid as _;
+use vello_gpu as _;
 
 #[cfg(feature = "vello")]
 use imaging_vello as _;

@@ -8,12 +8,13 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 
+use crate::Brush;
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
-use peniko::{Brush, Fill, FontData, Style};
+use peniko::{Fill, FontData, Style};
 
 use crate::{
-    BlurredRoundedRect, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef, MaskMode,
-    NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef,
+    BlurredRoundedRect, ClipRef, Composite, ContextKindRef, ContextRef, ContextValueRef, FillRef,
+    GlyphRunRef, GroupRef, MaskMode, NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef,
 };
 
 /// A geometry payload stored in a recording.
@@ -90,7 +91,7 @@ pub struct MaskId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DrawId(pub(crate) u32);
 
-/// Identifier for an interned context label stored in a [`Scene`].
+/// Identifier for an interned context string stored in a [`Scene`].
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LabelId(pub(crate) u32);
@@ -116,11 +117,43 @@ pub struct SourceLocation {
     pub column: u32,
 }
 
+/// Semantic kind for a context annotation stored in a [`Scene`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextKind {
+    /// Human-oriented freeform label.
+    Label,
+    /// Numeric widget identifier.
+    Widget,
+    /// Child index within a parent/container.
+    ChildIndex,
+    /// Named slot.
+    Slot,
+    /// User-defined named context kind.
+    Named(LabelId),
+}
+
+/// Structured value for a context annotation stored in a [`Scene`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextValue {
+    /// String payload.
+    Str(LabelId),
+    /// Unsigned 64-bit payload.
+    U64(u64),
+    /// Signed 64-bit payload.
+    I64(i64),
+    /// Machine-word-sized unsigned payload.
+    Usize(usize),
+    /// Boolean payload.
+    Bool(bool),
+}
+
 /// A context annotation stored in a [`Scene`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
-    /// Human-readable label.
-    pub label: LabelId,
+    /// Semantic kind of this context entry.
+    pub kind: ContextKind,
+    /// Structured value of this context entry.
+    pub value: ContextValue,
     /// Optional source location associated with the context.
     pub source: Option<SourceLocation>,
 }
@@ -130,12 +163,39 @@ impl Context {
     #[must_use]
     pub fn as_ref<'a>(&'a self, scene: &'a Scene) -> ContextRef<'a> {
         ContextRef {
-            label: scene.label(self.label),
+            kind: self.kind.as_ref(scene),
+            value: self.value.as_ref(scene),
             source: self.source.as_ref().map(|source| SourceLocationRef {
                 file: scene.file(source.file),
                 line: source.line,
                 column: source.column,
             }),
+        }
+    }
+}
+
+impl ContextKind {
+    #[must_use]
+    fn as_ref<'a>(&'a self, scene: &'a Scene) -> ContextKindRef<'a> {
+        match self {
+            Self::Label => ContextKindRef::Label,
+            Self::Widget => ContextKindRef::Widget,
+            Self::ChildIndex => ContextKindRef::ChildIndex,
+            Self::Slot => ContextKindRef::Slot,
+            Self::Named(name) => ContextKindRef::Named(scene.label(*name)),
+        }
+    }
+}
+
+impl ContextValue {
+    #[must_use]
+    fn as_ref<'a>(&'a self, scene: &'a Scene) -> ContextValueRef<'a> {
+        match self {
+            Self::Str(value) => ContextValueRef::Str(scene.label(*value)),
+            Self::U64(value) => ContextValueRef::U64(*value),
+            Self::I64(value) => ContextValueRef::I64(*value),
+            Self::Usize(value) => ContextValueRef::Usize(*value),
+            Self::Bool(value) => ContextValueRef::Bool(*value),
         }
     }
 }
@@ -199,17 +259,21 @@ impl AppliedMask {
 
 /// Parameters for an isolated group.
 ///
-/// The group is rendered into an isolated buffer, then composited into its parent using
-/// [`Group::composite`]. If `clip` is present, it is applied to the group's result at
-/// composite time (isolated clip).
+/// The group renders its content in isolation, applies filters in vector order, then applies
+/// the mask and isolated clip. Group opacity and blending apply once to that result when it
+/// is composited into its parent using [`Group::composite`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Group {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<Clip>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMask>,
-    /// Optional filter chain applied to the group result before compositing.
+    /// Filter chain applied in vector order before the mask, isolated clip, and compositing.
     pub filters: Vec<crate::Filter>,
+    /// Maps filter user-space coordinates to the destination coordinate system.
+    ///
+    /// Defaults to identity. Transformed replay prefixes this transform along with the content.
+    pub filter_transform: Affine,
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,
 }
@@ -221,6 +285,7 @@ impl Default for Group {
             clip: None,
             mask: None,
             filters: Vec::new(),
+            filter_transform: Affine::IDENTITY,
             composite: Composite::default(),
         }
     }
@@ -251,9 +316,16 @@ pub struct GlyphRun {
     pub transform: Affine,
     /// Optional per-glyph transform applied before the glyph offset translation.
     pub glyph_transform: Option<Affine>,
+    /// Optional brush-space transform applied after the global run transform.
+    ///
+    /// This affects transformed brushes such as gradients and images; solid colors ignore it.
+    pub brush_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
-    /// Synthetic embolden amount applied to glyph outlines in X/Y device units.
+    /// Outward expansion of glyph outlines along each glyph-local axis, in font-size pixels.
+    ///
+    /// Components must be finite and nonnegative. Expansion precedes the glyph and run
+    /// transforms; zero leaves that axis unchanged. Bitmap and color glyphs are unaffected.
     pub font_embolden: Vec2,
     /// Whether glyph hinting is enabled.
     pub hint: bool,
@@ -277,6 +349,7 @@ impl GlyphRun {
             font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
+            brush_transform: None,
             font_size: 16.0,
             font_embolden: Vec2::ZERO,
             hint: false,
@@ -368,6 +441,36 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Whether this recording or a referenced mask samples an external image.
+    ///
+    /// External pixels can change without changing scene equality. Renderers must not reuse
+    /// cached rasterizations of such scenes solely because their commands compare equal.
+    #[must_use]
+    pub fn has_external_images(&self) -> bool {
+        self.commands.iter().any(|command| match *command {
+            Command::Draw(id) => {
+                let brush = match self.draw_op(id) {
+                    Draw::Fill { brush, .. } | Draw::Stroke { brush, .. } => brush,
+                    Draw::GlyphRun(run) => &run.brush,
+                    Draw::BlurredRoundedRect(_) => return false,
+                };
+                matches!(
+                    brush,
+                    Brush::Image(crate::ImageBrush {
+                        image: crate::Image::External(_),
+                        ..
+                    })
+                )
+            }
+            Command::PushGroup(id) => self
+                .group(id)
+                .mask
+                .as_ref()
+                .is_some_and(|mask| self.mask(mask.mask).scene.has_external_images()),
+            _ => false,
+        })
+    }
+
     /// Create an empty scene.
     #[inline]
     pub fn new() -> Self {
@@ -451,7 +554,7 @@ impl Scene {
         &self.contexts[id.0 as usize]
     }
 
-    /// Resolve an interned label string by ID.
+    /// Resolve an interned context string by ID.
     #[inline]
     pub fn label(&self, id: LabelId) -> &str {
         &self.labels[id.0 as usize]
@@ -504,15 +607,38 @@ impl Scene {
         label: &str,
         source: Option<SourceLocationRef<'_>>,
     ) -> ContextId {
-        let label = self.define_label(label);
-        let source = source.map(|source| SourceLocation {
+        self.push_context_ref(ContextRef::label(label, source))
+    }
+
+    /// Push a structured context annotation.
+    #[inline]
+    pub fn push_context_ref(&mut self, context: ContextRef<'_>) -> ContextId {
+        let kind = match context.kind {
+            ContextKindRef::Label => ContextKind::Label,
+            ContextKindRef::Widget => ContextKind::Widget,
+            ContextKindRef::ChildIndex => ContextKind::ChildIndex,
+            ContextKindRef::Slot => ContextKind::Slot,
+            ContextKindRef::Named(name) => ContextKind::Named(self.define_label(name)),
+        };
+        let value = match context.value {
+            ContextValueRef::Str(value) => ContextValue::Str(self.define_label(value)),
+            ContextValueRef::U64(value) => ContextValue::U64(value),
+            ContextValueRef::I64(value) => ContextValue::I64(value),
+            ContextValueRef::Usize(value) => ContextValue::Usize(value),
+            ContextValueRef::Bool(value) => ContextValue::Bool(value),
+        };
+        let source = context.source.map(|source| SourceLocation {
             file: self.define_file(source.file),
             line: source.line,
             column: source.column,
         });
         let idx = u32::try_from(self.contexts.len()).expect("scene context table overflow");
         let id = ContextId(idx);
-        self.contexts.push(Context { label, source });
+        self.contexts.push(Context {
+            kind,
+            value,
+            source,
+        });
         self.commands.push(Command::PushContext(id));
         id
     }
@@ -593,7 +719,7 @@ impl Scene {
             .map(|id| {
                 let context = self.context(*id);
                 ContextNote {
-                    label: self.label(context.label).into(),
+                    label: context.as_ref(self).format(),
                     source: context
                         .source
                         .as_ref()
@@ -607,7 +733,7 @@ impl Scene {
             .collect()
     }
 
-    /// Validate well-nested stacks.
+    /// Validate well-nested stacks, filter parameters and transforms, and retained masks.
     pub fn validate(&self) -> Result<(), ValidateError> {
         let mut context_depth = 0_u32;
         let mut context_stack = Vec::new();
@@ -642,7 +768,19 @@ impl Scene {
                         }
                     })?;
                 }
-                Command::PushGroup(_) => group_depth += 1,
+                Command::PushGroup(id) => {
+                    let group = self.group(*id);
+                    if !group.filter_transform.is_finite()
+                        || group.filters.iter().any(|filter| {
+                            !crate::validation::filter_is_valid(filter, group.filter_transform)
+                        })
+                    {
+                        return Err(ValidateError::InvalidFilter {
+                            contexts: self.context_notes_for_stack(&context_stack),
+                        });
+                    }
+                    group_depth += 1;
+                }
                 Command::PopGroup => {
                     group_depth = group_depth.checked_sub(1).ok_or_else(|| {
                         ValidateError::UnbalancedPopGroup {
@@ -685,7 +823,7 @@ impl Scene {
 impl PaintSink for Scene {
     #[inline]
     fn push_context(&mut self, context: ContextRef<'_>) {
-        let _ = Self::push_context(self, context.label, context.source);
+        let _ = Self::push_context_ref(self, context);
     }
 
     #[inline]
@@ -787,6 +925,11 @@ pub enum ValidateError {
         /// Enclosing context stack still open at the end of validation.
         contexts: Vec<ContextNote>,
     },
+    /// A filter's parameters or transform were invalid.
+    InvalidFilter {
+        /// Enclosing context stack active at the point of failure.
+        contexts: Vec<ContextNote>,
+    },
     /// A retained mask definition was invalid.
     InvalidMask(Box<Self>),
 }
@@ -812,6 +955,9 @@ impl core::fmt::Display for ValidateError {
             Self::UnclosedContexts { .. } => {
                 f.write_str("scene validation failed: scene ended with unclosed contexts")
             }
+            Self::InvalidFilter { .. } => {
+                f.write_str("scene validation failed: invalid filter parameters or transform")
+            }
             Self::InvalidMask(_) => {
                 f.write_str("scene validation failed: retained mask definition is invalid")
             }
@@ -823,7 +969,8 @@ impl core::error::Error for ValidateError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::InvalidMask(error) => Some(error.as_ref()),
-            Self::UnbalancedPopClip { .. }
+            Self::InvalidFilter { .. }
+            | Self::UnbalancedPopClip { .. }
             | Self::UnbalancedPopGroup { .. }
             | Self::UnbalancedPopContext { .. }
             | Self::UnclosedClips { .. }
@@ -907,6 +1054,7 @@ mod tests {
             font,
             transform: Affine::IDENTITY,
             glyph_transform: None,
+            brush_transform: None,
             font_size: 12.0,
             font_embolden: Vec2::ZERO,
             hint: false,
@@ -996,10 +1144,12 @@ mod tests {
                 Command::PopContext,
             ]
         );
+        assert_eq!(dest.context(ContextId(0)).kind, ContextKind::Label);
         assert_eq!(
-            dest.label(dest.context(ContextId(0)).label),
-            "toolbar/button"
+            dest.context(ContextId(0)).value,
+            ContextValue::Str(LabelId(0))
         );
+        assert_eq!(dest.label(LabelId(0)), "toolbar/button");
         let source = dest
             .context(ContextId(0))
             .source

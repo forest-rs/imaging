@@ -11,6 +11,9 @@
 //! This crate provides a CPU raster renderer that consumes `imaging::record::Scene` or native
 //! Skia draw targets and produces an RGBA8 image buffer using Skia.
 //!
+//! Masks use native Skia layers on raster canvases, GPU canvases, and recorded pictures.
+//! The rendered mask's alpha or luminance modulates the filtered content before compositing.
+//!
 //! # Render A Recorded Scene
 //!
 //! Record commands into [`imaging::record::Scene`], then hand the scene to [`SkiaCpuRenderer`].
@@ -165,8 +168,6 @@ mod sinks;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios"))))]
 mod vulkan;
 
-#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios")))]
-use foreign_types_shared as _;
 use imaging::{
     Filter, GeometryRef, GlyphRunRef, RgbaImage,
     record::{Scene, ValidateError, replay},
@@ -194,8 +195,9 @@ use crate::gpu_readback::{
     ReadbackError, ScratchTexture, read_texture_into, read_texture_into_target,
 };
 #[cfg(feature = "gpu")]
-use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError};
-use sinks::MaskCache;
+use imaging_wgpu::TextureRenderer;
+#[cfg(feature = "gpu")]
+use imaging_wgpu::{TextureRendererError, TextureTargetError};
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 #[cfg(feature = "gpu")]
 pub use wgpu;
@@ -222,8 +224,8 @@ pub enum Error {
     InvalidGpuTextureTarget(&'static str),
     /// The target image buffer format cannot be represented through Skia.
     UnsupportedImageTargetFormat,
-    /// An image brush was encountered; this backend does not support it.
-    UnsupportedImageBrush,
+    /// This renderer cannot sample externally bound images.
+    UnsupportedExternalImage,
     /// A filter configuration could not be translated.
     UnsupportedFilter,
     /// A glyph run used a per-glyph transform unsupported by this backend.
@@ -397,7 +399,6 @@ impl Default for ImageCache {
 pub struct SkiaCaches {
     font_cache: SkiaFontCache,
     image_cache: Rc<RefCell<ImageCache>>,
-    mask_cache: Rc<RefCell<MaskCache>>,
 }
 
 impl SkiaCaches {
@@ -407,7 +408,6 @@ impl SkiaCaches {
         Self {
             font_cache: SkiaFontCache::new(),
             image_cache: Rc::new(RefCell::new(ImageCache::default())),
-            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
         }
     }
 
@@ -425,21 +425,14 @@ impl SkiaCaches {
     fn image_cache(&self) -> Rc<RefCell<ImageCache>> {
         Rc::clone(&self.image_cache)
     }
-    fn mask_cache(&self) -> Rc<RefCell<MaskCache>> {
-        Rc::clone(&self.mask_cache)
-    }
 
     fn clear(&self) {
         self.font_cache.clear();
         self.image_cache.borrow_mut().clear();
-        self.mask_cache.borrow_mut().clear();
     }
 
     fn set_image_cache_total_bytes_limit(&self, limit: usize) {
         self.image_cache.borrow_mut().set_max_bytes(limit);
-    }
-    fn set_mask_cache_total_bytes_limit(&self, limit: usize) {
-        self.mask_cache.borrow_mut().set_max_bytes(limit);
     }
 }
 
@@ -460,8 +453,6 @@ pub struct SkiaCacheConfig {
     pub resource_cache_single_allocation_byte_limit: Option<usize>,
     /// Maximum number of bytes retained by the shared realized-image cache.
     pub image_cache_total_bytes_limit: usize,
-    /// Maximum number of bytes retained by the shared realized mask cache.
-    pub mask_cache_total_bytes_limit: usize,
 }
 
 impl Default for SkiaCacheConfig {
@@ -472,7 +463,6 @@ impl Default for SkiaCacheConfig {
             resource_cache_total_bytes_limit: 10 * 1024 * 1024,
             resource_cache_single_allocation_byte_limit: None,
             image_cache_total_bytes_limit: 64 * 1024 * 1024,
-            mask_cache_total_bytes_limit: 64 * 1024 * 1024,
         }
     }
 }
@@ -519,13 +509,6 @@ impl SkiaCacheConfig {
     #[must_use]
     pub fn with_image_cache_total_bytes_limit(mut self, limit: usize) -> Self {
         self.image_cache_total_bytes_limit = limit;
-        self
-    }
-
-    /// Override the shared realized-mask cache byte limit.
-    #[must_use]
-    pub fn with_mask_cache_total_bytes_limit(mut self, limit: usize) -> Self {
-        self.mask_cache_total_bytes_limit = limit;
         self
     }
 
@@ -620,9 +603,6 @@ impl SkiaCpuRenderer {
         config
             .caches
             .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
-        config
-            .caches
-            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let surface = Self::create_surface(1, 1);
         Self {
             surface,
@@ -635,19 +615,7 @@ impl SkiaCpuRenderer {
 
     /// Set the tolerance used when converting shapes to paths.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        if self.tolerance != tolerance {
-            self.caches.mask_cache().borrow_mut().clear();
-        }
         self.tolerance = tolerance;
-    }
-
-    /// Drop any realized mask artifacts cached by the renderer.
-    ///
-    /// The cache is shared through [`SkiaCaches`], so unchanged masked subscenes can be reused
-    /// across compatible renderers. Call this if you need to release memory aggressively or after
-    /// changing assumptions that affect mask realization outside the recorded scene itself.
-    pub fn clear_cached_masks(&mut self) {
-        self.caches.mask_cache().borrow_mut().clear();
     }
 
     /// Drop any realized image resources cached by the renderer.
@@ -668,7 +636,6 @@ impl SkiaCpuRenderer {
         self.surface = Self::create_surface(width, height);
         self.width = width;
         self.height = height;
-        self.clear_cached_masks();
     }
 
     fn reset(&mut self) {
@@ -692,7 +659,6 @@ impl SkiaCpuRenderer {
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
             Some(self.caches.image_cache()),
-            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -765,7 +731,6 @@ impl ImageRenderer for SkiaCpuRenderer {
         let mut sink = SkCanvasSink::new_with_caches(
             self.surface.canvas(),
             Some(self.caches.image_cache()),
-            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -863,9 +828,6 @@ impl SkiaGpuRendererState {
         config
             .caches
             .set_image_cache_total_bytes_limit(config.cache_config.image_cache_total_bytes_limit);
-        config
-            .caches
-            .set_mask_cache_total_bytes_limit(config.cache_config.mask_cache_total_bytes_limit);
         let backend = GaneshBackend::from_wgpu(&adapter, &device, &queue)?;
         Ok(Self {
             backend,
@@ -901,7 +863,6 @@ impl SkiaGpuRendererState {
         let mut sink = SkCanvasSink::new_with_caches(
             surface.canvas(),
             Some(self.caches.image_cache()),
-            self.caches.mask_cache(),
             self.caches.font_cache(),
         );
         sink.set_tolerance(self.tolerance);
@@ -954,15 +915,7 @@ impl SkiaRenderer {
 
     /// Set the tolerance used when converting shapes to paths during scene encoding.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        if self.state.tolerance != tolerance {
-            self.state.caches.mask_cache().borrow_mut().clear();
-        }
         self.state.tolerance = tolerance;
-    }
-
-    /// Drop any realized mask artifacts cached by the renderer.
-    pub fn clear_cached_masks(&mut self) {
-        self.state.caches.mask_cache().borrow_mut().clear();
     }
 
     /// Drop any realized image resources cached by the renderer.
@@ -1121,6 +1074,13 @@ impl SkiaRenderer {
             ReadbackError::DevicePoll => Error::Internal("wgpu device poll failed"),
             ReadbackError::CallbackDropped => Error::Internal("wgpu readback callback dropped"),
             ReadbackError::BufferMap => Error::Internal("wgpu readback buffer map failed"),
+            ReadbackError::InvalidTargetStride => {
+                Error::Internal("image target row stride is too small")
+            }
+            ReadbackError::InvalidTargetBuffer => {
+                Error::Internal("image target buffer is too small")
+            }
+            ReadbackError::PixelConversion => Error::Internal("GPU image pixel conversion failed"),
         })
     }
 
@@ -1188,8 +1148,8 @@ fn map_image_renderer_error(error: Error) -> ImageRendererError {
         Error::InvalidScene(error) => {
             ImageRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            ImageRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        Error::UnsupportedExternalImage => {
+            ImageRendererError::Unsupported(RenderUnsupportedError::ExternalImage)
         }
         Error::UnsupportedFilter => ImageRendererError::Unsupported(RenderUnsupportedError::Filter),
         Error::UnsupportedGlyphTransform => {
@@ -1234,6 +1194,15 @@ fn map_readback_image_error(error: ReadbackError) -> ImageRendererError {
             ImageRendererError::Readback(GpuReadbackError::CallbackDropped)
         }
         ReadbackError::BufferMap => ImageRendererError::Readback(GpuReadbackError::BufferMap),
+        ReadbackError::InvalidTargetStride => ImageRendererError::Target(
+            ImageTargetError::InvalidTarget("image target row stride is too small"),
+        ),
+        ReadbackError::InvalidTargetBuffer => {
+            ImageRendererError::Target(ImageTargetError::InvalidTargetBuffer)
+        }
+        ReadbackError::PixelConversion => {
+            ImageRendererError::backend(Error::Internal("GPU image pixel conversion failed"))
+        }
     }
 }
 
@@ -1243,8 +1212,8 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
         }
-        Error::UnsupportedImageBrush => {
-            TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
+        Error::UnsupportedExternalImage => {
+            TextureRendererError::Unsupported(RenderUnsupportedError::ExternalImage)
         }
         Error::UnsupportedFilter => {
             TextureRendererError::Unsupported(RenderUnsupportedError::Filter)
@@ -1524,8 +1493,8 @@ impl FontCache {
             hint: glyph_run.hint,
         };
 
-        let mut font = if let Some(font) = self.fonts.get(&font_key) {
-            font.clone()
+        if let Some(font) = self.fonts.get(&font_key) {
+            Some(font.clone())
         } else {
             let typeface = self.typeface_for_key(&typeface_key, glyph_run.font)?;
             let mut font = sk::Font::from_typeface(typeface, glyph_run.font_size);
@@ -1535,11 +1504,8 @@ impl FontCache {
                 sk::FontHinting::None
             });
             self.fonts.insert(font_key, font.clone());
-            font
-        };
-
-        apply_glyph_transform(&mut font, glyph_run.glyph_transform, glyph_run.font_size)?;
-        Some(font)
+            Some(font)
+        }
     }
 
     fn typeface_for_key(
@@ -1599,8 +1565,10 @@ impl FontCache {
 
         let extracted_font = extracted_font_data(self, key, font)?;
         let font_bytes = extracted_font.data.as_ref();
-        let font_index = extracted_font.index as usize;
-        let typeface = self.font_mgr.new_from_data(font_bytes, font_index)?;
+        let font_index = extracted_font.index;
+        let typeface = self
+            .font_mgr
+            .new_from_data(sk::Data::new_copy(font_bytes), font_index)?;
         self.base_typefaces.insert(key.clone(), typeface.clone());
         Some(typeface)
     }
@@ -1660,26 +1628,6 @@ fn skia_font_from_glyph_run(
         Some(font_cache) => font_cache.borrow_mut().font_from_glyph_run(glyph_run),
         None => FontCache::new().font_from_glyph_run(glyph_run),
     }
-}
-
-fn apply_glyph_transform(
-    font: &mut sk::Font,
-    glyph_transform: Option<Affine>,
-    font_size: f32,
-) -> Option<()> {
-    let Some(transform) = glyph_transform else {
-        return Some(());
-    };
-
-    let [a, b, c, d, e, f] = transform.as_coeffs();
-    if b != 0.0 || e != 0.0 || f != 0.0 || d <= 0.0 {
-        return None;
-    }
-
-    font.set_size(f64_to_f32(font_size as f64 * d));
-    font.set_scale_x(f64_to_f32(a / d));
-    font.set_skew_x(f64_to_f32(c / d));
-    Some(())
 }
 
 fn sk_path_fill_type_from_fill_rule(rule: peniko::Fill) -> sk::PathFillType {
@@ -1753,8 +1701,8 @@ fn tile_mode_from_extend(extend: peniko::Extend) -> sk::TileMode {
 
 fn gradient_shader_cs_from_cs_tag(
     color_space: ColorSpaceTag,
-) -> sk::gradient_shader::interpolation::ColorSpace {
-    use sk::gradient_shader::interpolation::ColorSpace as SkCs;
+) -> sk::gradient::interpolation::ColorSpace {
+    use sk::gradient::interpolation::ColorSpace as SkCs;
 
     match color_space {
         ColorSpaceTag::Srgb => SkCs::SRGB,
@@ -1775,8 +1723,8 @@ fn gradient_shader_cs_from_cs_tag(
 
 fn gradient_shader_hue_method_from_hue_direction(
     direction: HueDirection,
-) -> sk::gradient_shader::interpolation::HueMethod {
-    use sk::gradient_shader::interpolation::HueMethod as SkHue;
+) -> sk::gradient::interpolation::HueMethod {
+    use sk::gradient::interpolation::HueMethod as SkHue;
 
     match direction {
         HueDirection::Shorter => SkHue::Shorter,
@@ -1798,11 +1746,12 @@ fn color_to_sk_color4f(color: peniko::Color) -> sk::Color4f {
 }
 
 fn brush_to_paint(
-    brush: BrushRef<'_>,
+    brush: imaging::BrushRef<'_>,
     opacity: f32,
     paint_xf: Affine,
     image_cache: Option<&Rc<RefCell<ImageCache>>>,
 ) -> Option<sk::Paint> {
+    let brush = brush.as_raster()?;
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
     let alpha_scale = opacity.clamp(0.0, 1.0);
@@ -1841,31 +1790,29 @@ fn brush_to_paint(
             let tile_mode = tile_mode_from_extend(grad.extend);
             let local = affine_to_matrix(paint_xf);
 
-            let interpolation = sk::gradient_shader::Interpolation {
+            let interpolation = sk::gradient::Interpolation {
                 color_space: gradient_shader_cs_from_cs_tag(grad.interpolation_cs),
                 in_premul: match grad.interpolation_alpha_space {
                     InterpolationAlphaSpace::Premultiplied => {
-                        sk::gradient_shader::interpolation::InPremul::Yes
+                        sk::gradient::interpolation::InPremul::Yes
                     }
                     InterpolationAlphaSpace::Unpremultiplied => {
-                        sk::gradient_shader::interpolation::InPremul::No
+                        sk::gradient::interpolation::InPremul::No
                     }
                 },
                 hue_method: gradient_shader_hue_method_from_hue_direction(grad.hue_direction),
             };
+            let gradient_colors =
+                sk::gradient::Colors::new(&colors[..], Some(&pos[..]), tile_mode, None);
+            let gradient = sk::gradient::Gradient::new(gradient_colors, interpolation);
 
             match &grad.kind {
                 peniko::GradientKind::Linear(line) => {
                     let p0 = sk::Point::new(f64_to_f32(line.start.x), f64_to_f32(line.start.y));
                     let p1 = sk::Point::new(f64_to_f32(line.end.x), f64_to_f32(line.end.y));
-                    if let Some(shader) = sk::gradient_shader::linear_with_interpolation(
-                        (p0, p1),
-                        (&colors[..], None),
-                        &pos[..],
-                        tile_mode,
-                        interpolation,
-                        Some(&local),
-                    ) {
+                    if let Some(shader) =
+                        sk::gradient::shaders::linear_gradient((p0, p1), &gradient, Some(&local))
+                    {
                         paint.set_shader(shader);
                     }
                 }
@@ -1879,13 +1826,10 @@ fn brush_to_paint(
                         sk::Point::new(f64_to_f32(rad.end_center.x), f64_to_f32(rad.end_center.y));
                     let end_radius = rad.end_radius;
 
-                    if let Some(shader) = sk::gradient_shader::two_point_conical_with_interpolation(
+                    if let Some(shader) = sk::gradient::shaders::two_point_conical_gradient(
                         (start_center, start_radius),
                         (end_center, end_radius),
-                        (&colors[..], None),
-                        &pos[..],
-                        tile_mode,
-                        interpolation,
+                        &gradient,
                         Some(&local),
                     ) {
                         paint.set_shader(shader);
@@ -1897,13 +1841,10 @@ fn brush_to_paint(
                     // `peniko` uses radians; Skia uses degrees for sweep gradient angles.
                     let start = rad_to_deg(sweep.start_angle);
                     let end = rad_to_deg(sweep.end_angle);
-                    if let Some(shader) = sk::gradient_shader::sweep_with_interpolation(
+                    if let Some(shader) = sk::gradient::shaders::sweep_gradient(
                         center,
-                        (&colors[..], None),
-                        Some(&pos[..]),
-                        tile_mode,
-                        Some((start, end)),
-                        interpolation,
+                        (start, end),
+                        &gradient,
                         Some(&local),
                     ) {
                         paint.set_shader(shader);
@@ -2057,22 +1998,44 @@ fn build_filter_chain(filters: &[Filter]) -> Option<sk::ImageFilter> {
             Filter::Blur {
                 std_deviation_x,
                 std_deviation_y,
-            } => image_filters::blur((std_deviation_x, std_deviation_y), None, current, None)?,
+            } => {
+                let sigma = (f64_to_f32(std_deviation_x), f64_to_f32(std_deviation_y));
+                if !sigma.0.is_finite() || !sigma.1.is_finite() {
+                    return None;
+                }
+                image_filters::blur(sigma, None, current, None)?
+            }
             Filter::DropShadow {
                 dx,
                 dy,
                 std_deviation_x,
                 std_deviation_y,
                 color,
-            } => image_filters::drop_shadow(
-                (dx, dy),
-                (std_deviation_x, std_deviation_y),
-                color_to_sk_color4f(color),
-                None,
-                current,
-                None,
-            )?,
-            Filter::Offset { dx, dy } => image_filters::offset((dx, dy), current, None)?,
+            } => {
+                let offset = (f64_to_f32(dx), f64_to_f32(dy));
+                let sigma = (f64_to_f32(std_deviation_x), f64_to_f32(std_deviation_y));
+                if ![offset.0, offset.1, sigma.0, sigma.1]
+                    .into_iter()
+                    .all(f32::is_finite)
+                {
+                    return None;
+                }
+                image_filters::drop_shadow(
+                    offset,
+                    sigma,
+                    color_to_sk_color4f(color),
+                    None,
+                    current,
+                    None,
+                )?
+            }
+            Filter::Offset { dx, dy } => {
+                let offset = (f64_to_f32(dx), f64_to_f32(dy));
+                if !offset.0.is_finite() || !offset.1.is_finite() {
+                    return None;
+                }
+                image_filters::offset(offset, current, None)?
+            }
         });
     }
     current
@@ -2107,6 +2070,12 @@ mod tests {
         static FONT: OnceLock<FontData> = OnceLock::new();
         FONT.get_or_init(|| FontData::new(Blob::new(Arc::new(TEST_FONT_BYTES)), 0))
             .clone()
+    }
+
+    fn test_typeface() -> sk::Typeface {
+        sk::FontMgr::default()
+            .new_from_data(sk::Data::new_copy(TEST_FONT_BYTES), 0)
+            .unwrap()
     }
 
     fn masked_scene(mode: MaskMode) -> Scene {
@@ -2174,31 +2143,120 @@ mod tests {
         assert_eq!(&image.data[..4], &[0x22, 0x66, 0xaa, 0xff]);
     }
 
-    #[test]
-    fn render_scene_reuses_cached_masks_for_identical_scenes() {
-        let scene = masked_scene(MaskMode::Alpha);
+    fn image_pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        let width = usize::try_from(image.width).expect("image width fits usize");
+        let idx = (usize::try_from(y).expect("y fits usize") * width
+            + usize::try_from(x).expect("x fits usize"))
+            * 4;
+        image.data[idx..idx + 4].try_into().expect("RGBA pixel")
+    }
+
+    fn assert_masked_scene_renders(mode: MaskMode) {
+        let scene = masked_scene(mode);
         let mut renderer = SkiaCpuRenderer::new();
 
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
+        let image = renderer.render_scene(&scene, 64, 64).unwrap();
 
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
+        assert_eq!(image_pixel(&image, 4, 4), [0, 0, 0, 0]);
+        assert!(image_pixel(&image, 16, 16)[3] > 0);
     }
 
     #[test]
-    fn clear_cached_masks_drops_realized_masks() {
-        let scene = masked_scene(MaskMode::Luminance);
+    fn render_scene_renders_alpha_masks() {
+        assert_masked_scene_renders(MaskMode::Alpha);
+    }
+
+    #[test]
+    fn render_scene_renders_luminance_masks() {
+        assert_masked_scene_renders(MaskMode::Luminance);
+    }
+
+    fn filtered_mask_scene(mode: MaskMode) -> Scene {
+        let mask = Painter::<Scene>::record_mask(mode, |p| {
+            p.fill_rect(
+                Rect::new(0.0, 0.0, 8.0, 8.0),
+                Color::from_rgba8(0, 0, 255, 128),
+            );
+        });
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(
+            GroupRef::new()
+                .with_filters(&[Filter::offset(2.0, 0.0)])
+                .with_filter_transform(Affine::scale(2.0))
+                .with_mask(mask.as_ref())
+                .with_clip(imaging::ClipRef::fill(Rect::new(5.0, 0.0, 7.0, 8.0)))
+                .with_composite(imaging::Composite::new(peniko::BlendMode::default(), 0.5)),
+            |p| p.fill_rect(Rect::new(0.0, 0.0, 4.0, 8.0), Color::WHITE),
+        );
+        scene
+    }
+
+    fn assert_filtered_mask(image: &RgbaImage, mode: MaskMode) {
+        for y in 0..8 {
+            for x in 0..16 {
+                let pixel = image_pixel(image, x, y);
+                let expected = if (5..7).contains(&x) {
+                    match mode {
+                        MaskMode::Alpha => 64,
+                        MaskMode::Luminance => 5,
+                    }
+                } else {
+                    0
+                };
+                assert!(
+                    pixel[3].abs_diff(expected) <= 1,
+                    "filtered {mode:?} mask at ({x}, {y}): {pixel:?}, expected alpha {expected}"
+                );
+                if expected != 0 {
+                    assert_eq!(&pixel[..3], &[255; 3], "mask colors must not tint content");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_pictures_preserve_filtered_masks_and_clips() {
         let mut renderer = SkiaCpuRenderer::new();
+        for mode in [MaskMode::Alpha, MaskMode::Luminance] {
+            let scene = filtered_mask_scene(mode);
+            let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 16.0, 8.0));
+            replay(&scene, &mut sink);
+            let picture = sink.finish_picture().unwrap();
+            assert_filtered_mask(&renderer.render_picture(&picture, 16, 8).unwrap(), mode);
+            assert_filtered_mask(&renderer.render_scene(&scene, 16, 8).unwrap(), mode);
+        }
+    }
 
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
+    #[test]
+    fn singular_non_axis_aligned_filter_returns_unsupported() {
+        let mut scene = Scene::new();
+        Painter::new(&mut scene).with_group(
+            GroupRef::new()
+                .with_filters(&[Filter::blur(1.0)])
+                .with_filter_transform(Affine::new([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])),
+            |p| p.fill_rect(Rect::new(0.0, 0.0, 8.0, 8.0), Color::WHITE),
+        );
+        assert!(matches!(
+            SkiaCpuRenderer::new().render_scene(&scene, 8, 8),
+            Err(Error::UnsupportedFilter)
+        ));
+    }
 
-        renderer.clear_cached_masks();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
-
-        renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn gpu_sources_and_pictures_preserve_filtered_masks_and_clips() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+        for mode in [MaskMode::Alpha, MaskMode::Luminance] {
+            let scene = filtered_mask_scene(mode);
+            let image = ImageRenderer::render_source(&mut renderer, &mut &scene, 16, 8).unwrap();
+            assert_filtered_mask(&image, mode);
+            let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 16.0, 8.0));
+            replay(&scene, &mut sink);
+            let picture = sink.finish_picture().unwrap();
+            assert_filtered_mask(&renderer.render_picture(&picture, 16, 8).unwrap(), mode);
+        }
     }
 
     #[test]
@@ -2226,26 +2284,14 @@ mod tests {
     }
 
     #[test]
-    fn changing_tolerance_clears_cached_masks() {
-        let scene = masked_scene(MaskMode::Alpha);
+    fn changing_tolerance_keeps_masked_rendering_working() {
+        let scene = masked_scene(MaskMode::Luminance);
         let mut renderer = SkiaCpuRenderer::new();
 
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 1);
 
         renderer.set_tolerance(0.25);
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
-    }
-
-    #[test]
-    fn config_can_disable_realized_mask_retention() {
-        let scene = masked_scene(MaskMode::Alpha);
-        let config = SkiaConfig::new()
-            .with_cache_config(SkiaCacheConfig::new().with_mask_cache_total_bytes_limit(0));
-        let mut renderer = SkiaCpuRenderer::new_with_config(config);
-
         renderer.render_scene(&scene, 64, 64).unwrap();
-        assert_eq!(renderer.caches.mask_cache().borrow().len(), 0);
     }
 
     #[test]
@@ -2425,6 +2471,146 @@ mod tests {
         assert_eq!(caches.font_cache().counts(), counts);
     }
 
+    #[test]
+    fn glyph_transform_precedes_placement_and_keeps_brush_in_run_space() {
+        let font = test_font();
+        let id = u32::from(test_typeface().unichar_to_glyph('H' as i32));
+        let glyphs = [
+            Glyph {
+                id,
+                x: 20.0,
+                y: 32.0,
+            },
+            Glyph {
+                id,
+                x: 60.0,
+                y: 46.0,
+            },
+        ];
+        let run_transform = Affine::translate((7.0, 11.0));
+        let brush_transform = Affine::translate((15.0, 0.0)) * Affine::scale(2.0);
+        let gradient = peniko::Gradient::new_linear((0.0, 0.0), (40.0, 0.0))
+            .with_stops([Color::from_rgb8(255, 0, 0), Color::from_rgb8(0, 0, 255)]);
+        let style = Style::Fill(Fill::NonZero);
+        let mut renderer = SkiaCpuRenderer::new();
+
+        for glyph_transform in [
+            Affine::translate((4.0, -2.0)),
+            Affine::new([1.0, 0.5, -0.25, 1.0, 4.0, -2.0]),
+            Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+            Affine::scale_non_uniform(1.0, -1.0),
+        ] {
+            let mut actual_scene = Scene::new();
+            Painter::new(&mut actual_scene)
+                .glyphs(&font, &gradient)
+                .font_size(22.0)
+                .transform(run_transform)
+                .glyph_transform(Some(glyph_transform))
+                .brush_transform(Some(brush_transform))
+                .draw(&style, glyphs);
+
+            let mut expected_scene = Scene::new();
+            let mut painter = Painter::new(&mut expected_scene);
+            for glyph in glyphs {
+                let glyph_to_run =
+                    Affine::translate((f64::from(glyph.x), f64::from(glyph.y))) * glyph_transform;
+                painter
+                    .glyphs(&font, &gradient)
+                    .font_size(22.0)
+                    .transform(run_transform * glyph_to_run)
+                    .brush_transform(Some(glyph_to_run.inverse() * brush_transform))
+                    .draw(&style, [Glyph { id, x: 0.0, y: 0.0 }]);
+            }
+
+            let expected = renderer.render_scene(&expected_scene, 112, 112).unwrap();
+            assert!(
+                expected
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0)
+            );
+            let actual = renderer.render_scene(&actual_scene, 112, 112).unwrap();
+            assert!(
+                actual.data == expected.data,
+                "direct draw for {glyph_transform:?}"
+            );
+
+            let mut picture = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 112.0, 112.0));
+            replay(&actual_scene, &mut picture);
+            let actual = renderer
+                .render_picture(&picture.finish_picture().unwrap(), 112, 112)
+                .unwrap();
+            assert!(
+                actual.data == expected.data,
+                "picture draw for {glyph_transform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transformed_glyph_outline_is_stroked_in_run_space() {
+        let font = test_font();
+        let typeface = test_typeface();
+        let id = typeface.unichar_to_glyph('H' as i32);
+        let glyph = Glyph {
+            id: u32::from(id),
+            x: 24.0,
+            y: 48.0,
+        };
+        let font_size = 22.0;
+        let stroke = kurbo::Stroke::new(3.0).with_dashes(0.0, [4.0, 3.0]);
+        let run_transform = Affine::translate((7.0, 11.0));
+        let glyph_transform = Affine::new([2.0, 0.5, 0.0, 1.0, 4.0, -2.0]);
+        let mut scene = Scene::new();
+        Painter::new(&mut scene)
+            .glyphs(&font, Color::WHITE)
+            .font_size(font_size)
+            .transform(run_transform)
+            .glyph_transform(Some(glyph_transform))
+            .draw(&Style::Stroke(stroke.clone()), [glyph]);
+
+        let mut native_font = sk::Font::from_typeface(typeface, font_size);
+        native_font
+            .set_hinting(sk::FontHinting::None)
+            .set_subpixel(true);
+        let path = native_font
+            .get_path(id)
+            .unwrap()
+            .with_transform(&affine_to_matrix(
+                Affine::translate((f64::from(glyph.x), f64::from(glyph.y))) * glyph_transform,
+            ));
+        let mut paint = sk::Paint::default();
+        paint.set_anti_alias(true).set_color(sk::Color::WHITE);
+        apply_stroke_style(&mut paint, &stroke);
+
+        let mut renderer = SkiaCpuRenderer::new();
+        renderer.resize(112, 112);
+        renderer
+            .surface
+            .canvas()
+            .concat(&affine_to_matrix(run_transform))
+            .draw_path(&path, &paint);
+        let mut expected = RgbaImage::new(112, 112);
+        renderer
+            .read_into_target(ImageBufferTarget::from_rgba_image(&mut expected))
+            .unwrap();
+        assert!(
+            expected
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] > 0)
+        );
+        let actual = renderer.render_scene(&scene, 112, 112).unwrap();
+        assert!(
+            actual.data == expected.data,
+            "affine glyph stroke width and dashes"
+        );
+    }
+
     #[cfg(feature = "gpu")]
     fn block_on<F: Future>(future: F) -> F::Output {
         let waker = Waker::noop();
@@ -2440,23 +2626,31 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     fn try_init_gpu_renderer() -> Option<SkiaRenderer> {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        let desc = wgpu::DeviceDescriptor::default();
-        let (device, queue) = block_on(adapter.request_device(&desc)).ok()?;
-        SkiaRenderer::new(adapter, device, queue).ok()
+        try_init_gpu_renderer_with_device().map(|(renderer, _)| renderer)
     }
 
     #[cfg(feature = "gpu")]
     fn try_init_gpu_renderer_with_device() -> Option<(SkiaRenderer, wgpu::Device)> {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        let desc = wgpu::DeviceDescriptor::default();
-        let (device, queue) = block_on(adapter.request_device(&desc)).ok()?;
-        let renderer = SkiaRenderer::new(adapter, device.clone(), queue).ok()?;
-        Some((renderer, device))
+        let result = (|| -> Result<_, Box<dyn core::error::Error>> {
+            let instance = wgpu::Instance::default();
+            let adapter =
+                block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+            let (device, queue) =
+                block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+            let renderer = SkiaRenderer::new(adapter, device.clone(), queue)?;
+            Ok((renderer, device))
+        })();
+        match result {
+            Ok(renderer) => Some(renderer),
+            Err(error) => {
+                assert!(
+                    std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() != Ok("yes"),
+                    "Skia GPU initialization failed: {error}"
+                );
+                eprintln!("skipping Skia GPU test: {error}");
+                None
+            }
+        }
     }
 
     #[cfg(feature = "gpu")]
@@ -2504,12 +2698,13 @@ mod tests {
         sink.finish_picture().unwrap()
     }
 
+    #[cfg(feature = "gpu")]
     fn assert_solid_rgba_image(image: &RgbaImage, expected: [u8; 4]) {
         assert_eq!(
             image.data.len(),
             usize::try_from(image.width).unwrap() * usize::try_from(image.height).unwrap() * 4
         );
-        for (index, pixel) in image.data.chunks_exact(4).enumerate() {
+        for (index, pixel) in image.data.chunks_exact(expected.len()).enumerate() {
             assert_eq!(pixel, expected, "pixel {index} did not match");
         }
     }
@@ -2544,6 +2739,69 @@ mod tests {
             renderer.supported_image_formats(),
             supported_image_formats()
         );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_readback_returns_unpremultiplied_pixels_and_rejects_short_targets() {
+        let Some(mut renderer) = try_init_gpu_renderer() else {
+            return;
+        };
+        let scene = solid_scene(2, 2, Color::from_rgba8(255, 0, 0, 128));
+        let mut source = &scene;
+        let image = ImageRenderer::render_source(&mut renderer, &mut source, 2, 2).unwrap();
+        assert_solid_rgba_image(&image, [255, 0, 0, 128]);
+        let mut bgra = [0_u8; 16];
+        let mut source = &scene;
+        ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut bgra,
+                width: 2,
+                height: 2,
+                bytes_per_row: 8,
+                format: ImageBufferFormat::Bgra8Unorm,
+            },
+        )
+        .unwrap();
+        assert_eq!(bgra, [0, 0, 255, 128].repeat(4).as_slice());
+        let mut float = [0_u8; 32];
+        let mut source = &scene;
+        ImageRenderer::render_source_into(
+            &mut renderer,
+            &mut source,
+            ImageBufferTarget {
+                data: &mut float,
+                width: 2,
+                height: 2,
+                bytes_per_row: 16,
+                format: ImageBufferFormat::Rgba16Float,
+            },
+        )
+        .unwrap();
+        let (pixels, _) = float.as_chunks::<8>();
+        for pixel in pixels {
+            assert_eq!(u16::from_le_bytes([pixel[0], pixel[1]]), 0x3c00);
+            assert_eq!(&pixel[2..6], &[0; 4]);
+            assert_eq!(u16::from_le_bytes([pixel[6], pixel[7]]), 0x3804);
+        }
+        let mut bytes = [0_u8; 16];
+        for (stride, len) in [(7, 16), (8, 15)] {
+            let mut source = &scene;
+            let result = ImageRenderer::render_source_into(
+                &mut renderer,
+                &mut source,
+                ImageBufferTarget {
+                    data: &mut bytes[..len],
+                    width: 2,
+                    height: 2,
+                    bytes_per_row: stride,
+                    format: ImageBufferFormat::Rgba8Unorm,
+                },
+            );
+            assert!(matches!(result, Err(ImageRendererError::Target(_))));
+        }
     }
 
     #[cfg(feature = "gpu")]

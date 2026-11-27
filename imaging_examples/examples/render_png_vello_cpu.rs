@@ -6,10 +6,13 @@
 use std::{fs::File, path::PathBuf};
 
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
-use imaging::{Painter, record::Scene};
+use imaging::{
+    Painter,
+    kurbo::{Rect, RoundedRect},
+    peniko::Color,
+    record::Scene,
+};
 use imaging_vello_cpu::VelloCpuRenderer;
-use kurbo::{Rect, RoundedRect};
-use peniko::Color;
 
 const WIDTH: u16 = 320;
 const HEIGHT: u16 = 180;

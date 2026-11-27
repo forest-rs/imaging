@@ -7,12 +7,17 @@
 //! - Painting: stream borrowed commands into any [`PaintSink`] with [`Painter`].
 //! - Recording: retain an owned command stream in [`record::Scene`] for validation and replay.
 //!
+//! Start with [`guide::learning_path`] for runnable examples. Use [`guide::mental_model`] to
+//! understand the command stream and [`guide::backends`] to choose a renderer.
+//!
 //! The root of the crate is intentionally focused on the streaming surface and the shared drawing
 //! vocabulary. Retained scene data and low-level recording payloads live under [`record`].
 //!
 //! Optional scoped context annotations can be attached during painting with
-//! [`Painter::with_context`] or the [`with_context!`] macro. Recorded scenes intern context labels
-//! and file names only when contexts are actually emitted.
+//! [`Painter::with_context`], [`Painter::with_context_ref`], or the [`with_context!`] macro.
+//! Recorded scenes intern context strings and file names only when contexts are actually emitted,
+//! so structured context values like widget IDs or child indices do not require eager string
+//! formatting on the hot path.
 //!
 //! # Painting
 //!
@@ -21,26 +26,19 @@
 //! retained payloads.
 //!
 //! ```rust
-//! use imaging::{record::Scene, Painter};
-//! use kurbo::Rect;
-//! use peniko::Color;
+//! use imaging::{Painter, kurbo::Rect, peniko::Color, record::Scene};
 //!
 //! let mut scene = Scene::new();
-//!
-//! {
-//!     let mut painter = Painter::new(&mut scene);
-//!     painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
-//!     painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |p| {
-//!         p.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
-//!     });
-//! }
-//!
-//! scene.validate()?;
-//! # Ok::<(), imaging::record::ValidateError>(())
+//! let mut painter = Painter::new(&mut scene);
+//! painter.fill_rect(Rect::new(0.0, 0.0, 64.0, 64.0), Color::WHITE);
+//! painter.with_fill_clip(Rect::new(8.0, 8.0, 56.0, 56.0), |painter| {
+//!     painter.fill_rect(Rect::new(16.0, 16.0, 48.0, 48.0), Color::from_rgb8(0x2a, 0x6f, 0xdb));
+//! });
 //! ```
 //!
-//! For a complete custom [`PaintSink`] implementation, see
-//! `imaging_examples/examples/counting_sink.rs`.
+//! The [counting sink example] implements [`PaintSink`] to receive the same commands.
+//!
+//! [counting sink example]: https://github.com/forest-rs/imaging/blob/main/imaging_examples/examples/counting_sink.rs
 //!
 //! # Recording
 //!
@@ -72,7 +70,20 @@
 //! Low-level retained payloads like [`record::Draw`], [`record::Clip`], and [`record::Group`] are
 //! also public under [`record`] when you need exact control over the recorded representation.
 //!
-//! If you are new to the crate, start with [`guide::learning_path`].
+//! # Feature Flags
+//!
+//! The default feature set enables `std` support in the geometry and color dependencies. For
+//! `no_std` builds, disable default features and enable `libm`:
+//!
+//! ```toml
+//! imaging = { version = "0.0.1", default-features = false, features = ["libm"] }
+//! ```
+//!
+//! Images use [`ImageBrush`] and [`ImageBrushRef`] throughout fills, strokes, glyph runs, and
+//! [`Painter::draw_image`]. [`Image::Raster`] holds shared [`peniko::ImageData`] pixels;
+//! [`Image::External`] holds a typed resource handle bound by a renderer. Core recordings own
+//! handles without depending on GPU types. Encoded scenes keep the backend resources they sample
+//! alive, and unsupported or missing bindings produce explicit errors.
 //!
 //! The API is intentionally small and experimental; expect breaking changes while we iterate.
 
@@ -84,13 +95,11 @@ use alloc::vec::Vec;
 use kurbo::{Affine, Rect};
 use peniko::BlendMode;
 
+mod brush;
 pub mod diagnostics;
 #[cfg(doc)]
 pub mod guide {
-    //! Short guides for learning the crate.
-    //!
-    //! These pages are built for rustdoc and docs.rs. They keep the conceptual material close to
-    //! the public API without adding anything to normal builds.
+    //! Guides to the command stream, retained scenes, and workspace backends.
 
     #[doc = include_str!("guide/learning_path.md")]
     pub mod learning_path {}
@@ -101,15 +110,20 @@ pub mod guide {
     #[doc = include_str!("guide/backends.md")]
     pub mod backends {}
 }
+mod filter;
+mod image;
 mod paint;
 mod painter;
 pub mod record;
 pub mod render;
 pub mod validation;
 
+pub use brush::{Brush, BrushRef, ImageBrush, ImageBrushRef};
+pub use filter::Filter;
+pub use image::{ExternalImage, Image, ImageRef};
 pub use paint::{
-    AppliedMaskRef, ClipRef, ContextRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef,
-    MaskRef, PaintSink, SourceLocationRef, StrokeRef,
+    AppliedMaskRef, ClipRef, ContextKindRef, ContextRef, ContextValueRef, DrawRef, FillRef,
+    GeometryRef, GlyphRunRef, GroupRef, MaskRef, PaintSink, SourceLocationRef, StrokeRef,
 };
 pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
 pub use render::{
@@ -170,8 +184,7 @@ macro_rules! with_context {
 /// Owned unpremultiplied RGBA8 image data returned by renderers.
 ///
 /// This is an output type for readback and headless rendering results. It is not the shared image
-/// asset type used for image brushes or other `imaging` inputs; those continue to use
-/// [`peniko::ImageData`].
+/// asset type used for image brushes or other `imaging` inputs; those use [`Image`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RgbaImage {
     /// Width in pixels.
@@ -221,82 +234,6 @@ pub enum MaskMode {
     ///
     /// This follows SVG/CSS masking behavior where premultiplied RGB contributes to the mask value.
     Luminance,
-}
-
-/// Description of a filter effect applied to an isolated group.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Filter {
-    /// Fill the group output with a solid color (aka `feFlood`).
-    ///
-    /// This ignores the group's source content. It is still affected by the group's isolated clip.
-    Flood {
-        /// Flood color.
-        color: peniko::Color,
-    },
-    /// Gaussian blur with separate X/Y standard deviation values in user space.
-    ///
-    /// Backends should scale these values using the current transform when the filter is applied.
-    Blur {
-        /// Standard deviation along the X axis (in user space units).
-        std_deviation_x: f32,
-        /// Standard deviation along the Y axis (in user space units).
-        std_deviation_y: f32,
-    },
-    /// Drop shadow under the source content.
-    DropShadow {
-        /// Shadow offset along the X axis (in user space units).
-        dx: f32,
-        /// Shadow offset along the Y axis (in user space units).
-        dy: f32,
-        /// Blur standard deviation along the X axis (in user space units).
-        std_deviation_x: f32,
-        /// Blur standard deviation along the Y axis (in user space units).
-        std_deviation_y: f32,
-        /// Shadow color.
-        color: peniko::Color,
-    },
-    /// Translate the group output by a vector (aka `feOffset`).
-    ///
-    /// Offsets are specified in user space; backends should transform this vector using the current
-    /// linear transform when the filter is applied.
-    Offset {
-        /// Offset along the X axis (in user space units).
-        dx: f32,
-        /// Offset along the Y axis (in user space units).
-        dy: f32,
-    },
-}
-
-impl Filter {
-    /// Create a flood filter.
-    #[inline]
-    pub const fn flood(color: peniko::Color) -> Self {
-        Self::Flood { color }
-    }
-
-    /// Create a uniform Gaussian blur filter.
-    #[inline]
-    pub const fn blur(sigma: f32) -> Self {
-        Self::Blur {
-            std_deviation_x: sigma,
-            std_deviation_y: sigma,
-        }
-    }
-
-    /// Create a Gaussian blur filter with separate X/Y sigma values.
-    #[inline]
-    pub const fn blur_xy(std_deviation_x: f32, std_deviation_y: f32) -> Self {
-        Self::Blur {
-            std_deviation_x,
-            std_deviation_y,
-        }
-    }
-
-    /// Create an offset/translation filter.
-    #[inline]
-    pub const fn offset(dx: f32, dy: f32) -> Self {
-        Self::Offset { dx, dy }
-    }
 }
 
 /// A solid-color rounded rectangle blurred with a gaussian filter.
