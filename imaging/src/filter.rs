@@ -93,7 +93,17 @@ impl Filter {
     pub fn in_device_space(self, transform: Affine) -> Option<Self> {
         let [a, b, c, d, ..] = transform.as_coeffs();
         let offset = |dx, dy| (a * dx + c * dy, b * dx + d * dy);
-        let blur = |sx, sy| {
+        let blur = |sx: f64, sy: f64| {
+            // A quarter turn constructed with sin/cos has small residual coefficients.
+            // Detect axis-preserving and axis-swapping transforms before normalizing
+            // the rows. For a one-axis blur, normalizing a residual makes it unit length.
+            let negligible = |value: f64, axis: f64| value.abs() <= f64::EPSILON * axis.abs();
+            if negligible(b, a) && negligible(c, d) {
+                return Some(((a * sx).abs(), (d * sy).abs()));
+            }
+            if negligible(a, b) && negligible(d, c) {
+                return Some(((c * sy).abs(), (b * sx).abs()));
+            }
             // Rows of A * diag(sx, sy). Their dot product is the off-diagonal
             // covariance; their lengths are the destination standard deviations.
             let x = Vec2::new(a * sx, c * sy);
@@ -165,6 +175,15 @@ mod tests {
             Filter::blur_xy(2.0, 3.0).in_device_space(Affine::scale_non_uniform(-2.0, 0.0)),
             Some(Filter::blur_xy(4.0, 0.0))
         );
+    }
+
+    #[test]
+    fn quarter_turns_map_one_axis_blurs_to_the_other_axis() {
+        let blur = Filter::blur_xy(3.0, 0.0);
+        let turn = Affine::rotate(core::f64::consts::FRAC_PI_2);
+        assert_eq!(blur.in_device_space(turn), Some(Filter::blur_xy(0.0, 3.0)));
+        assert_eq!(blur.in_device_space(turn * turn), Some(blur));
+        assert_eq!(blur.in_device_space(Affine::rotate(0.1)), None);
     }
 
     #[test]
