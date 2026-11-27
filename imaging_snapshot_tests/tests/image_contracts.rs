@@ -23,9 +23,9 @@ fn image_scene(data: ImageData) -> Scene {
 }
 
 fn assert_pixels(image: RgbaImage, expected: [u8; 4]) {
-    for pixel in image.data.as_chunks::<4>().0 {
+    for pixel in image.data.chunks_exact(expected.len()) {
         assert_eq!(
-            *pixel, expected,
+            pixel, expected,
             "image pixels must honor channel order and alpha metadata"
         );
     }
