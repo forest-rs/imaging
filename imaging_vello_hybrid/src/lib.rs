@@ -637,7 +637,7 @@ fn readback_into_target(
         &mut *data,
         bytes_per_row,
     )?;
-    unpremultiply_rgba8_target(&mut *data, width, bytes_per_row);
+    unpremultiply_rgba8_target(&mut *data, width, height, bytes_per_row);
     Ok(())
 }
 
