@@ -30,22 +30,6 @@ pub(crate) fn run_cases(
     run_cases_with(backend, render, |_case| 0, errors);
 }
 
-pub(crate) fn try_init_or_skip<T, E>(
-    backend: &str,
-    try_init: impl FnOnce() -> Result<T, E>,
-) -> Option<T>
-where
-    E: core::fmt::Debug,
-{
-    match try_init() {
-        Ok(value) => Some(value),
-        Err(err) => {
-            eprintln!("[{backend}] skipping snapshots: {err:?}");
-            None
-        }
-    }
-}
-
 pub(crate) fn run_cases_with(
     backend: &str,
     mut render: impl FnMut(&dyn SnapshotCase) -> RgbaImage,

@@ -135,33 +135,7 @@ fn skia_raster_images() {
 }
 
 #[cfg(any(feature = "vello", feature = "vello_hybrid"))]
-mod gpu {
-    #[cfg(feature = "vello")]
-    pub(super) use imaging_vello::wgpu;
-    #[cfg(all(not(feature = "vello"), feature = "vello_hybrid"))]
-    pub(super) use imaging_vello_hybrid::wgpu;
-
-    pub(super) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        if std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() == Ok("no") {
-            return None;
-        }
-        let result = pollster::block_on(async {
-            let instance = wgpu::Instance::default();
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions::default())
-                .await
-                .ok()?;
-            adapter
-                .request_device(&wgpu::DeviceDescriptor::default())
-                .await
-                .ok()
-        });
-        if std::env::var("IMAGING_CI_GPU_SUPPORT").as_deref() == Ok("yes") {
-            assert!(result.is_some(), "GPU tests require a device");
-        }
-        result
-    }
-}
+mod gpu;
 
 #[test]
 #[cfg(feature = "vello")]
