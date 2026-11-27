@@ -82,11 +82,15 @@ impl SvgDocument {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{borrow::ToOwned, boxed::Box, format, vec, vec::Vec};
+    use alloc::{borrow::ToOwned, boxed::Box, vec, vec::Vec};
     use std::sync::Arc;
 
     use imaging::Brush;
-    use imaging::{MaskMode, Painter, filter::FilterEffectsRef, record};
+    use imaging::{
+        MaskMode, Painter,
+        filter::{FilterEffectsRef, FilterGraph},
+        record,
+    };
     use kurbo::Affine;
 
     use super::{ParseOptions, RenderOptions, SvgDocument};
@@ -246,49 +250,256 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_unfiltered_content_when_a_chain_cannot_be_lowered() {
-        for unsupported in [
-            "<feOffset in='SourceAlpha'/>",
-            "<feOffset in='SourceGraphic'/>",
-            "<feOffset in='first'/>",
-            "<feGaussianBlur stdDeviation='2'/>",
-            "<feColorMatrix type='saturate' values='0'/>",
-        ] {
-            let svg = format!(
-                "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'>
-                    <defs><filter id='unsupported'>
-                        <feOffset dx='1' result='first'/><feOffset dx='2'/>{unsupported}
-                    </filter></defs>
-                    <g id='subject' opacity='.5' filter='url(#unsupported)'>
-                        <rect width='20' height='20' fill='red'/>
-                    </g>
-                </svg>"
-            );
-            let document = SvgDocument::from_str(&svg, &ParseOptions::default()).unwrap();
-            let mut scene = record::Scene::new();
-            let report = document
-                .render(&mut Painter::new(&mut scene), &RenderOptions::default())
-                .unwrap();
-            assert_eq!(
-                report.unsupported_features,
-                [crate::UnsupportedFeature {
-                    kind: crate::UnsupportedFeatureKind::Filter,
-                    node_id: Some("subject".to_owned()),
-                }],
-            );
-            let [
-                record::Command::PushGroup(group),
-                record::Command::Draw(_),
-                record::Command::PopGroup,
-            ] = scene.commands()
-            else {
-                panic!("expected unfiltered content with opacity for {unsupported}");
-            };
-            let group = scene.group(*group);
-            assert!(group.filters.as_ref().is_empty());
-            assert_eq!(group.composite.alpha, 0.5);
-            scene.validate().unwrap();
-        }
+    fn lowers_named_graph_inputs_and_keeps_filter_boundaries() {
+        use imaging::filter::{
+            CompositeOperator, FilterColorSpace, FilterId, FilterInput, FilterPrimitiveKind,
+        };
+        use kurbo::{Rect, Vec2};
+
+        let (scene, report) = render_filter_test(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+                <defs>
+                    <filter id='a' filterUnits='userSpaceOnUse' x='0' y='0' width='12' height='8'>
+                        <feFlood x='2' y='1' width='3' height='3' result='color'/>
+                        <feGaussianBlur in='SourceAlpha' stdDeviation='1'
+                            color-interpolation-filters='sRGB' result='blurred'/>
+                        <feOffset in='color' dx='1' dy='2'/>
+                        <feMerge>
+                            <feMergeNode in='blurred'/>
+                            <feMergeNode in='SourceGraphic'/>
+                            <feMergeNode/>
+                        </feMerge>
+                    </filter>
+                    <filter id='b' filterUnits='userSpaceOnUse' x='3' y='1' width='20' height='15'>
+                        <feComposite in='SourceGraphic' in2='SourceAlpha'
+                            operator='lighter' result='color'/>
+                        <feOffset in='color' dx='1'/>
+                    </filter>
+                </defs>
+                <g filter='url(#a) url(#b)' transform='translate(2 3)' opacity='.5'>
+                    <rect width='5' height='6'/>
+                </g>
+            </svg>",
+        );
+        assert!(report.is_fully_supported(), "{report:?}");
+        let graphs = recorded_graphs(&scene);
+        let [(second, second_transform), (first, first_transform)] = graphs.as_slice() else {
+            panic!("expected two nested filter graphs");
+        };
+        assert_eq!(*first_transform, Affine::translate((2.0, 3.0)));
+        assert_eq!(*second_transform, *first_transform);
+        let result = |index| FilterInput::Result(FilterId(index));
+        let flood_rect = Rect::new(2.0, 1.0, 5.0, 4.0);
+        assert_eq!(first.region, Rect::new(0.0, 0.0, 12.0, 8.0));
+        assert_eq!(first.primitives[0].subregion, Some(flood_rect));
+        assert_eq!(first.primitives[0].color_space, FilterColorSpace::LinearRgb);
+        assert_eq!(first.primitives[1].color_space, FilterColorSpace::Srgb);
+        assert_eq!(
+            first.primitives[1].kind,
+            FilterPrimitiveKind::GaussianBlur {
+                input: FilterInput::SourceAlpha,
+                std_deviation: Vec2::new(1.0, 1.0),
+            },
+        );
+        assert_eq!(first.primitives[2].subregion, Some(flood_rect));
+        assert_eq!(
+            first.primitives[2].kind,
+            FilterPrimitiveKind::Offset {
+                input: result(0),
+                offset: Vec2::new(1.0, 2.0),
+            },
+        );
+        assert_eq!(
+            first.primitives[3].kind,
+            FilterPrimitiveKind::Merge {
+                inputs: vec![result(1), FilterInput::SourceGraphic, result(2)],
+            },
+        );
+        assert_eq!(first.output, result(3));
+
+        assert_eq!(second.region, Rect::new(3.0, 1.0, 23.0, 16.0));
+        assert_eq!(
+            second.primitives[0].kind,
+            FilterPrimitiveKind::Composite {
+                source: FilterInput::SourceGraphic,
+                backdrop: FilterInput::SourceAlpha,
+                operator: CompositeOperator::Lighter,
+            },
+        );
+        assert_eq!(
+            second.primitives[1].kind.inputs().collect::<Vec<_>>(),
+            [result(0)]
+        );
+        assert_eq!(second.output, result(1));
+        let [record::Command::PushGroup(group), ..] = scene.commands() else {
+            panic!("expected group opacity outside the filter graphs");
+        };
+        assert_eq!(scene.group(*group).composite.alpha, 0.5);
+        assert!(scene.group(*group).filters.as_ref().is_empty());
+    }
+
+    #[test]
+    fn records_filter_image_content_at_its_subregion_origin() {
+        use imaging::filter::FilterPrimitiveKind;
+        use kurbo::Rect;
+
+        let (scene, report) = render_filter_test(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+                <defs>
+                    <rect id='image' width='2' height='3' fill='red'/>
+                    <filter id='f' filterUnits='userSpaceOnUse' x='0' y='0' width='32' height='32'>
+                        <feImage href='#image' x='10' y='12' width='8' height='6'/>
+                    </filter>
+                </defs>
+                <g filter='url(#f)' transform='translate(2 3)'>
+                    <rect width='20' height='20'/>
+                </g>
+            </svg>",
+        );
+        assert!(report.is_fully_supported(), "{report:?}");
+        let graphs = recorded_graphs(&scene);
+        let [(graph, transform)] = graphs.as_slice() else {
+            panic!("expected one filter graph");
+        };
+        assert_eq!(*transform, Affine::translate((2.0, 3.0)));
+        let node = &graph.primitives[0];
+        assert_eq!(node.subregion, Some(Rect::new(10.0, 12.0, 18.0, 18.0)));
+        let FilterPrimitiveKind::Image { scene } = &node.kind else {
+            panic!("expected retained image content");
+        };
+        let [record::Command::Draw(draw)] = scene.commands() else {
+            panic!("expected one draw in the retained filter image");
+        };
+        let record::Draw::Fill { transform, .. } = scene.draw_op(*draw) else {
+            panic!("expected a retained fill");
+        };
+        assert_eq!(*transform, Affine::translate((10.0, 12.0)));
+    }
+
+    #[test]
+    fn preserves_convolution_noise_and_lighting_parameters() {
+        use imaging::filter::{
+            EdgeMode, FilterInput, FilterPrimitiveKind, LightSource, TurbulenceKind,
+        };
+        use kurbo::Vec2;
+
+        let (scene, report) = render_filter_test(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+                <defs><filter id='f'>
+                    <feConvolveMatrix order='3 2' kernelMatrix='1 2 3 4 5 6'
+                        targetX='2' targetY='0' edgeMode='wrap' divisor='8'
+                        bias='.25' preserveAlpha='true'/>
+                    <feTurbulence type='fractalNoise' baseFrequency='.125 .25'
+                        numOctaves='2' seed='83' stitchTiles='stitch'/>
+                    <feDiffuseLighting lighting-color='#123456' surfaceScale='2' diffuseConstant='3'>
+                        <fePointLight x='5' y='8' z='13'/>
+                    </feDiffuseLighting>
+                </filter></defs>
+                <rect width='20' height='20' filter='url(#f)'/>
+            </svg>",
+        );
+        assert!(report.is_fully_supported(), "{report:?}");
+        let graphs = recorded_graphs(&scene);
+        let [(graph, _)] = graphs.as_slice() else {
+            panic!("expected one filter graph");
+        };
+        assert_eq!(
+            graph.primitives[0].kind,
+            FilterPrimitiveKind::ConvolveMatrix {
+                input: FilterInput::SourceGraphic,
+                order: [3, 2],
+                target: [2, 0],
+                kernel: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                divisor: 8.0,
+                bias: 0.25,
+                edge_mode: EdgeMode::Wrap,
+                preserve_alpha: true,
+            },
+        );
+        assert_eq!(
+            graph.primitives[1].kind,
+            FilterPrimitiveKind::Turbulence {
+                base_frequency: Vec2::new(0.125, 0.25),
+                num_octaves: 2,
+                seed: 83,
+                stitch_tiles: true,
+                kind: TurbulenceKind::FractalNoise,
+            },
+        );
+        assert_eq!(
+            graph.primitives[2].kind,
+            FilterPrimitiveKind::DiffuseLighting {
+                input: FilterInput::Result(imaging::filter::FilterId(1)),
+                surface_scale: 2.0,
+                diffuse_constant: 3.0,
+                lighting_color: peniko::Color::from_rgb8(0x12, 0x34, 0x56),
+                light: LightSource::Point {
+                    position: [5.0, 8.0, 13.0],
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn falls_back_to_unfiltered_content_when_a_filter_image_cannot_be_lowered() {
+        let (scene, report) = render_filter_test(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'>
+                <defs>
+                    <pattern id='p' width='.5' height='.5'><rect width='4' height='4'/></pattern>
+                    <rect id='image' width='20' height='20' fill='url(#p)'/>
+                    <filter id='first'><feOffset dx='1'/></filter>
+                    <filter id='unsupported'><feImage href='#image'/></filter>
+                </defs>
+                <g id='subject' opacity='.5' filter='url(#first) url(#unsupported)'>
+                    <rect width='20' height='20' fill='red'/>
+                </g>
+            </svg>",
+        );
+        assert_eq!(
+            report.unsupported_features,
+            [crate::UnsupportedFeature {
+                kind: crate::UnsupportedFeatureKind::Filter,
+                node_id: Some("subject".to_owned()),
+            }],
+        );
+        let [
+            record::Command::PushGroup(group),
+            record::Command::Draw(_),
+            record::Command::PopGroup,
+        ] = scene.commands()
+        else {
+            panic!("expected unfiltered content with opacity");
+        };
+        let group = scene.group(*group);
+        assert!(group.filters.as_ref().is_empty());
+        assert_eq!(group.composite.alpha, 0.5);
+    }
+
+    fn render_filter_test(svg: &str) -> (record::Scene, crate::RenderReport) {
+        let document = SvgDocument::from_str(svg, &ParseOptions::default()).unwrap();
+        let mut scene = record::Scene::new();
+        let report = document
+            .render(&mut Painter::new(&mut scene), &RenderOptions::default())
+            .unwrap();
+        scene.validate().unwrap();
+        (scene, report)
+    }
+
+    fn recorded_graphs(scene: &record::Scene) -> Vec<(&FilterGraph, Affine)> {
+        scene
+            .commands()
+            .iter()
+            .filter_map(|command| {
+                let record::Command::PushGroup(group) = command else {
+                    return None;
+                };
+                let group = scene.group(*group);
+                match group.filters.as_ref() {
+                    FilterEffectsRef::Graph(graph) => Some((graph, group.filter_transform)),
+                    FilterEffectsRef::Chain(_) => None,
+                }
+            })
+            .collect()
     }
 
     #[test]

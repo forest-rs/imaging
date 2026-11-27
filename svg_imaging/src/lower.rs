@@ -3,6 +3,8 @@
 
 //! Lower `usvg` trees into a crate-local render plan.
 
+mod filter;
+
 use alloc::{vec, vec::Vec};
 use hashbrown::HashMap;
 
@@ -24,12 +26,16 @@ use crate::{
 };
 
 pub(crate) fn lower_tree(tree: &usvg::Tree, options: &RenderOptions) -> crate::plan::RenderPlan {
+    lower_root(tree.root(), options.transform)
+}
+
+fn lower_root(root: &usvg::Group, transform: Affine) -> crate::plan::RenderPlan {
     let mut cx = LowerCx {
         masks: Vec::new(),
         lowered_masks: HashMap::new(),
         report: RenderReport::default(),
     };
-    let nodes = cx.lower_group(tree.root(), options.transform);
+    let nodes = cx.lower_group(root, transform);
     crate::plan::RenderPlan {
         masks: cx.masks,
         nodes,
@@ -46,10 +52,7 @@ struct LowerCx {
 impl LowerCx {
     fn lower_group(&mut self, group: &usvg::Group, root_transform: Affine) -> Vec<PlanNode> {
         let transform = root_transform * convert_transform(group.abs_transform());
-        let filters = lower_filters(group);
-        if filters.is_none() && !group.filters().is_empty() {
-            self.unsupported(UnsupportedFeatureKind::Filter, group.id());
-        }
+        let filters = self.lower_filters(group);
         let clips = group
             .clip_path()
             .and_then(|clip_path| self.lower_clip_path_chain(clip_path, transform, group.id()))
@@ -87,6 +90,18 @@ impl LowerCx {
         } else {
             children
         }
+    }
+
+    fn lower_filters(&mut self, group: &usvg::Group) -> Option<PlanFilterChain> {
+        if group.filters().is_empty() {
+            return None;
+        }
+        let chain = lower_linear_filters(group)
+            .or_else(|| filter::lower_graphs(group).map(PlanFilterChain::Graphs));
+        if chain.is_none() {
+            self.unsupported(UnsupportedFeatureKind::Filter, group.id());
+        }
+        chain
     }
 
     fn lower_node(&mut self, node: &Node, root_transform: Affine) -> Vec<PlanNode> {
@@ -417,7 +432,7 @@ impl LowerCx {
     }
 }
 
-fn lower_filters(group: &usvg::Group) -> Option<PlanFilterChain> {
+fn lower_linear_filters(group: &usvg::Group) -> Option<PlanFilterChain> {
     let filters = group.filters();
     let source_region = convert_rect(filters.first()?.rect());
     let mut steps: Vec<PlanFilterStep> = Vec::new();
@@ -448,7 +463,7 @@ fn lower_filters(group: &usvg::Group) -> Option<PlanFilterChain> {
             previous = Some(primitive.result());
         }
     }
-    Some(PlanFilterChain {
+    Some(PlanFilterChain::Linear {
         source_region,
         steps,
     })
