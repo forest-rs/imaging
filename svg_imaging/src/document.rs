@@ -86,7 +86,7 @@ mod tests {
     use std::sync::Arc;
 
     use imaging::Brush;
-    use imaging::{MaskMode, Painter, record};
+    use imaging::{MaskMode, Painter, filter::FilterEffectsRef, record};
     use kurbo::Affine;
 
     use super::{ParseOptions, RenderOptions, SvgDocument};
@@ -213,13 +213,16 @@ mod tests {
             .iter()
             .rev()
             .filter_map(|command| match command {
-                record::Command::PushGroup(id) if !scene.group(*id).filters.is_empty() => {
-                    Some(scene.group(*id))
-                }
+                record::Command::PushGroup(id) => match scene.group(*id).filters.as_ref() {
+                    FilterEffectsRef::Chain(filters) if !filters.is_empty() => {
+                        Some((scene.group(*id), filters))
+                    }
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
-        let filters: Vec<_> = groups.iter().flat_map(|group| &group.filters).collect();
+        let filters: Vec<_> = groups.iter().flat_map(|(_, filters)| *filters).collect();
         assert_eq!(
             filters,
             [
@@ -234,7 +237,7 @@ mod tests {
                 },
             ]
         );
-        for group in groups {
+        for (group, _) in groups {
             assert_eq!(
                 group.filter_transform,
                 transform * Affine::translate((2.0, 3.0)) * Affine::scale(2.0),
@@ -282,7 +285,7 @@ mod tests {
                 panic!("expected unfiltered content with opacity for {unsupported}");
             };
             let group = scene.group(*group);
-            assert!(group.filters.is_empty());
+            assert!(group.filters.as_ref().is_empty());
             assert_eq!(group.composite.alpha, 0.5);
             scene.validate().unwrap();
         }
