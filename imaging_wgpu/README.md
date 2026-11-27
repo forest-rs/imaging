@@ -30,9 +30,6 @@ This crate is `std`-only because it depends on `wgpu`.
 <!-- cargo-rdme end -->
 
 [`wgpu`]: https://docs.rs/imaging_wgpu/latest/imaging_wgpu/wgpu/
-[`v27`]: https://docs.rs/imaging_wgpu/latest/imaging_wgpu/v27/
-[`v28`]: https://docs.rs/imaging_wgpu/latest/imaging_wgpu/v28/
-[`v29`]: https://docs.rs/imaging_wgpu/latest/imaging_wgpu/v29/
 
 ## Minimum supported Rust Version (MSRV)
 

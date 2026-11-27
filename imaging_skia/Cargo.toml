@@ -25,7 +25,7 @@ imaging_wgpu = { default-features = false, optional = true, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 skia-safe = { features = ["ganesh"], version = "0.153.3" }
-wgpu = { optional = true, version = "30.0.1" }
+wgpu = { default-features = true, optional = true, workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 oaty = "0.1"

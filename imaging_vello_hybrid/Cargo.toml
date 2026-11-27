@@ -11,17 +11,17 @@ keywords = ["gpu", "graphics", "imaging", "rendering", "vello"]
 categories = ["graphics", "rendering"]
 
 [dependencies]
-glifo = { default-features = false, version = "0.4.0" }
+glifo.workspace = true
 imaging = { features = ["std"], workspace = true }
 imaging_wgpu = { default-features = false, workspace = true }
 kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
-vello_common = { default-features = true, version = "0.3.0" }
-vello_gpu = { default-features = true, version = "0.3.0" }
-wgpu = { default-features = false, features = [
+vello_common = { default-features = true, workspace = true }
+vello_gpu.workspace = true
+wgpu = { features = [
     "std",
     "wgsl",
-], version = "30.0.1" }
+], workspace = true }
 
 [lints]
 workspace = true

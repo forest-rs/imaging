@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::image_registry::RegisteredImage;
+use crate::image_registry::ImageTexture;
 
 /// An encoded hybrid scene that keeps its uploaded images alive.
 ///
@@ -12,8 +12,7 @@ use crate::image_registry::RegisteredImage;
 #[derive(Debug)]
 pub struct VelloHybridScene {
     pub(crate) native: vello_gpu::Scene,
-    pub(crate) external_images: Vec<Arc<crate::ExternalTexture>>,
-    pub(crate) images: Vec<Arc<RegisteredImage>>,
+    pub(crate) images: Vec<Arc<ImageTexture>>,
     pub(crate) renderer: Option<Arc<()>>,
 }
 
@@ -24,7 +23,6 @@ impl VelloHybridScene {
         Self {
             native: vello_gpu::Scene::new(width, height),
             images: Vec::new(),
-            external_images: Vec::new(),
             renderer: None,
         }
     }
@@ -33,7 +31,6 @@ impl VelloHybridScene {
     pub fn reset(&mut self) {
         self.native.reset();
         self.images.clear();
-        self.external_images.clear();
         self.renderer = None;
     }
 
@@ -56,6 +53,8 @@ impl VelloHybridScene {
     }
 
     /// Borrow the underlying native scene without releasing its image references.
+    ///
+    /// Use [`crate::VelloHybridRenderer`] to render the scene with its retained image bindings.
     #[must_use]
     pub fn native(&self) -> &vello_gpu::Scene {
         &self.native

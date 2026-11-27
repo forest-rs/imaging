@@ -12,12 +12,12 @@ categories = ["graphics", "rendering"]
 
 [dependencies]
 # TODO: Vello CPU should re-export FontEmbolden upstream, removing this direct dependency.
-glifo = { default-features = false, version = "0.4.0" }
+glifo.workspace = true
 imaging.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
-vello_common = { default-features = false, version = "0.3.0" }
-vello_cpu = { default-features = false, features = ["text", "u8_pipeline"], version = "0.3.0" }
+vello_common.workspace = true
+vello_cpu = { default-features = false, features = ["text", "u8_pipeline"], version = "0.4.0" }
 
 [lints]
 workspace = true

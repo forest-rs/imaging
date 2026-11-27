@@ -14,7 +14,7 @@
 //! presentation targets, then pass those handles into [`VelloHybridRenderer`].
 //!
 //! Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
-//! and translated to backend-managed opaque image ids. Encoded scenes retain these uploads
+//! and bound as sampled textures. Encoded scenes retain these uploads
 //! until reset or dropped. Use [`VelloHybridSceneSink::with_renderer`]
 //! when recording directly into a native [`VelloHybridScene`] and you want the same image
 //! support.
@@ -22,14 +22,21 @@
 //! Alpha masks render the mask scene into an isolated `DestIn` layer, preserving its paint,
 //! blending, and image bindings. Luminance masks remain unsupported by this backend.
 //!
-//! Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
-//! X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
-//! or sheared blur kernel return [`Error::UnsupportedFilter`].
+//! Filter chains use nested single-primitive layers. Gaussian blurs support independent
+//! X/Y standard deviations in destination coordinates. Drop shadows require equal
+//! deviations. Filters that require a non-axis-aligned blur kernel return
+//! [`Error::UnsupportedFilter`].
 //! Blurred rounded rectangles use the renderer's native analytic draw.
 //!
-//! Synthetic emboldening uses glifo's native outline expansion. In glifo 0.4,
-//! unhinted fills expand in font units rather than font-size pixels, and absorbed
-//! transform scales do not scale the expansion amount.
+//! Synthetic emboldening expands the outline by the requested amount in font-size
+//! pixels before the glyph and run transforms are applied.
+//!
+//! # Migrating to Vello GPU 0.4
+//!
+//! When rendering into a caller-provided texture view, pass the full texture width and
+//! height and use a view of mip level zero. A size mismatch returns
+//! [`Error::InvalidTargetDimensions`]. [`VelloHybridRenderer`] supplies the texture bindings
+//! for encoded images when rendering a [`VelloHybridScene`].
 //!
 //! # Render A Recorded Scene
 //!
@@ -201,7 +208,7 @@ mod scene;
 mod scene_sink;
 mod wgpu_support;
 
-use image_registry::HybridImageRegistry;
+use image_registry::{HybridImageRegistry, ImageTexture};
 use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
 use imaging::render::{
@@ -212,7 +219,7 @@ pub use imaging_wgpu::wgpu;
 use imaging_wgpu::{TextureRenderer, TextureViewTarget};
 use imaging_wgpu::{TextureRendererError, TextureTargetError};
 use std::sync::Arc;
-use vello_gpu::{RenderError, RenderSize, RenderTargetConfig, TextureBindings};
+use vello_gpu::{RenderError, RenderOptions, RenderTarget, RenderTargetConfig, TextureBindings};
 use wgpu::{CommandEncoderDescriptor, TextureFormat};
 
 use crate::wgpu_support::{
@@ -232,7 +239,9 @@ pub enum Error {
     UnboundImage(imaging::ExternalImage),
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered on a sink path that has no renderer-backed image resolver.
+    /// The requested dimensions differ from the render target texture's dimensions.
+    InvalidTargetDimensions,
+    /// An inline image brush could not be uploaded or requires a renderer-backed sink.
     UnsupportedImageBrush,
     /// Destructive glyph blending is not supported by Vello GPU.
     UnsupportedGlyphBlend,
@@ -265,12 +274,7 @@ pub(crate) struct VelloHybridRendererState {
     queue: wgpu::Queue,
     tolerance: f64,
     image_registry: HybridImageRegistry,
-    external_images: std::collections::HashMap<imaging::ExternalImage, Arc<ExternalTexture>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct ExternalTexture {
-    view: wgpu::TextureView,
+    external_images: std::collections::HashMap<imaging::ExternalImage, Arc<ImageTexture>>,
 }
 
 /// Target-oriented renderer that executes `imaging` commands using `vello_gpu` + `wgpu`.
@@ -294,6 +298,7 @@ impl VelloHybridRendererState {
     fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let (renderer, resources) = vello_gpu::Renderer::new(
             &device,
+            &queue,
             &RenderTargetConfig {
                 format: TextureFormat::Rgba8Unorm,
                 width: 1,
@@ -311,17 +316,6 @@ impl VelloHybridRendererState {
             image_registry: HybridImageRegistry::default(),
             external_images: std::collections::HashMap::new(),
         }
-    }
-
-    fn clear_cached_images(&mut self) {
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("imaging_vello_hybrid clear cached images"),
-            });
-        self.image_registry
-            .clear(&mut self.resources, &mut self.renderer, &mut encoder);
-        self.queue.submit([encoder.finish()]);
     }
 
     fn render_to_view(
@@ -354,24 +348,26 @@ impl VelloHybridRendererState {
         {
             return Err(Error::WrongRenderer);
         }
-        let (width, height) = Self::checked_size(width, height)?;
-        let render_size = RenderSize { width, height };
+        Self::checked_size(width, height)?;
+        let texture = texture_view.texture();
+        if width != texture.width() || height != texture.height() {
+            return Err(Error::InvalidTargetDimensions);
+        }
         let mut bindings = TextureBindings::new();
-        for (index, image) in scene.external_images.iter().enumerate() {
+        for (index, image) in scene.images.iter().enumerate() {
             bindings.insert(vello_common::TextureId(index as u64), image.view.clone());
         }
         self.renderer
             .render(
                 &scene.native,
                 &mut self.resources,
-                &self.device,
-                &self.queue,
                 encoder,
-                &render_size,
-                texture_view,
-                None,
+                RenderTarget {
+                    view: texture_view,
+                    depth_view: None,
+                },
                 &bindings,
-                vello_gpu::TargetInit::Clear(vello_gpu::ClearSettings::default()),
+                RenderOptions::default(),
             )
             .map_err(Error::Render)
     }
@@ -397,7 +393,7 @@ impl VelloHybridRenderer {
     /// Images referenced by encoded scenes stay alive until those scenes are reset or dropped.
     /// Call this again afterwards to release their cached allocations immediately.
     pub fn clear_cached_images(&mut self) {
-        self.state.clear_cached_images();
+        self.state.image_registry.clear();
     }
 
     /// Lower a semantic [`imaging::record::Scene`] into a native [`VelloHybridScene`].
@@ -441,6 +437,8 @@ impl VelloHybridRenderer {
     }
 
     /// Render a native [`VelloHybridScene`] into a caller-provided texture view.
+    ///
+    /// Use a view of mip level zero and pass the dimensions of the underlying texture.
     pub fn render_to_texture_view(
         &mut self,
         scene: &VelloHybridScene,
@@ -458,6 +456,7 @@ impl VelloHybridRenderer {
     /// finished encoder on this renderer's queue to execute the rendering. This
     /// method does not finish or submit the encoder; it may enqueue resource
     /// uploads on the queue. The target must support `RENDER_ATTACHMENT` usage.
+    /// Use a view of mip level zero and pass the dimensions of the underlying texture.
     /// Submit this encoder before rendering again or resetting this renderer,
     /// because later work may reuse its intermediate resources.
     ///
@@ -660,6 +659,11 @@ fn map_texture_renderer_error(error: Error) -> TextureRendererError {
         Error::InvalidScene(error) => {
             TextureRendererError::Content(RenderContentError::InvalidScene(error))
         }
+        Error::InvalidTargetDimensions => {
+            TextureRendererError::Target(TextureTargetError::InvalidTarget(
+                "render dimensions must match the texture dimensions",
+            ))
+        }
         Error::UnsupportedImageBrush => {
             TextureRendererError::Unsupported(RenderUnsupportedError::ImageBrush)
         }
@@ -766,8 +770,9 @@ impl imaging_wgpu::TextureImageRenderer for VelloHybridRenderer {
         }
         self.state.external_images.insert(
             image.clone(),
-            Arc::new(ExternalTexture {
+            Arc::new(ImageTexture {
                 view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                may_have_transparency: true,
             }),
         );
         Ok(())
@@ -1045,6 +1050,35 @@ mod tests {
     }
 
     #[test]
+    fn inline_image_reuses_the_upload_and_keeps_sampling_metadata() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        let source = ImageData {
+            data: Blob::new(Arc::new([0, 0, 255, 128])),
+            format: ImageFormat::Bgra8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 1,
+            height: 1,
+        };
+        let brush = ImageBrush::new(source);
+        let translucent = brush.clone().with_alpha(0.5);
+        let mut scene = Scene::new();
+        let mut painter = Painter::new(&mut scene);
+        painter.fill_rect(Rect::new(0.0, 0.0, 4.0, 4.0), &brush);
+        painter.fill_rect(Rect::new(4.0, 0.0, 8.0, 4.0), &translucent);
+
+        let first = renderer.encode_scene(&scene, 8, 4).unwrap();
+        let second = renderer.encode_scene(&scene, 8, 4).unwrap();
+        assert_eq!(first.images.len(), 1);
+        assert_eq!(second.images.len(), 1);
+        assert!(Arc::ptr_eq(&first.images[0], &second.images[0]));
+        let image = renderer.render(&second, 8, 4).unwrap();
+        assert_eq!(&image.data[4..8], &[255, 0, 0, 128]);
+        assert_eq!(&image.data[20..24], &[255, 0, 0, 64]);
+    }
+
+    #[test]
     fn retained_images_survive_cache_eviction() {
         let Some(mut renderer) = image_test_renderer() else {
             return;
@@ -1145,6 +1179,37 @@ mod tests {
         let image = renderer.render(&native, 48, 48).unwrap();
         assert_eq!(image.width, 48);
         assert_eq!(image.height, 48);
+    }
+
+    #[test]
+    fn one_axis_gaussian_blur_renders_in_device_space() {
+        let Some(mut renderer) = image_test_renderer() else {
+            return;
+        };
+        for (filter_transform, blurred, sharp) in [
+            (kurbo::Affine::IDENTITY, (21, 32), (32, 21)),
+            (
+                kurbo::Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+                (32, 21),
+                (21, 32),
+            ),
+        ] {
+            let mut scene = Scene::new();
+            Painter::new(&mut scene).with_group(
+                imaging::GroupRef::new()
+                    .with_filters(&[imaging::Filter::blur_xy(4.0, 0.0)])
+                    .with_filter_transform(filter_transform),
+                |p| p.fill_rect(Rect::new(24.0, 24.0, 40.0, 40.0), Color::WHITE),
+            );
+            let native = renderer.encode_scene(&scene, 64, 64).unwrap();
+            let image = renderer.render(&native, 64, 64).unwrap();
+            let alpha = |(x, y): (usize, usize)| image.data[(y * 64 + x) * 4 + 3];
+            assert!(
+                alpha(blurred) > 0,
+                "the blurred axis must extend past the source"
+            );
+            assert_eq!(alpha(sharp), 0, "the other axis must remain sharp");
+        }
     }
 
     #[test]
@@ -1322,6 +1387,10 @@ mod tests {
         });
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let native = renderer.encode_scene(&scene, 24, 24).unwrap();
+        assert!(matches!(
+            renderer.render_to_texture_view(&native, &texture_view, 24, 16),
+            Err(Error::InvalidTargetDimensions)
+        ));
         renderer
             .render_to_texture_view(&native, &texture_view, 24, 24)
             .unwrap();

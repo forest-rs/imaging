@@ -26,13 +26,13 @@ Vello CPU backend for `imaging`.
 This crate provides a CPU renderer that consumes `imaging::record::Scene` (or accepts commands
 directly via `imaging::PaintSink`) and produces an RGBA8 image buffer using `vello_cpu`.
 
-Filter chains use nested single-primitive layers. Blurs and drop shadows require equal
-X/Y standard deviations in destination coordinates. Transforms that require an anisotropic
-or sheared blur kernel return [`Error::UnsupportedFilter`].
+Filter chains use nested single-primitive layers. Gaussian blurs support independent
+X/Y standard deviations in destination coordinates. Drop shadows require equal
+deviations. Filters that require a non-axis-aligned blur kernel return
+[`Error::UnsupportedFilter`].
 
-Synthetic emboldening uses glifo's native outline expansion. In glifo 0.4,
-unhinted fills expand in font units rather than font-size pixels, and absorbed
-transform scales do not scale the expansion amount.
+Synthetic emboldening expands the outline by the requested amount in font-size
+pixels before the glyph and run transforms are applied.
 
 # Render A Recorded Scene
 
