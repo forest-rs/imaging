@@ -1018,6 +1018,56 @@ mod tests {
     use alloc::vec;
 
     #[test]
+    fn filter_graph_replay_preserves_local_coordinates_and_external_resources() {
+        use crate::filter::{
+            FilterColorSpace, FilterGraph, FilterId, FilterInput, FilterPrimitive,
+        };
+        use crate::{ExternalImage, ImageBrush, Painter};
+
+        let mut image = Scene::new();
+        let brush = ImageBrush::new(ExternalImage::new(
+            2,
+            3,
+            peniko::ImageAlphaType::AlphaPremultiplied,
+        ));
+        Painter::new(&mut image).draw_image(&brush, Affine::translate((4.0, 5.0)));
+        let region = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let graph = FilterGraph {
+            region,
+            primitives: vec![FilterPrimitive {
+                subregion: Some(Rect::new(3.0, 3.0, 8.0, 9.0)),
+                color_space: FilterColorSpace::Srgb,
+                kind: FilterPrimitiveKind::Image {
+                    scene: Box::new(image),
+                },
+            }],
+            output: FilterInput::Result(FilterId(0)),
+        };
+        let mut source = Scene::new();
+        let local = Affine::translate((10.0, 3.0));
+        Painter::new(&mut source).with_group(
+            GroupRef::new()
+                .with_filter_graph(&graph)
+                .with_filter_transform(local),
+            |_| {},
+        );
+        assert_eq!(source.validate(), Ok(()));
+        assert!(source.has_external_images());
+
+        let mut copy = Scene::new();
+        let prefix = Affine::scale_non_uniform(2.0, 3.0);
+        replay_transformed(&source, &mut copy, prefix);
+        let Command::PushGroup(id) = copy.commands()[0] else {
+            panic!("expected a group");
+        };
+        let group = copy.group(id);
+        assert_eq!(group.filter_transform, prefix * local);
+        assert_eq!(group.filters.as_ref(), FilterEffectsRef::Graph(&graph));
+        assert!(copy.has_external_images());
+        assert_eq!(copy.validate(), Ok(()));
+    }
+
+    #[test]
     fn scene_is_empty_tracks_recorded_commands() {
         let mut scene = Scene::new();
         assert!(scene.is_empty());

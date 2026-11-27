@@ -69,6 +69,35 @@ impl Default for FilterEffects {
 ///
 /// Rectangles, geometric parameters, and embedded scenes use the same filter-local coordinates.
 /// [`crate::GroupRef::filter_transform`] maps that coordinate system to the destination.
+///
+/// ```
+/// use imaging::{
+///     GroupRef, Painter,
+///     filter::{FilterColorSpace, FilterGraph, FilterId, FilterInput, FilterPrimitive, FilterPrimitiveKind},
+///     record::Scene,
+/// };
+/// use kurbo::{Rect, Vec2};
+/// use peniko::Color;
+///
+/// let region = Rect::new(0.0, 0.0, 32.0, 32.0);
+/// let graph = FilterGraph {
+///     region,
+///     primitives: vec![FilterPrimitive {
+///         subregion: Some(region),
+///         color_space: FilterColorSpace::LinearRgb,
+///         kind: FilterPrimitiveKind::GaussianBlur {
+///             input: FilterInput::SourceGraphic,
+///             std_deviation: Vec2::new(2.0, 3.0),
+///         },
+///     }],
+///     output: FilterInput::Result(FilterId(0)),
+/// };
+/// let mut scene = Scene::new();
+/// Painter::new(&mut scene).with_group(GroupRef::new().with_filter_graph(&graph), |painter| {
+///     painter.fill_rect(Rect::new(8.0, 8.0, 24.0, 24.0), Color::BLACK);
+/// });
+/// assert_eq!(scene.validate(), Ok(()));
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct FilterGraph {
     /// Overall filter region, in filter-local coordinates.
