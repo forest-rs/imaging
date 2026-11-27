@@ -37,6 +37,7 @@ use hashbrown as _;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef, MaskMode,
     PaintSink, RgbaImage, StrokeRef,
+    filter::FilterEffectsRef,
     record::{Scene, ValidateError},
     render::{
         ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, ImageTargetError,
@@ -2348,8 +2349,14 @@ impl<'renderer, 'target> TinySkiaRender<'renderer, 'target> {
         if let Some(coverage) = self.lookup_cached_mask(scene, mode, transform, bounds) {
             return Some(GroupMask { bounds, coverage });
         }
-        let pixmap = rasterize_scene_mask(scene, bounds, transform)?;
-        let coverage = coverage_from_mask_pixmap(pixmap.as_ref(), mode);
+        let pixmap = match rasterize_scene_mask(scene, bounds, transform) {
+            Ok(pixmap) => pixmap,
+            Err(error) => {
+                self.error.get_or_insert(error);
+                return None;
+            }
+        };
+        let coverage = coverage_from_mask_pixmap(&pixmap, mode);
         self.store_cached_mask(scene, mode, transform, bounds, coverage.clone());
         Some(GroupMask { bounds, coverage })
     }
@@ -2825,28 +2832,23 @@ impl Default for TinySkiaRenderer {
     }
 }
 
-fn rasterize_scene_pixmap(
-    scene: &Scene,
-    width: u32,
-    height: u32,
-    transform: Affine,
-) -> Option<Arc<Pixmap>> {
-    let mut renderer = TinySkiaRenderer::new();
-    let mut render = renderer.begin(width, height).ok()?;
-    imaging::record::replay_transformed(scene, &mut render, transform);
-    let layer = render.layers.into_iter().next()?;
-    match layer.pixmap {
-        LayerPixmap::Owned(pixmap) => Some(Arc::new(pixmap)),
-        LayerPixmap::Borrowed(_) => None,
-    }
-}
-
-fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Option<Arc<Pixmap>> {
-    let width = bounds.width();
-    let height = bounds.height();
+fn rasterize_scene_mask(scene: &Scene, bounds: IntRect, transform: Affine) -> Result<Pixmap> {
     let origin = Affine::translate((-f64::from(bounds.x()), -f64::from(bounds.y())));
-    let pixmap = rasterize_scene_pixmap(scene, width, height, origin * transform)?;
-    Some(pixmap)
+    let mut renderer = TinySkiaRenderer::new();
+    let mut render = renderer.begin(bounds.width(), bounds.height())?;
+    imaging::record::replay_transformed(scene, &mut render, origin * transform);
+    if let Some(error) = render.error {
+        return Err(error);
+    }
+    let layer = render
+        .layers
+        .into_iter()
+        .next()
+        .ok_or(Error::Internal("missing mask pixmap"))?;
+    match layer.pixmap {
+        LayerPixmap::Owned(pixmap) => Ok(pixmap),
+        LayerPixmap::Borrowed(_) => Err(Error::Internal("mask pixmap must be owned")),
+    }
 }
 
 impl PaintSink for TinySkiaRender<'_, '_> {
@@ -2873,6 +2875,11 @@ impl PaintSink for TinySkiaRender<'_, '_> {
     }
 
     fn push_group(&mut self, group: GroupRef<'_>) {
+        let FilterEffectsRef::Chain(filters) = group.filters else {
+            self.error.get_or_insert(Error::UnsupportedFilter);
+            self.group_frames.push(GroupFrame::Empty);
+            return;
+        };
         if group
             .mask
             .as_ref()
@@ -2898,8 +2905,7 @@ impl PaintSink for TinySkiaRender<'_, '_> {
                 .into_iter()
                 .all(|value| (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&value))
         };
-        let filters = group
-            .filters
+        let filters = filters
             .iter()
             .copied()
             .map(|filter| {

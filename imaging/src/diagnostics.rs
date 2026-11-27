@@ -239,7 +239,7 @@ where
 
     fn push_group(&mut self, group: GroupRef<'_>) {
         if let Some(mask) = &group.mask
-            && !scene_has_any_draw(mask.mask.scene)
+            && !scene_has_paint(mask.mask.scene)
         {
             self.push_diagnostic(DiagnosticKind::EmptyMaskScene);
         }
@@ -248,6 +248,9 @@ where
             draw_count: self.draw_count,
             is_identity: group_is_identity(&group),
         });
+        if filters_can_paint(group.filters) {
+            self.draw_count += 1;
+        }
         self.inner.push_group(group);
         self.finish_command();
     }
@@ -356,11 +359,26 @@ fn resolved_source_location(source: SourceLocationRef<'_>) -> ResolvedSourceLoca
     }
 }
 
-fn scene_has_any_draw(scene: &Scene) -> bool {
-    scene
-        .commands()
-        .iter()
-        .any(|command| matches!(command, crate::record::Command::Draw(_)))
+fn scene_has_paint(scene: &Scene) -> bool {
+    use crate::record::Command;
+
+    scene.commands().iter().any(|command| match *command {
+        Command::Draw(_) => true,
+        Command::PushGroup(id) => filters_can_paint(scene.group(id).filters.as_ref()),
+        _ => false,
+    })
+}
+
+fn filters_can_paint(filters: crate::filter::FilterEffectsRef<'_>) -> bool {
+    use crate::filter::FilterEffectsRef;
+
+    match filters {
+        FilterEffectsRef::Chain(filters) => filters
+            .iter()
+            .any(|filter| matches!(filter, crate::Filter::Flood { .. })),
+        // A graph can generate pixels even if the group supplies no source image.
+        FilterEffectsRef::Graph(_) => true,
+    }
 }
 
 fn group_is_identity(group: &GroupRef<'_>) -> bool {

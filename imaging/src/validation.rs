@@ -74,6 +74,7 @@ use crate::BrushRef;
 use crate::{
     AppliedMaskRef, BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef,
     PaintSink, StrokeRef,
+    filter::{FilterEffectsRef, FilterGraph, FilterGraphError, FilterPrimitiveKind},
     record::{self, Geometry, Glyph},
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke, Vec2};
@@ -111,6 +112,8 @@ pub enum ValidationError {
     InvalidStroke,
     /// A filter had invalid parameters.
     InvalidFilter,
+    /// A filter graph was invalid.
+    InvalidFilterGraph(FilterGraphError),
     /// A brush payload had invalid parameters.
     InvalidBrush {
         /// Short label describing what was invalid.
@@ -380,6 +383,19 @@ where
         }
     }
 
+    fn validate_filter_graph(&mut self, graph: &FilterGraph, transform: Affine) -> bool {
+        if let Err(error) = graph.validate_transformed(transform) {
+            return !self.violate(ValidationError::InvalidFilterGraph(error));
+        }
+        let mut ok = true;
+        for primitive in &graph.primitives {
+            if let FilterPrimitiveKind::Image { scene } = &primitive.kind {
+                ok &= self.validate_recorded_scene_stream(scene);
+            }
+        }
+        ok
+    }
+
     fn validate_brush(&mut self, brush: BrushRef<'_>) -> bool {
         match brush {
             BrushRef::Solid(_) => true,
@@ -627,8 +643,15 @@ where
         if let Some(mask) = group.mask.as_ref() {
             ok &= self.validate_group_mask(mask);
         }
-        for filter in group.filters {
-            ok &= self.validate_filter(filter, group.filter_transform);
+        match group.filters {
+            FilterEffectsRef::Chain(filters) => {
+                for filter in filters {
+                    ok &= self.validate_filter(filter, group.filter_transform);
+                }
+            }
+            FilterEffectsRef::Graph(graph) => {
+                ok &= self.validate_filter_graph(graph, group.filter_transform);
+            }
         }
         if !ok {
             return;

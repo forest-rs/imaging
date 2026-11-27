@@ -15,6 +15,7 @@ use peniko::{Fill, FontData, Style};
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, ContextKindRef, ContextRef, ContextValueRef, FillRef,
     GlyphRunRef, GroupRef, MaskMode, NormalizedCoord, PaintSink, SourceLocationRef, StrokeRef,
+    filter::{FilterEffects, FilterEffectsRef, FilterGraphError, FilterPrimitiveKind},
 };
 
 /// A geometry payload stored in a recording.
@@ -259,7 +260,7 @@ impl AppliedMask {
 
 /// Parameters for an isolated group.
 ///
-/// The group renders its content in isolation, applies filters in vector order, then applies
+/// The group renders its content in isolation, applies its filters, then applies
 /// the mask and isolated clip. Group opacity and blending apply once to that result when it
 /// is composited into its parent using [`Group::composite`].
 #[derive(Clone, Debug, PartialEq)]
@@ -268,11 +269,12 @@ pub struct Group {
     pub clip: Option<Clip>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMask>,
-    /// Filter chain applied in vector order before the mask, isolated clip, and compositing.
-    pub filters: Vec<crate::Filter>,
+    /// Filters applied before the mask, isolated clip, and compositing.
+    pub filters: FilterEffects,
     /// Maps filter user-space coordinates to the destination coordinate system.
     ///
     /// Defaults to identity. Transformed replay prefixes this transform along with the content.
+    /// Filter geometry and any embedded filter scenes stay in filter-local coordinates.
     pub filter_transform: Affine,
     /// Compositing parameters used when merging the group into its parent.
     pub composite: Composite,
@@ -284,7 +286,7 @@ impl Default for Group {
         Self {
             clip: None,
             mask: None,
-            filters: Vec::new(),
+            filters: FilterEffects::default(),
             filter_transform: Affine::IDENTITY,
             composite: Composite::default(),
         }
@@ -441,7 +443,8 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// Whether this recording or a referenced mask samples an external image.
+    /// Whether this recording, a retained mask, or a filter image scene references an external
+    /// image.
     ///
     /// External pixels can change without changing scene equality. Renderers must not reuse
     /// cached rasterizations of such scenes solely because their commands compare equal.
@@ -462,11 +465,18 @@ impl Scene {
                     })
                 )
             }
-            Command::PushGroup(id) => self
-                .group(id)
-                .mask
-                .as_ref()
-                .is_some_and(|mask| self.mask(mask.mask).scene.has_external_images()),
+            Command::PushGroup(id) => {
+                let group = self.group(id);
+                let mask_has_external_images = group.mask.as_ref().is_some_and(|mask| {
+                    self.mask(mask.mask).scene.has_external_images()
+                });
+                mask_has_external_images || match &group.filters {
+                    FilterEffects::Chain(_) => false,
+                    FilterEffects::Graph(graph) => graph.primitives.iter().any(|primitive| {
+                        matches!(&primitive.kind, FilterPrimitiveKind::Image { scene } if scene.has_external_images())
+                    }),
+                }
+            }
             _ => false,
         })
     }
@@ -733,7 +743,7 @@ impl Scene {
             .collect()
     }
 
-    /// Validate well-nested stacks, filter parameters and transforms, and retained masks.
+    /// Validate well-nested stacks, filter parameters and transforms, and retained scenes.
     pub fn validate(&self) -> Result<(), ValidateError> {
         let mut context_depth = 0_u32;
         let mut context_stack = Vec::new();
@@ -771,13 +781,22 @@ impl Scene {
                 Command::PushGroup(id) => {
                     let group = self.group(*id);
                     if !group.filter_transform.is_finite()
-                        || group.filters.iter().any(|filter| {
+                        || matches!(group.filters.as_ref(), FilterEffectsRef::Chain(filters)
+                        if filters.iter().any(|filter| {
                             !crate::validation::filter_is_valid(filter, group.filter_transform)
-                        })
+                        }))
                     {
                         return Err(ValidateError::InvalidFilter {
                             contexts: self.context_notes_for_stack(&context_stack),
                         });
+                    }
+                    if let FilterEffectsRef::Graph(graph) = group.filters.as_ref() {
+                        graph
+                            .validate_transformed(group.filter_transform)
+                            .map_err(|error| ValidateError::InvalidFilterGraph {
+                                error,
+                                contexts: self.context_notes_for_stack(&context_stack),
+                            })?;
                     }
                     group_depth += 1;
                 }
@@ -883,7 +902,7 @@ where
 
 /// Replay a recorded [`Scene`] into a [`crate::PaintSink`] with an extra transform.
 ///
-/// The extra transform prefixes clip transforms, draw transforms, group clip transforms, and
+/// The extra transform prefixes clip, draw, mask, and filter transforms.
 /// Existing brush transforms are preserved as-is.
 pub fn replay_transformed<S>(scene: &Scene, sink: &mut S, transform: Affine)
 where
@@ -930,6 +949,13 @@ pub enum ValidateError {
         /// Enclosing context stack active at the point of failure.
         contexts: Vec<ContextNote>,
     },
+    /// A filter graph was invalid.
+    InvalidFilterGraph {
+        /// Error in the graph.
+        error: FilterGraphError,
+        /// Enclosing context stack active at the point of failure.
+        contexts: Vec<ContextNote>,
+    },
     /// A retained mask definition was invalid.
     InvalidMask(Box<Self>),
 }
@@ -958,6 +984,9 @@ impl core::fmt::Display for ValidateError {
             Self::InvalidFilter { .. } => {
                 f.write_str("scene validation failed: invalid filter parameters or transform")
             }
+            Self::InvalidFilterGraph { error, .. } => {
+                write!(f, "scene filter graph validation failed ({error})")
+            }
             Self::InvalidMask(_) => {
                 f.write_str("scene validation failed: retained mask definition is invalid")
             }
@@ -969,6 +998,7 @@ impl core::error::Error for ValidateError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::InvalidMask(error) => Some(error.as_ref()),
+            Self::InvalidFilterGraph { error, .. } => Some(error),
             Self::InvalidFilter { .. }
             | Self::UnbalancedPopClip { .. }
             | Self::UnbalancedPopGroup { .. }
